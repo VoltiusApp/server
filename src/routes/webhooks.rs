@@ -73,28 +73,50 @@ async fn handle_subscription_created(pool: &PgPool, payload: &serde_json::Value)
         .as_str()
         .unwrap_or("");
     let ls_subscription_id = payload["data"]["id"].as_str().unwrap_or("");
-
-    // Tier derived from product metadata or variant name
     let tier = attrs["product_name"]
         .as_str()
         .map(|n| tier_from_product_name(n))
         .unwrap_or("pro");
 
-    let result = sqlx::query(
-        "UPDATE users SET
-            subscription_tier = $1,
-            ls_customer_id = $2,
-            ls_subscription_id = $3,
-            trial_used = TRUE,
-            trial_ends_at = NULL
-         WHERE email = $4",
-    )
-    .bind(tier)
-    .bind(ls_customer_id)
-    .bind(ls_subscription_id)
-    .bind(customer_email)
-    .execute(pool)
-    .await;
+    // Prefer UUID match from checkout custom_data — survives email changes at checkout
+    let user_id = payload["meta"]["custom_data"]["user_id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    let result = if let Some(uid) = user_id {
+        sqlx::query(
+            "UPDATE users SET
+                subscription_tier = $1,
+                ls_customer_id = $2,
+                ls_subscription_id = $3,
+                trial_used = TRUE,
+                trial_ends_at = NULL
+             WHERE id = $4",
+        )
+        .bind(tier)
+        .bind(ls_customer_id)
+        .bind(ls_subscription_id)
+        .bind(uid)
+        .execute(pool)
+        .await
+    } else {
+        // Fallback: match by email (e.g. manual LS admin actions without custom_data)
+        sqlx::query(
+            "UPDATE users SET
+                subscription_tier = $1,
+                ls_customer_id = $2,
+                ls_subscription_id = $3,
+                trial_used = TRUE,
+                trial_ends_at = NULL
+             WHERE email = $4",
+        )
+        .bind(tier)
+        .bind(ls_customer_id)
+        .bind(ls_subscription_id)
+        .bind(customer_email)
+        .execute(pool)
+        .await
+    };
 
     match result {
         Ok(r) if r.rows_affected() > 0 => {

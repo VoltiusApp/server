@@ -38,6 +38,9 @@ pub async fn create_checkout(
         "https://{store_slug}.lemonsqueezy.com/checkout/buy/{variant_id}?checkout[email]={email}"
     );
 
+    // Embed user_id so the webhook can match by UUID instead of email
+    url.push_str(&format!("&checkout[custom][user_id]={}", auth.0));
+
     if let Some(seats) = body.seats {
         url.push_str(&format!("&checkout[quantity]={seats}"));
     }

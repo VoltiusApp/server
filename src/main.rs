@@ -17,7 +17,8 @@ use sync_notifier::SyncNotifier;
 use terminal_manager::TerminalManager;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tower_http::cors::{Any, CorsLayer};
+use axum::http::HeaderValue;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -114,12 +115,22 @@ async fn main() {
         .merge(protected)
         .merge(ws_routes)
         .route("/health", get(|| async { "ok" }))
-        .layer(
+        .layer({
+            let allow_origin = match std::env::var("CORS_ORIGINS") {
+                Ok(s) => {
+                    let origins: Vec<HeaderValue> = s
+                        .split(',')
+                        .filter_map(|o| o.trim().parse().ok())
+                        .collect();
+                    if origins.is_empty() { AllowOrigin::any() } else { AllowOrigin::list(origins) }
+                }
+                Err(_) => AllowOrigin::any(),
+            };
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(allow_origin)
                 .allow_methods(Any)
-                .allow_headers(Any),
-        )
+                .allow_headers(Any)
+        })
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))

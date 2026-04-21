@@ -46,18 +46,30 @@ impl RateLimiter {
 }
 
 fn extract_ip(req: &Request) -> IpAddr {
-    // Try X-Forwarded-For first (behind reverse proxy), fall back to peer addr
-    req.headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
-        .or_else(|| {
-            req.extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip())
-        })
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    // Only trust X-Forwarded-For when the direct connection is from the configured trusted proxy.
+    // Without TRUSTED_PROXY_IP set, fall back to the real peer address to prevent spoofing.
+    let trusted: Option<IpAddr> = std::env::var("TRUSTED_PROXY_IP")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
+    let behind_proxy = matches!((peer_ip, trusted), (Some(peer), Some(t)) if peer == t);
+
+    if behind_proxy {
+        req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .or(peer_ip)
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    } else {
+        peer_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    }
 }
 
 /// Auth endpoints: 10 requests/minute per IP.
