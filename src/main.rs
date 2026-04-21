@@ -103,6 +103,24 @@ async fn main() {
         .layer(Extension(notifier))
         .layer(Extension(terminal_manager.clone()));
 
+    // Admin routes — auth + admin check, no rate limit (internal tool)
+    let admin_routes = Router::new()
+        .route("/v1/admin/stats", get(routes::admin::get_stats))
+        .route("/v1/admin/users/export", get(routes::admin::export_users_csv))
+        .route("/v1/admin/users", get(routes::admin::list_users))
+        .route("/v1/admin/users/:id", get(routes::admin::get_user))
+        .route("/v1/admin/users/:id", patch(routes::admin::patch_user))
+        .route("/v1/admin/users/:id/ban", post(routes::admin::ban_user))
+        .route("/v1/admin/users/:id/unban", post(routes::admin::unban_user))
+        .route("/v1/admin/users/:id/extend-trial", post(routes::admin::extend_trial))
+        .route("/v1/admin/users/:id/devices", get(routes::admin::list_devices))
+        .route("/v1/admin/users/:id/flags", get(routes::admin::list_flags))
+        .route("/v1/admin/users/:id/flags/:flag", put(routes::admin::set_flag))
+        .route("/v1/admin/users/:id/churn", get(routes::admin::list_user_churn))
+        .route("/v1/admin/audit-log", get(routes::admin::list_audit_log))
+        .route("/v1/admin/churn", get(routes::admin::list_churn))
+        .layer(middleware::from_fn(auth::require_admin_key));
+
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()
         .route("/v1/terminal-sessions/:id/ws", get(routes::terminal::ws_handler))
@@ -113,6 +131,7 @@ async fn main() {
         .merge(webhooks)
         .merge(pro_sync)
         .merge(protected)
+        .merge(admin_routes)
         .merge(ws_routes)
         .route("/health", get(|| async { "ok" }))
         .layer({

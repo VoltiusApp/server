@@ -12,6 +12,8 @@ pub struct Claims {
     pub tier: String,           // "free" | "pro" | "teams" | "business"
     pub trial_ends_at: Option<i64>, // unix timestamp, null when trial unused or expired
     pub trial_used: bool,
+    pub is_admin: bool,
+    pub is_banned: bool,
 }
 
 impl Claims {
@@ -35,6 +37,8 @@ pub fn create_access_token(
     tier: &str,
     trial_ends_at: Option<i64>,
     trial_used: bool,
+    is_admin: bool,
+    is_banned: bool,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
@@ -45,6 +49,8 @@ pub fn create_access_token(
         tier: tier.to_string(),
         trial_ends_at,
         trial_used,
+        is_admin,
+        is_banned,
     };
     encode(
         &Header::default(),
@@ -64,6 +70,8 @@ pub fn create_refresh_token(user_id: Uuid) -> Result<String, jsonwebtoken::error
         tier: "free".to_string(),
         trial_ends_at: None,
         trial_used: false,
+        is_admin: false,
+        is_banned: false,
     };
     encode(
         &Header::default(),

@@ -17,11 +17,13 @@ struct TierInfo {
     tier: String,
     trial_ends_at: Option<i64>,
     trial_used: bool,
+    is_admin: bool,
+    is_banned: bool,
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool)>(
-        "SELECT subscription_tier, trial_ends_at, trial_used FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool)>(
+        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -35,6 +37,8 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         tier: row.0,
         trial_ends_at: row.1.map(|t| t.timestamp()),
         trial_used: row.2,
+        is_admin: row.3,
+        is_banned: row.4,
     })
 }
 
@@ -128,6 +132,8 @@ pub async fn register(
         "pro",
         Some(trial_ends_at.timestamp()),
         false,
+        false,
+        false,
     )
     .map_err(|err| {
         error!(error = %err, user_id = %user_id, "Failed to create access token during registration");
@@ -162,7 +168,7 @@ pub async fn login(
     State(pool): State<PgPool>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, StatusCode> {
-    let user = sqlx::query_as::<_, (Uuid, String)>("SELECT id, auth_hash FROM users WHERE email = $1")
+    let user = sqlx::query_as::<_, (Uuid, String, bool)>("SELECT id, auth_hash, is_banned FROM users WHERE email = $1")
         .bind(&body.email)
         .fetch_optional(&pool)
         .await
@@ -175,7 +181,12 @@ pub async fn login(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let (user_id, auth_hash) = user;
+    let (user_id, auth_hash, is_banned) = user;
+
+    if is_banned {
+        warn!(user_id = %user_id, "Login attempt by banned user");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let valid = verify_auth_key(&body.auth_key, &auth_hash).map_err(|err| {
         error!(error = %err, user_id = %user_id, "Failed to verify auth key during login");
@@ -187,7 +198,7 @@ pub async fn login(
     }
 
     let tier = fetch_tier(&pool, user_id).await?;
-    let jwt_token = create_access_token(user_id, &tier.tier, tier.trial_ends_at, tier.trial_used)
+    let jwt_token = create_access_token(user_id, &tier.tier, tier.trial_ends_at, tier.trial_used, tier.is_admin, tier.is_banned)
         .map_err(|err| {
             error!(error = %err, user_id = %user_id, "Failed to create access token during login");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -228,7 +239,7 @@ pub async fn refresh(
     })?;
 
     let tier = fetch_tier(&pool, claims.sub).await?;
-    let jwt_token = create_access_token(claims.sub, &tier.tier, tier.trial_ends_at, tier.trial_used)
+    let jwt_token = create_access_token(claims.sub, &tier.tier, tier.trial_ends_at, tier.trial_used, tier.is_admin, tier.is_banned)
         .map_err(|err| {
             error!(error = %err, user_id = %claims.sub, "Failed to create access token during refresh");
             StatusCode::INTERNAL_SERVER_ERROR

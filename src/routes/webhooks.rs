@@ -174,6 +174,13 @@ async fn handle_subscription_cancelled(pool: &PgPool, payload: &serde_json::Valu
 async fn handle_subscription_expired(pool: &PgPool, payload: &serde_json::Value) -> StatusCode {
     let ls_subscription_id = payload["data"]["id"].as_str().unwrap_or("");
 
+    let old_tier_row = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, subscription_tier FROM users WHERE ls_subscription_id = $1",
+    )
+    .bind(ls_subscription_id)
+    .fetch_optional(pool)
+    .await;
+
     let result = sqlx::query(
         "UPDATE users SET
             subscription_tier = 'free',
@@ -186,8 +193,21 @@ async fn handle_subscription_expired(pool: &PgPool, payload: &serde_json::Value)
     .await;
 
     match result {
-        Ok(_) => {
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Ok(Some((user_id, old_tier))) = old_tier_row {
+                let _ = sqlx::query(
+                    "INSERT INTO churn_events (user_id, from_tier, to_tier, reason) VALUES ($1, $2, 'free', 'subscription_expired')",
+                )
+                .bind(user_id)
+                .bind(&old_tier)
+                .execute(pool)
+                .await;
+            }
             info!(ls_subscription_id = %ls_subscription_id, "Subscription expired — downgraded to free");
+            StatusCode::OK
+        }
+        Ok(_) => {
+            info!(ls_subscription_id = %ls_subscription_id, "subscription_expired: no matching user");
             StatusCode::OK
         }
         Err(e) => {
@@ -202,6 +222,13 @@ async fn handle_trial_expired(pool: &PgPool, payload: &serde_json::Value) -> Sta
         .as_str()
         .unwrap_or("");
 
+    let old_tier_row = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, subscription_tier FROM users WHERE email = $1",
+    )
+    .bind(customer_email)
+    .fetch_optional(pool)
+    .await;
+
     let result = sqlx::query(
         "UPDATE users SET subscription_tier = 'free', trial_used = TRUE, trial_ends_at = NULL WHERE email = $1",
     )
@@ -210,8 +237,21 @@ async fn handle_trial_expired(pool: &PgPool, payload: &serde_json::Value) -> Sta
     .await;
 
     match result {
-        Ok(_) => {
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Ok(Some((user_id, old_tier))) = old_tier_row {
+                let _ = sqlx::query(
+                    "INSERT INTO churn_events (user_id, from_tier, to_tier, reason) VALUES ($1, $2, 'free', 'trial_expired')",
+                )
+                .bind(user_id)
+                .bind(&old_tier)
+                .execute(pool)
+                .await;
+            }
             info!(email = %customer_email, "Trial expired — downgraded to free");
+            StatusCode::OK
+        }
+        Ok(_) => {
+            info!(email = %customer_email, "trial_expired: no matching user");
             StatusCode::OK
         }
         Err(e) => {
