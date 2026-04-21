@@ -1,0 +1,33 @@
+[package]
+name = "voltius-server"
+version = "0.1.0"
+edition = "2021"
+description = "E2EE sync server for Term Forge"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid", "chrono", "json"] }
+argon2 = "0.5"
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower = { version = "0.5", features = ["limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+dotenvy = "0.15"
+rand = "0.8"
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
