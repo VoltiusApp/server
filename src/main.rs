@@ -100,7 +100,7 @@ async fn main() {
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
-        .layer(Extension(notifier))
+        .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()));
 
     // Admin routes — auth + admin check, no rate limit (internal tool)
@@ -119,7 +119,8 @@ async fn main() {
         .route("/v1/admin/users/:id/churn", get(routes::admin::list_user_churn))
         .route("/v1/admin/audit-log", get(routes::admin::list_audit_log))
         .route("/v1/admin/churn", get(routes::admin::list_churn))
-        .layer(middleware::from_fn(auth::require_admin_key));
+        .layer(middleware::from_fn(auth::require_admin_key))
+        .layer(Extension(notifier.clone()));
 
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()

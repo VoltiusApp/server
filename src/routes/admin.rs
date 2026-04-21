@@ -13,6 +13,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::auth::AdminEmail;
+use crate::sync_notifier::SyncNotifier;
 
 // ─── Audit helper ─────────────────────────────────────────────────────────────
 
@@ -289,6 +290,7 @@ pub struct PatchUserRequest {
 pub async fn patch_user(
     State(pool): State<PgPool>,
     Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Extension(notifier): Extension<SyncNotifier>,
     Path(user_id): Path<Uuid>,
     Json(body): Json<PatchUserRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -368,6 +370,7 @@ pub async fn patch_user(
     )
     .await;
 
+    notifier.notify(user_id, "token_invalidated".to_string());
     info!(admin = %admin_email, user = %user_id, "Admin patched user");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -382,6 +385,7 @@ pub struct BanRequest {
 pub async fn ban_user(
     State(pool): State<PgPool>,
     Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Extension(notifier): Extension<SyncNotifier>,
     Path(user_id): Path<Uuid>,
     Json(body): Json<BanRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -410,6 +414,7 @@ pub async fn ban_user(
     )
     .await;
 
+    notifier.notify(user_id, "token_invalidated".to_string());
     info!(admin = %admin_email, user = %user_id, reason = %body.reason, "User banned");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -417,6 +422,7 @@ pub async fn ban_user(
 pub async fn unban_user(
     State(pool): State<PgPool>,
     Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Extension(notifier): Extension<SyncNotifier>,
     Path(user_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let result = sqlx::query(
@@ -436,6 +442,7 @@ pub async fn unban_user(
 
     write_audit(&pool, &admin_email, Some(user_id), "unban", json!({})).await;
 
+    notifier.notify(user_id, "token_invalidated".to_string());
     info!(admin = %admin_email, user = %user_id, "User unbanned");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -450,6 +457,7 @@ pub struct ExtendTrialRequest {
 pub async fn extend_trial(
     State(pool): State<PgPool>,
     Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Extension(notifier): Extension<SyncNotifier>,
     Path(user_id): Path<Uuid>,
     Json(body): Json<ExtendTrialRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -483,6 +491,7 @@ pub async fn extend_trial(
     )
     .await;
 
+    notifier.notify(user_id, "token_invalidated".to_string());
     info!(admin = %admin_email, user = %user_id, days = body.days, "Trial extended");
     Ok(StatusCode::NO_CONTENT)
 }
