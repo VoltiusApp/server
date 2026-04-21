@@ -10,8 +10,8 @@ fn verify_ls_signature(body: &[u8], signature_header: &str) -> bool {
     let secret = match std::env::var("LEMONSQUEEZY_SIGNING_SECRET") {
         Ok(s) => s,
         Err(_) => {
-            warn!("LEMONSQUEEZY_SIGNING_SECRET not set — skipping webhook signature verification");
-            return true; // dev mode: allow unsigned
+            error!("LEMONSQUEEZY_SIGNING_SECRET not set — rejecting webhook");
+            return false;
         }
     };
 
