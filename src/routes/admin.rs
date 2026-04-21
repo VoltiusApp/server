@@ -282,6 +282,7 @@ pub async fn get_user(
 pub struct PatchUserRequest {
     tier: Option<String>,
     trial_ends_at: Option<DateTime<Utc>>,
+    clear_trial: Option<bool>,
     trial_used: Option<bool>,
     discount_pct: Option<i16>,
     admin_notes: Option<String>,
@@ -335,14 +336,19 @@ pub async fn patch_user(
         r#"
         UPDATE users SET
             subscription_tier = COALESCE($1, subscription_tier),
-            trial_ends_at = CASE WHEN $2::timestamptz IS NOT NULL THEN $2 ELSE trial_ends_at END,
-            trial_used = COALESCE($3, trial_used),
-            discount_pct = COALESCE($4, discount_pct),
-            admin_notes = COALESCE($5, admin_notes)
-        WHERE id = $6
+            trial_ends_at = CASE
+                WHEN $2 = TRUE THEN NULL
+                WHEN $3::timestamptz IS NOT NULL THEN $3
+                ELSE trial_ends_at
+            END,
+            trial_used = COALESCE($4, trial_used),
+            discount_pct = COALESCE($5, discount_pct),
+            admin_notes = COALESCE($6, admin_notes)
+        WHERE id = $7
         "#,
     )
     .bind(&body.tier)
+    .bind(body.clear_trial.unwrap_or(false))
     .bind(body.trial_ends_at)
     .bind(body.trial_used)
     .bind(body.discount_pct)
