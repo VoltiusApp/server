@@ -4,6 +4,7 @@ WORKDIR /app
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release && \

@@ -17,5 +17,15 @@ pub async fn create_pool() -> PgPool {
         });
 
     info!("PostgreSQL connection pool is ready");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .unwrap_or_else(|err| {
+            error!(error = %err, "Failed to run migrations");
+            panic!("Failed to run migrations");
+        });
+    info!("Migrations applied successfully");
+
     pool
 }
