@@ -1,6 +1,6 @@
 services:
   server:
-    image: ghcr.io/VoltiusApp/voltius-server:latest
+    build: .
     container_name: voltius-server
     networks:
       - cloudflare
