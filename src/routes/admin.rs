@@ -249,6 +249,7 @@ pub struct UserDetail {
     discount_pct: Option<i16>,
     ls_customer_id: Option<String>,
     ls_subscription_id: Option<String>,
+    admin_override: bool,
     created_at: DateTime<Utc>,
 }
 
@@ -260,7 +261,7 @@ pub async fn get_user(
         r#"
         SELECT id, email, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
-               ls_customer_id, ls_subscription_id, created_at
+               ls_customer_id, ls_subscription_id, admin_override, created_at
         FROM users WHERE id = $1
         "#,
     )
@@ -286,6 +287,7 @@ pub struct PatchUserRequest {
     trial_used: Option<bool>,
     discount_pct: Option<i16>,
     admin_notes: Option<String>,
+    admin_override: Option<bool>,
 }
 
 pub async fn patch_user(
@@ -343,7 +345,8 @@ pub async fn patch_user(
             END,
             trial_used = COALESCE($4, trial_used),
             discount_pct = COALESCE($5, discount_pct),
-            admin_notes = COALESCE($6, admin_notes)
+            admin_notes = COALESCE($6, admin_notes),
+            admin_override = COALESCE($8, admin_override)
         WHERE id = $7
         "#,
     )
@@ -354,6 +357,7 @@ pub async fn patch_user(
     .bind(body.discount_pct)
     .bind(&body.admin_notes)
     .bind(user_id)
+    .bind(body.admin_override)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -371,6 +375,7 @@ pub async fn patch_user(
             "trial_ends_at": body.trial_ends_at,
             "trial_used": body.trial_used,
             "discount_pct": body.discount_pct,
+            "admin_override": body.admin_override,
             "old_tier": old_tier,
         }),
     )

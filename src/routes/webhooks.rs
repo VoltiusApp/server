@@ -143,7 +143,7 @@ async fn handle_subscription_updated(pool: &PgPool, payload: &serde_json::Value)
         .unwrap_or("pro");
 
     let result = sqlx::query(
-        "UPDATE users SET subscription_tier = $1 WHERE ls_subscription_id = $2",
+        "UPDATE users SET subscription_tier = $1 WHERE ls_subscription_id = $2 AND admin_override = FALSE",
     )
     .bind(tier)
     .bind(ls_subscription_id)
@@ -186,7 +186,7 @@ async fn handle_subscription_expired(pool: &PgPool, payload: &serde_json::Value)
             subscription_tier = 'free',
             ls_subscription_id = NULL,
             trial_used = TRUE
-         WHERE ls_subscription_id = $1",
+         WHERE ls_subscription_id = $1 AND admin_override = FALSE",
     )
     .bind(ls_subscription_id)
     .execute(pool)
