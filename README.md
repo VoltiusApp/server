@@ -1,14 +1,18 @@
 # Voltius Server
 
-Axum/Rust API server for Voltius.
+Axum/Rust API server for Voltius. Licensed under **AGPLv3** — see [LICENSE](./LICENSE).
 
-## Getting Started
+## Self-Hosting
 
 ```bash
+cp .env.example .env
+# Edit .env with your values
 docker compose up -d
 ```
 
 Listening on `http://0.0.0.0:8080` by default.
+
+Business customers who self-host receive a **commercial license exception** alongside their subscription, allowing private modifications without AGPLv3 obligations. See [COMMERCIAL_LICENSE.md](../COMMERCIAL_LICENSE.md).
 
 ## Environment Variables
 

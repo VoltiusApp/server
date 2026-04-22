@@ -31,7 +31,6 @@ services:
       RUST_LOG: info
       SYNC_RATE_LIMIT: ${SYNC_RATE_LIMIT:-10000}
       ADMIN_SECRET: ${ADMIN_SECRET}
-      LICENSE_KEY: ${LICENSE_KEY}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
       interval: 5s
