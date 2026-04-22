@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod license;
 mod models;
 mod permissions;
 mod rate_limit;
@@ -30,6 +31,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    license::check().await;
 
     let pool = db::create_pool().await;
     let notifier = SyncNotifier::new();
