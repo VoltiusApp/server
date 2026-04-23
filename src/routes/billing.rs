@@ -8,8 +8,9 @@ use crate::auth::AuthUser;
 
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
-    pub plan: String, // "pro" | "teams"
+    pub plan: String,     // "pro" | "teams"
     pub seats: Option<u32>,
+    pub interval: Option<String>, // "monthly" | "yearly", defaults to "monthly"
 }
 
 #[derive(Serialize)]
@@ -23,10 +24,13 @@ pub async fn create_checkout(
     Json(body): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutResponse>, StatusCode> {
     let store_slug = std::env::var("LEMONSQUEEZY_STORE_SLUG").unwrap_or_default();
-    let variant_id = match body.plan.as_str() {
-        "pro" => std::env::var("LS_VARIANT_PRO").unwrap_or_default(),
-        "teams" => std::env::var("LS_VARIANT_TEAMS").unwrap_or_default(),
-        _ => return Err(StatusCode::BAD_REQUEST),
+    let yearly = body.interval.as_deref().unwrap_or("monthly") == "yearly";
+    let variant_id = match (body.plan.as_str(), yearly) {
+        ("pro", false)   => std::env::var("LS_VARIANT_PRO_MONTHLY").unwrap_or_default(),
+        ("pro", true)    => std::env::var("LS_VARIANT_PRO_YEARLY").unwrap_or_default(),
+        ("teams", false) => std::env::var("LS_VARIANT_TEAMS_MONTHLY").unwrap_or_default(),
+        ("teams", true)  => std::env::var("LS_VARIANT_TEAMS_YEARLY").unwrap_or_default(),
+        _                => return Err(StatusCode::BAD_REQUEST),
     };
 
     if store_slug.is_empty() || variant_id.is_empty() {
