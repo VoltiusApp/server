@@ -165,7 +165,7 @@ pub async fn register(
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
-    pub email: String,
+    pub account_id: Uuid,
     pub auth_key: String,
 }
 
@@ -173,8 +173,8 @@ pub async fn login(
     State(pool): State<PgPool>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, StatusCode> {
-    let user = sqlx::query_as::<_, (Uuid, String, bool)>("SELECT id, auth_hash, is_banned FROM users WHERE email = $1")
-        .bind(&body.email)
+    let user = sqlx::query_as::<_, (Uuid, String, bool)>("SELECT id, auth_hash, is_banned FROM users WHERE account_id = $1")
+        .bind(body.account_id)
         .fetch_optional(&pool)
         .await
         .map_err(|err| {

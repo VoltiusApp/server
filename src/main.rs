@@ -17,7 +17,7 @@ use sync_notifier::SyncNotifier;
 use terminal_manager::TerminalManager;
 use std::net::SocketAddr;
 use std::time::Duration;
-use axum::http::HeaderValue;
+use axum::http::{header, HeaderValue};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -149,7 +149,7 @@ async fn main() {
             CorsLayer::new()
                 .allow_origin(allow_origin)
                 .allow_methods(Any)
-                .allow_headers(Any)
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         })
         .layer(
             TraceLayer::new_for_http()
