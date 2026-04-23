@@ -83,7 +83,8 @@ pub struct RegisterRequest {
     pub email: String,
     pub account_id: Uuid,
     pub auth_key: String,
-    pub public_key: String,
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,7 +114,7 @@ pub async fn register(
     .bind(&body.email)
     .bind(body.account_id)
     .bind(&auth_hash)
-    .bind(&body.public_key)
+    .bind(body.public_key.as_deref())
     .bind(trial_ends_at)
     .fetch_one(&pool)
     .await
