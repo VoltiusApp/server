@@ -91,6 +91,8 @@ pub struct AuthResponse {
     pub user_id: Uuid,
     pub jwt_token: String,
     pub refresh_token: String,
+    pub tier: String,
+    pub trial_ends_at: Option<i64>,
 }
 
 pub async fn register(
@@ -152,6 +154,8 @@ pub async fn register(
             user_id,
             jwt_token,
             refresh_token,
+            tier: "pro".to_string(),
+            trial_ends_at: Some(trial_ends_at.timestamp()),
         }),
     ))
 }
@@ -214,6 +218,8 @@ pub async fn login(
         user_id,
         jwt_token,
         refresh_token,
+        tier: tier.tier,
+        trial_ends_at: tier.trial_ends_at,
     }))
 }
 
