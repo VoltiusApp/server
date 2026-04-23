@@ -12,7 +12,7 @@ docker compose up -d
 
 Listening on `http://0.0.0.0:8080` by default.
 
-Business customers who self-host receive a **commercial license exception** alongside their subscription, allowing private modifications without AGPLv3 obligations. See [COMMERCIAL_LICENSE.md](../COMMERCIAL_LICENSE.md).
+Business customers who self-host receive a **commercial license exception** alongside their subscription, allowing private modifications without AGPLv3 obligations. See [COMMERCIAL_LICENSE.md](./COMMERCIAL_LICENSE.md).
 
 ## Environment Variables
 
