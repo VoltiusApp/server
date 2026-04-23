@@ -83,19 +83,23 @@ async fn handle_subscription_created(pool: &PgPool, payload: &serde_json::Value)
         .as_str()
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
+    let seat_count = attrs["quantity"].as_i64().map(|q| q as i32);
+
     let result = if let Some(uid) = user_id {
         sqlx::query(
             "UPDATE users SET
                 subscription_tier = $1,
                 ls_customer_id = $2,
                 ls_subscription_id = $3,
+                seat_count = COALESCE($4, seat_count),
                 trial_used = TRUE,
                 trial_ends_at = NULL
-             WHERE id = $4",
+             WHERE id = $5",
         )
         .bind(tier)
         .bind(ls_customer_id)
         .bind(ls_subscription_id)
+        .bind(seat_count)
         .bind(uid)
         .execute(pool)
         .await
@@ -106,13 +110,15 @@ async fn handle_subscription_created(pool: &PgPool, payload: &serde_json::Value)
                 subscription_tier = $1,
                 ls_customer_id = $2,
                 ls_subscription_id = $3,
+                seat_count = COALESCE($4, seat_count),
                 trial_used = TRUE,
                 trial_ends_at = NULL
-             WHERE email = $4",
+             WHERE email = $5",
         )
         .bind(tier)
         .bind(ls_customer_id)
         .bind(ls_subscription_id)
+        .bind(seat_count)
         .bind(customer_email)
         .execute(pool)
         .await
@@ -142,10 +148,16 @@ async fn handle_subscription_updated(pool: &PgPool, payload: &serde_json::Value)
         .map(|n| tier_from_product_name(n))
         .unwrap_or("pro");
 
+    let seat_count = attrs["quantity"].as_i64().map(|q| q as i32);
+
     let result = sqlx::query(
-        "UPDATE users SET subscription_tier = $1 WHERE ls_subscription_id = $2 AND admin_override = FALSE",
+        "UPDATE users SET
+            subscription_tier = $1,
+            seat_count = COALESCE($2, seat_count)
+         WHERE ls_subscription_id = $3 AND admin_override = FALSE",
     )
     .bind(tier)
+    .bind(seat_count)
     .bind(ls_subscription_id)
     .execute(pool)
     .await;

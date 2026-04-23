@@ -193,6 +193,36 @@ pub async fn add_member(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Enforce seat limit: owner's seat_count caps how many members the team can have
+    let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
+        .bind(team_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let seat_count = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT seat_count FROM users WHERE id = $1",
+    )
+    .bind(owner_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if let Some(seats) = seat_count {
+        let current = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM team_members WHERE team_id = $1",
+        )
+        .bind(team_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to count team members"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        if current >= seats as i64 {
+            warn!(team_id = %team_id, seats, current, "Seat limit reached");
+            return Err(StatusCode::PAYMENT_REQUIRED);
+        }
+    }
+
     let member_role = body.role.as_deref().unwrap_or("member");
     sqlx::query(
         "INSERT INTO team_members (team_id, user_id, role, invited_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",

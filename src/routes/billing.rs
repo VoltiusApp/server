@@ -33,6 +33,14 @@ pub async fn create_checkout(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    // Teams requires at least 3 seats
+    if body.plan == "teams" {
+        let seats = body.seats.unwrap_or(0);
+        if seats < 3 {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
     let email = fetch_user_email(&pool, auth.0).await?;
     let mut url = format!(
         "https://{store_slug}.lemonsqueezy.com/checkout/buy/{variant_id}?checkout[email]={email}"
