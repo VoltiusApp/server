@@ -14,7 +14,7 @@ pub struct CheckoutRequest {
 
 #[derive(Serialize)]
 pub struct CheckoutResponse {
-    pub url: String,
+    pub checkout_url: String,
 }
 
 pub async fn create_checkout(
@@ -53,7 +53,7 @@ pub async fn create_checkout(
         url.push_str(&format!("&checkout[quantity]={seats}"));
     }
 
-    Ok(Json(CheckoutResponse { url }))
+    Ok(Json(CheckoutResponse { checkout_url: url }))
 }
 
 async fn fetch_user_email(pool: &PgPool, user_id: Uuid) -> Result<String, StatusCode> {
