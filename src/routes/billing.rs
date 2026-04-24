@@ -7,6 +7,14 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 
 #[derive(Serialize)]
+pub struct SubscriptionInfoResponse {
+    pub tier: String,
+    pub seats: Option<i32>,
+    pub trial_ends_at: Option<i64>,
+    pub has_ls_subscription: bool,
+}
+
+#[derive(Serialize)]
 pub struct PortalResponse {
     pub portal_url: String,
 }
@@ -75,26 +83,54 @@ pub async fn get_portal(
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<PortalResponse>, StatusCode> {
     let row = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT ls_customer_id FROM users WHERE id = $1",
+        "SELECT ls_subscription_id FROM users WHERE id = $1",
     )
     .bind(auth.0)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to fetch customer id");
+        error!(error = %e, user_id = %auth.0, "Failed to fetch subscription id");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let customer_id = row.0.ok_or(StatusCode::NOT_FOUND)?;
-    let store_id = std::env::var("LEMONSQUEEZY_STORE_ID").unwrap_or_default();
-    if store_id.is_empty() {
+    let subscription_id = row.0.ok_or(StatusCode::NOT_FOUND)?;
+    let api_key = std::env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // Lemon Squeezy customer portal URL
-    let portal_url = format!(
-        "https://app.lemonsqueezy.com/my-orders?customer_id={customer_id}&store_id={store_id}"
-    );
+    let client = reqwest::Client::new();
+    let ls_res = client
+        .get(format!(
+            "https://api.lemonsqueezy.com/v1/subscriptions/{subscription_id}"
+        ))
+        .bearer_auth(&api_key)
+        .header("Accept", "application/vnd.api+json")
+        .send()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "LS subscription fetch request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !ls_res.status().is_success() {
+        error!(status = %ls_res.status(), "LS subscription fetch failed");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let ls_body: serde_json::Value = ls_res.json().await.map_err(|e| {
+        error!(error = %e, "LS subscription response parse failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let portal_url = ls_body["data"]["attributes"]["urls"]["customer_portal"]
+        .as_str()
+        .ok_or_else(|| {
+            error!("LS subscription response missing customer_portal URL");
+            StatusCode::BAD_GATEWAY
+        })?
+        .to_string();
+
     Ok(Json(PortalResponse { portal_url }))
 }
 
@@ -152,6 +188,29 @@ pub async fn update_seats(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_subscription(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+) -> Result<Json<SubscriptionInfoResponse>, StatusCode> {
+    let row = sqlx::query_as::<_, (String, Option<chrono::DateTime<chrono::Utc>>, Option<i32>, Option<String>)>(
+        "SELECT subscription_tier, trial_ends_at, seat_count, ls_subscription_id FROM users WHERE id = $1",
+    )
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to fetch subscription info");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(SubscriptionInfoResponse {
+        tier: row.0,
+        trial_ends_at: row.1.map(|t| t.timestamp()),
+        seats: row.2,
+        has_ls_subscription: row.3.is_some(),
+    }))
 }
 
 async fn fetch_user_email(pool: &PgPool, user_id: Uuid) -> Result<String, StatusCode> {
