@@ -6,6 +6,16 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 
+#[derive(Serialize)]
+pub struct PortalResponse {
+    pub portal_url: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSeatsRequest {
+    pub seats: u32,
+}
+
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
     pub plan: String,     // "pro" | "teams"
@@ -58,6 +68,90 @@ pub async fn create_checkout(
     }
 
     Ok(Json(CheckoutResponse { checkout_url: url }))
+}
+
+pub async fn get_portal(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+) -> Result<Json<PortalResponse>, StatusCode> {
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT ls_customer_id FROM users WHERE id = $1",
+    )
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to fetch customer id");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let customer_id = row.0.ok_or(StatusCode::NOT_FOUND)?;
+    let store_id = std::env::var("LEMONSQUEEZY_STORE_ID").unwrap_or_default();
+    if store_id.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // Lemon Squeezy customer portal URL
+    let portal_url = format!(
+        "https://app.lemonsqueezy.com/my-orders?customer_id={customer_id}&store_id={store_id}"
+    );
+    Ok(Json(PortalResponse { portal_url }))
+}
+
+pub async fn update_seats(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Json(body): Json<UpdateSeatsRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if body.seats < 3 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT ls_subscription_id FROM users WHERE id = $1",
+    )
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to fetch subscription id");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let subscription_id = row.0.ok_or(StatusCode::NOT_FOUND)?;
+    let api_key = std::env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let client = reqwest::Client::new();
+    let res = client
+        .patch(format!(
+            "https://api.lemonsqueezy.com/v1/subscriptions/{subscription_id}"
+        ))
+        .bearer_auth(&api_key)
+        .header("Accept", "application/vnd.api+json")
+        .header("Content-Type", "application/vnd.api+json")
+        .json(&serde_json::json!({
+            "data": {
+                "type": "subscriptions",
+                "id": subscription_id,
+                "attributes": { "quantity": body.seats }
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "LS seats update request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !res.status().is_success() {
+        error!(status = %res.status(), "LS seats update failed");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn fetch_user_email(pool: &PgPool, user_id: Uuid) -> Result<String, StatusCode> {

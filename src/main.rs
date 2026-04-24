@@ -97,6 +97,8 @@ async fn main() {
         .route("/v1/terminal-sessions/:id", delete(routes::terminal::end_session))
         // Billing
         .route("/v1/billing/checkout", post(routes::billing::create_checkout))
+        .route("/v1/billing/portal", post(routes::billing::get_portal))
+        .route("/v1/billing/seats", post(routes::billing::update_seats))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
