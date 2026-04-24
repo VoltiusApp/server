@@ -37,9 +37,9 @@ pub async fn create_checkout(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // Teams requires at least 3 seats
+    // Teams requires at least 3 seats; default to 3 if not specified
     if body.plan == "teams" {
-        let seats = body.seats.unwrap_or(0);
+        let seats = body.seats.unwrap_or(3);
         if seats < 3 {
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
