@@ -4,7 +4,7 @@ CREATE TABLE pending_invitations (
   email        TEXT NOT NULL,
   role         TEXT NOT NULL DEFAULT 'member',
   invited_by   UUID REFERENCES users(id) ON DELETE SET NULL,
-  token        TEXT NOT NULL UNIQUE DEFAULT encode(gen_random_bytes(32), 'hex'),
+  token        TEXT NOT NULL UNIQUE DEFAULT replace(gen_random_uuid()::text, '-', '') || replace(gen_random_uuid()::text, '-', ''),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at   TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '7 days',
   accepted_at  TIMESTAMPTZ,
