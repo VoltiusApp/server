@@ -195,15 +195,15 @@ pub async fn add_member(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Enforce seat limit: owner's seat_count caps how many members the team can have
+    // Enforce seat limit: count unique users across all vaults owned by the team owner
     let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
         .bind(team_id)
         .fetch_one(&pool)
         .await
         .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    let seat_count = sqlx::query_scalar::<_, Option<i32>>(
-        "SELECT seat_count FROM users WHERE id = $1",
+    let (seat_count, trial_ends_at) = sqlx::query_as::<_, (Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT seat_count, trial_ends_at FROM users WHERE id = $1",
     )
     .bind(owner_id)
     .fetch_one(&pool)
@@ -211,16 +211,26 @@ pub async fn add_member(
     .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if let Some(seats) = seat_count {
-        let current = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM team_members WHERE team_id = $1",
+        // During LS-native trial, cap at 10 seats regardless of purchased quantity
+        let effective_cap = if trial_ends_at.is_some() {
+            seats.min(10)
+        } else {
+            seats
+        };
+
+        let used = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT tm.user_id)
+             FROM team_members tm
+             JOIN teams t ON tm.team_id = t.id
+             WHERE t.owner_id = $1",
         )
-        .bind(team_id)
+        .bind(owner_id)
         .fetch_one(&pool)
         .await
-        .map_err(|e| { error!(error = %e, "Failed to count team members"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| { error!(error = %e, "Failed to count used seats"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-        if current >= seats as i64 {
-            warn!(team_id = %team_id, seats, current, "Seat limit reached");
+        if used >= effective_cap as i64 {
+            warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached");
             return Err(StatusCode::PAYMENT_REQUIRED);
         }
     }
@@ -698,5 +708,232 @@ pub async fn delete_role(
     }
 
     info!(team_id = %team_id, role_id = %role_id, "Custom role deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Invite member (email-based, creates pending invite if user not found) ────
+
+#[derive(Deserialize)]
+pub struct InviteMemberRequest {
+    pub email: String,
+    pub role: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct InviteMemberResponse {
+    /// "added" if the user existed and was added directly, "invited" if an email was sent
+    pub status: String,
+}
+
+pub async fn invite_member(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::extract::Path(team_id): axum::extract::Path<Uuid>,
+    Json(body): Json<InviteMemberRequest>,
+) -> Result<Json<InviteMemberResponse>, StatusCode> {
+    let can_invite = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_INVITE_MEMBERS,
+    )
+    .await?;
+    if !can_invite {
+        warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to invite members");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let email = body.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let role = body.role.as_deref().unwrap_or("member").to_string();
+
+    // Seat limit check (same logic as add_member)
+    let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
+        .bind(team_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let (seat_count, trial_ends_at) = sqlx::query_as::<_, (Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT seat_count, trial_ends_at FROM users WHERE id = $1",
+    )
+    .bind(owner_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if let Some(seats) = seat_count {
+        let effective_cap = if trial_ends_at.is_some() { seats.min(10) } else { seats };
+        let used = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT tm.user_id)
+             FROM team_members tm
+             JOIN teams t ON tm.team_id = t.id
+             WHERE t.owner_id = $1",
+        )
+        .bind(owner_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to count used seats"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        if used >= effective_cap as i64 {
+            warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached on invite");
+            return Err(StatusCode::PAYMENT_REQUIRED);
+        }
+    }
+
+    // Check if user with that email already exists
+    let existing_user = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to look up user by email"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if let Some((user_id,)) = existing_user {
+        // Direct add — same as add_member
+        if user_id == auth.0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        sqlx::query(
+            "INSERT INTO team_members (team_id, user_id, role, invited_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .bind(&role)
+        .bind(auth.0)
+        .execute(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to add team member directly"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        info!(team_id = %team_id, user_id = %user_id, role = %role, "Member directly added via invite endpoint");
+        notifier.notify_membership_changed(user_id);
+        return Ok(Json(InviteMemberResponse { status: "added".to_string() }));
+    }
+
+    // User doesn't exist — create pending invitation and send email
+    let inviter_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
+        .bind(auth.0)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch inviter email"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let team_name = sqlx::query_scalar::<_, String>("SELECT name FROM teams WHERE id = $1")
+        .bind(team_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch team name"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let token: String = sqlx::query_scalar(
+        "INSERT INTO pending_invitations (team_id, email, role, invited_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (team_id, email) DO UPDATE
+           SET role = EXCLUDED.role,
+               invited_by = EXCLUDED.invited_by,
+               expires_at = now() + INTERVAL '7 days',
+               accepted_at = NULL
+         RETURNING token",
+    )
+    .bind(team_id)
+    .bind(&email)
+    .bind(&role)
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to create pending invitation"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let app_url = std::env::var("VOLTIUS_APP_URL")
+        .unwrap_or_else(|_| "https://app.voltius.app".to_string());
+
+    if let Err(e) = crate::email::send_team_invitation(&email, &team_name, &inviter_email, &token, &app_url).await {
+        error!(error = %e, "Failed to send invitation email");
+        // Don't fail the request — invitation record is created, email is best-effort
+    }
+
+    info!(team_id = %team_id, email = %email, "Pending invitation created");
+    Ok(Json(InviteMemberResponse { status: "invited".to_string() }))
+}
+
+// ─── List pending invitations ─────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct PendingInvitation {
+    pub id: Uuid,
+    pub email: String,
+    pub role: String,
+    pub invited_by_email: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn list_pending_invitations(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::extract::Path(team_id): axum::extract::Path<Uuid>,
+) -> Result<Json<Vec<PendingInvitation>>, StatusCode> {
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
+    )
+    .bind(team_id)
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+        r#"SELECT pi.id, pi.email, pi.role, u.email, pi.created_at, pi.expires_at
+           FROM pending_invitations pi
+           LEFT JOIN users u ON u.id = pi.invited_by
+           WHERE pi.team_id = $1
+             AND pi.accepted_at IS NULL
+             AND pi.expires_at > now()
+           ORDER BY pi.created_at DESC"#,
+    )
+    .bind(team_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to list pending invitations"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, email, role, invited_by_email, created_at, expires_at)| PendingInvitation {
+                id, email, role, invited_by_email, created_at, expires_at,
+            })
+            .collect(),
+    ))
+}
+
+// ─── Revoke pending invitation ────────────────────────────────────────────────
+
+pub async fn revoke_pending_invitation(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::extract::Path((team_id, invitation_id)): axum::extract::Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
+    )
+    .await?;
+    if !can_manage {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let result = sqlx::query(
+        "DELETE FROM pending_invitations WHERE id = $1 AND team_id = $2",
+    )
+    .bind(invitation_id)
+    .bind(team_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to revoke invitation"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    info!(team_id = %team_id, invitation_id = %invitation_id, "Pending invitation revoked");
     Ok(StatusCode::NO_CONTENT)
 }

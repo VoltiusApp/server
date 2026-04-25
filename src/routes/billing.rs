@@ -10,6 +10,7 @@ use crate::auth::AuthUser;
 pub struct SubscriptionInfoResponse {
     pub tier: String,
     pub seats: Option<i32>,
+    pub used_seats: Option<i64>,
     pub trial_ends_at: Option<i64>,
     pub has_ls_subscription: bool,
 }
@@ -22,6 +23,8 @@ pub struct PortalResponse {
 #[derive(Deserialize)]
 pub struct UpdateSeatsRequest {
     pub seats: u32,
+    #[serde(default)]
+    pub invoice_immediately: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +163,11 @@ pub async fn update_seats(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    let mut attributes = serde_json::json!({ "quantity": body.seats });
+    if body.invoice_immediately == Some(true) {
+        attributes["invoice_immediately"] = serde_json::json!(true);
+    }
+
     let client = reqwest::Client::new();
     let res = client
         .patch(format!(
@@ -172,7 +180,7 @@ pub async fn update_seats(
             "data": {
                 "type": "subscriptions",
                 "id": subscription_id,
-                "attributes": { "quantity": body.seats }
+                "attributes": attributes,
             }
         }))
         .send()
@@ -186,6 +194,18 @@ pub async fn update_seats(
         error!(status = %res.status(), "LS seats update failed");
         return Err(StatusCode::BAD_GATEWAY);
     }
+
+    // Optimistically update seat_count so the subsequent add_member call doesn't
+    // race the LS webhook (which updates it asynchronously).
+    sqlx::query("UPDATE users SET seat_count = $1 WHERE id = $2")
+        .bind(body.seats as i32)
+        .bind(auth.0)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to optimistically update seat_count");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -205,10 +225,31 @@ pub async fn get_subscription(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let tier = &row.0;
+    let used_seats = if tier == "teams" || tier == "business" {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT tm.user_id)
+             FROM team_members tm
+             JOIN teams t ON tm.team_id = t.id
+             WHERE t.owner_id = $1",
+        )
+        .bind(auth.0)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %auth.0, "Failed to count used seats");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        Some(count)
+    } else {
+        None
+    };
+
     Ok(Json(SubscriptionInfoResponse {
         tier: row.0,
         trial_ends_at: row.1.map(|t| t.timestamp()),
         seats: row.2,
+        used_seats,
         has_ls_subscription: row.3.is_some(),
     }))
 }

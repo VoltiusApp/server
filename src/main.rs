@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod email;
 mod models;
 mod permissions;
 mod rate_limit;
@@ -55,6 +56,10 @@ async fn main() {
     let webhooks = Router::new()
         .route("/v1/webhooks/lemonsqueezy", post(routes::webhooks::lemonsqueezy_webhook));
 
+    // Public invitation details — no auth (email link)
+    let public_invitations = Router::new()
+        .route("/v1/invitations/:token", get(routes::invitations::get_invitation));
+
     // Pro-gated sync routes (auth + tier check + rate limit)
     let pro_sync = Router::new()
         .route("/v1/sync/blob", put(routes::sync::put_blob))
@@ -80,6 +85,11 @@ async fn main() {
         .route("/v1/teams/:team_id/members/:user_id", delete(routes::teams::remove_member))
         .route("/v1/teams/:team_id/members/:user_id", patch(routes::teams::update_member_role))
         .route("/v1/users/search", get(routes::teams::search_users))
+        // Team invitations
+        .route("/v1/teams/:team_id/invite", post(routes::teams::invite_member))
+        .route("/v1/teams/:team_id/pending-invitations", get(routes::teams::list_pending_invitations))
+        .route("/v1/teams/:team_id/pending-invitations/:inv_id", delete(routes::teams::revoke_pending_invitation))
+        .route("/v1/invitations/:token/accept", post(routes::invitations::accept_invitation))
         // Custom roles
         .route("/v1/teams/:team_id/roles", get(routes::teams::list_roles))
         .route("/v1/teams/:team_id/roles", post(routes::teams::create_role))
@@ -133,6 +143,7 @@ async fn main() {
     let app = Router::new()
         .merge(public)
         .merge(webhooks)
+        .merge(public_invitations)
         .merge(pro_sync)
         .merge(protected)
         .merge(admin_routes)

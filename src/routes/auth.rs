@@ -130,6 +130,38 @@ pub async fn register(
     })?;
 
     let user_id = row.0;
+
+    // Auto-accept any pending invitations for this email
+    let pending = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT team_id, role FROM pending_invitations
+         WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
+    )
+    .bind(&body.email)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
+    for (team_id, role) in &pending {
+        let _ = sqlx::query(
+            "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .bind(role)
+        .execute(&pool)
+        .await;
+    }
+    if !pending.is_empty() {
+        let _ = sqlx::query(
+            "UPDATE pending_invitations SET accepted_at = now()
+             WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
+        )
+        .bind(&body.email)
+        .execute(&pool)
+        .await;
+        info!(user_id = %user_id, count = pending.len(), "Auto-accepted pending invitations on registration");
+    }
+
     let jwt_token = create_access_token(
         user_id,
         "pro",
