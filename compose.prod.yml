@@ -13,7 +13,7 @@ services:
       RUST_LOG: info
       SYNC_RATE_LIMIT: ${SYNC_RATE_LIMIT:-10000}
       ADMIN_SECRET: ${ADMIN_SECRET}
-      CORS_ORIGINS: https://voltius.app,https://www.voltius.app,https://app.voltius.app,tauri://localhost,https://tauri.localhost,http://localhost:1420
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://voltius.app,https://www.voltius.app,https://app.voltius.app,tauri://localhost,https://tauri.localhost,http://localhost:1420,http://localhost:1421}
       LEMONSQUEEZY_SIGNING_SECRET: ${LEMONSQUEEZY_SIGNING_SECRET}
       LEMONSQUEEZY_STORE_SLUG: ${LEMONSQUEEZY_STORE_SLUG}
       LS_VARIANT_PRO_MONTHLY: ${LS_VARIANT_PRO_MONTHLY}
