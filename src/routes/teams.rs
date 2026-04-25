@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{CustomRole, Team, TeamMember};
+use crate::sync_notifier::SyncNotifier;
 
 // ─── Create team ─────────────────────────────────────────────────────────────
 
@@ -154,6 +155,7 @@ pub struct AddMemberRequest {
 pub async fn add_member(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<AddMemberRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -239,6 +241,7 @@ pub async fn add_member(
     })?;
 
     info!(team_id = %team_id, invitee_id = %invitee_id, role = %member_role, "Member added");
+    notifier.notify_membership_changed(invitee_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -364,6 +367,7 @@ pub async fn update_member_role(
 pub async fn remove_member(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, user_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     // Members can remove themselves; MANAGE_MEMBERS permission required to remove others
@@ -401,6 +405,7 @@ pub async fn remove_member(
         .map_err(|e| { error!(error = %e, "Failed to remove team member"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     info!(team_id = %team_id, removed_user_id = %user_id, "Member removed");
+    notifier.notify_membership_changed(user_id);
     Ok(StatusCode::NO_CONTENT)
 }
 

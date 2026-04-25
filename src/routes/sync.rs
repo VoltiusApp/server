@@ -9,7 +9,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 use crate::auth::AuthUser;
-use crate::sync_notifier::SyncNotifier;
+use crate::sync_notifier::{SyncEvent, SyncNotifier};
 
 const MAX_BLOB_SIZE: usize = 5 * 1024 * 1024; // 5 MB
 
@@ -220,8 +220,11 @@ pub async fn sync_stream(
     let rx = notifier.subscribe();
 
     let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
-        Ok((uid, device_id)) if uid == user_id => {
+        Ok(SyncEvent::BlobPushed { user_id: uid, device_id }) if uid == user_id => {
             Some(Ok(Event::default().data(device_id)))
+        }
+        Ok(SyncEvent::MembershipChanged { user_id: uid }) if uid == user_id => {
+            Some(Ok(Event::default().data("membership_changed")))
         }
         Ok(_) => None,
         // Lagged: we missed some events, tell the client to sync anyway
