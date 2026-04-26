@@ -349,7 +349,11 @@ pub async fn patch_user(
             discount_pct = COALESCE($5, discount_pct),
             admin_notes = COALESCE($6, admin_notes),
             admin_override = COALESCE($8, admin_override),
-            seat_count = COALESCE($9, seat_count)
+            seat_count = CASE
+                WHEN $9::int IS NOT NULL THEN $9
+                WHEN seat_count IS NULL AND COALESCE($1, subscription_tier) IN ('teams', 'business') THEN 3
+                ELSE seat_count
+            END
         WHERE id = $7
         "#,
     )
