@@ -90,7 +90,9 @@ async fn main() {
         .route("/v1/teams/:team_id/members", get(routes::teams::list_members))
         .route("/v1/teams/:team_id/members", post(routes::teams::add_member))
         .route("/v1/teams/:team_id/members/:user_id", delete(routes::teams::remove_member))
-        .route("/v1/teams/:team_id/members/:user_id", patch(routes::teams::update_member_role))
+        .route("/v1/teams/:team_id/members/:user_id/roles", get(routes::teams::list_member_roles))
+        .route("/v1/teams/:team_id/members/:user_id/roles", post(routes::teams::assign_member_role))
+        .route("/v1/teams/:team_id/members/:user_id/roles/:role_id", delete(routes::teams::remove_member_role))
         .route("/v1/users/search", get(routes::teams::search_users))
         // Team invitations
         .route("/v1/teams/:team_id/invite", post(routes::teams::invite_member))

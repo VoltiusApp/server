@@ -55,7 +55,6 @@ pub async fn accept_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    // Fetch invitation
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
         r#"SELECT pi.id, pi.team_id, pi.email, pi.role
            FROM pending_invitations pi
@@ -77,7 +76,6 @@ pub async fn accept_invitation(
 
     let (invitation_id, team_id, invited_email, role) = row;
 
-    // Verify the accepting user's email matches the invitation
     let user_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
         .bind(auth.0)
         .fetch_one(&pool)
@@ -97,29 +95,55 @@ pub async fn accept_invitation(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Add to team
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin transaction for invitation acceptance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Add to team_members (no role column after migration)
     sqlx::query(
-        "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        "INSERT INTO team_members (team_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
     .bind(team_id)
     .bind(auth.0)
-    .bind(&role)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, "Failed to add member on invitation acceptance");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Mark accepted
+    // Assign the builtin role stored in the invitation
+    sqlx::query(
+        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
+           SELECT $1, $2, tr.id FROM team_roles tr
+           WHERE tr.team_id = $1 AND tr.name = $3 AND tr.is_builtin = TRUE
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(team_id)
+    .bind(auth.0)
+    .bind(&role)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to assign role on invitation acceptance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Mark invitation accepted
     sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
         .bind(invitation_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             error!(error = %e, "Failed to mark invitation accepted");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit invitation acceptance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     info!(user_id = %auth.0, team_id = %team_id, role = %role, "Invitation accepted");
     notifier.notify_membership_changed(auth.0);

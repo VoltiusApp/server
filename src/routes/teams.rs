@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::models::team::{CustomRole, Team, TeamMember};
+use crate::models::team::{Team, TeamMember, TeamRole};
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
@@ -21,28 +21,67 @@ pub async fn create_team(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<CreateTeamRequest>,
 ) -> Result<(StatusCode, Json<Team>), StatusCode> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let team = sqlx::query_as::<_, Team>(
         "INSERT INTO teams (name, owner_id) VALUES ($1, $2) RETURNING id, name, owner_id, created_at",
     )
     .bind(&body.name)
     .bind(auth.0)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, "Failed to create team");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Owner is automatically a member
+    sqlx::query("INSERT INTO team_members (team_id, user_id) VALUES ($1, $2)")
+        .bind(team.id)
+        .bind(auth.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to add owner as team member");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Seed builtin roles for the new team
+    for (name, permissions, position) in crate::permissions::BUILTIN_ROLES {
+        sqlx::query(
+            "INSERT INTO team_roles (team_id, name, permissions, is_builtin, position) VALUES ($1, $2, $3, TRUE, $4)",
+        )
+        .bind(team.id)
+        .bind(*name)
+        .bind(*permissions)
+        .bind(*position)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, name = %name, "Failed to seed builtin role");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Assign owner role to creator
     sqlx::query(
-        "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')",
+        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
+           SELECT $1, $2, id FROM team_roles
+           WHERE team_id = $1 AND name = 'owner' AND is_builtin = TRUE"#,
     )
     .bind(team.id)
     .bind(auth.0)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
-        error!(error = %e, "Failed to add owner as team member");
+        error!(error = %e, "Failed to assign owner role");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit team creation transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -58,20 +97,21 @@ pub struct TeamWithRole {
     pub name: String,
     pub owner_id: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub role: String,
+    pub role_ids: Vec<Uuid>,
 }
 
 pub async fn list_teams(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<TeamWithRole>>, StatusCode> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, chrono::DateTime<chrono::Utc>, String)>(
+    // Returns one row per (team, role) — aggregated in Rust
+    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>)>(
         r#"
-        SELECT t.id, t.name, t.owner_id, t.created_at, tm.role
+        SELECT t.id, t.name, t.owner_id, t.created_at, tmr.role_id
         FROM teams t
-        JOIN team_members tm ON tm.team_id = t.id
-        WHERE tm.user_id = $1
-        ORDER BY t.created_at ASC
+        JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
+        LEFT JOIN team_member_roles tmr ON tmr.team_id = t.id AND tmr.user_id = $1
+        ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
     )
     .bind(auth.0)
@@ -82,17 +122,27 @@ pub async fn list_teams(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(|(id, name, owner_id, created_at, role)| TeamWithRole {
-                id,
-                name,
-                owner_id,
-                created_at,
-                role,
-            })
-            .collect(),
-    ))
+    let mut teams: Vec<TeamWithRole> = Vec::new();
+    for (id, name, owner_id, created_at, role_id) in rows {
+        match teams.last_mut() {
+            Some(last) if last.id == id => {
+                if let Some(rid) = role_id {
+                    last.role_ids.push(rid);
+                }
+            }
+            _ => {
+                teams.push(TeamWithRole {
+                    id,
+                    name,
+                    owner_id,
+                    created_at,
+                    role_ids: role_id.into_iter().collect(),
+                });
+            }
+        }
+    }
+
+    Ok(Json(teams))
 }
 
 // ─── Get team members ─────────────────────────────────────────────────────────
@@ -127,17 +177,17 @@ pub async fn list_members(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let members = sqlx::query_as::<_, TeamMember>(
+    // Returns one row per (member, role) — aggregated in Rust
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>, String, String, Option<Uuid>)>(
         r#"
-        SELECT tm.team_id, tm.user_id, tm.role, inv.email AS invited_by_email, tm.joined_at,
-               u.email, u.public_key,
-               tm.custom_role_id, cr.name AS custom_role_name, cr.permissions AS custom_role_permissions
+        SELECT tm.team_id, tm.user_id, inv.email AS invited_by_email, tm.joined_at,
+               u.email, u.public_key, tmr.role_id
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
-        LEFT JOIN custom_roles cr ON cr.id = tm.custom_role_id
+        LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
         WHERE tm.team_id = $1
-        ORDER BY tm.joined_at ASC
+        ORDER BY tm.joined_at ASC, tmr.role_id ASC NULLS LAST
         "#,
     )
     .bind(team_id)
@@ -148,24 +198,39 @@ pub async fn list_members(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let response: Vec<TeamMemberResponse> = members
-        .into_iter()
-        .map(|m| TeamMemberResponse {
-            is_online: presence.contains_key(&m.user_id),
-            member: m,
-        })
-        .collect();
+    let mut members: Vec<TeamMemberResponse> = Vec::new();
+    for (t_id, user_id, invited_by_email, joined_at, email, public_key, role_id) in rows {
+        match members.last_mut() {
+            Some(last) if last.member.user_id == user_id => {
+                if let Some(rid) = role_id {
+                    last.member.role_ids.push(rid);
+                }
+            }
+            _ => {
+                members.push(TeamMemberResponse {
+                    is_online: presence.contains_key(&user_id),
+                    member: TeamMember {
+                        team_id: t_id,
+                        user_id,
+                        email,
+                        public_key,
+                        invited_by_email,
+                        joined_at,
+                        role_ids: role_id.into_iter().collect(),
+                    },
+                });
+            }
+        }
+    }
 
-    Ok(Json(response))
+    Ok(Json(members))
 }
 
 // ─── Add member (by email or user_id) ────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct AddMemberRequest {
-    /// Invite by email address
     pub email: Option<String>,
-    /// Invite directly by user_id (from search results)
     pub user_id: Option<Uuid>,
     pub role: Option<String>,
 }
@@ -177,7 +242,6 @@ pub async fn add_member(
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<AddMemberRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    // Verify requester has INVITE_MEMBERS permission (built-in owner/manager or custom role with bit)
     let can_invite = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_INVITE_MEMBERS,
     )
@@ -187,9 +251,7 @@ pub async fn add_member(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Resolve invitee: prefer user_id if provided, else find by email
     let invitee_id: Uuid = if let Some(uid) = body.user_id {
-        // Verify user exists
         let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
             .bind(uid)
             .fetch_one(&pool)
@@ -208,12 +270,10 @@ pub async fn add_member(
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    // Don't add yourself
     if invitee_id == auth.0 {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Enforce seat limit: count unique users across all vaults owned by the team owner
     let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
         .bind(team_id)
         .fetch_one(&pool)
@@ -229,13 +289,7 @@ pub async fn add_member(
     .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if let Some(seats) = seat_count {
-        // During LS-native trial, cap at 10 seats regardless of purchased quantity
-        let effective_cap = if trial_ends_at.is_some() {
-            seats.min(10)
-        } else {
-            seats
-        };
-
+        let effective_cap = if trial_ends_at.is_some() { seats.min(10) } else { seats };
         let used = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(DISTINCT tm.user_id)
              FROM team_members tm
@@ -253,140 +307,53 @@ pub async fn add_member(
         }
     }
 
-    let member_role = body.role.as_deref().unwrap_or("member");
+    let role_name = body.role.as_deref().unwrap_or("member");
+    const VALID_ROLES: &[&str] = &["owner", "manager", "editor", "member", "connect-only"];
+    if !VALID_ROLES.contains(&role_name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     sqlx::query(
-        "INSERT INTO team_members (team_id, user_id, role, invited_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        "INSERT INTO team_members (team_id, user_id, invited_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
     .bind(team_id)
     .bind(invitee_id)
-    .bind(member_role)
     .bind(auth.0)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, "Failed to add team member");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!(team_id = %team_id, invitee_id = %invitee_id, role = %member_role, "Member added");
+    sqlx::query(
+        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
+           SELECT $1, $2, id FROM team_roles
+           WHERE team_id = $1 AND name = $3 AND is_builtin = TRUE
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(team_id)
+    .bind(invitee_id)
+    .bind(role_name)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to assign builtin role");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit add member transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!(team_id = %team_id, invitee_id = %invitee_id, role = %role_name, "Member added");
     notifier.notify_membership_changed(invitee_id);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// ─── Update member role ───────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct UpdateRoleRequest {
-    /// Built-in role name ("manager" | "editor" | "member")
-    pub role: Option<String>,
-    /// Custom role UUID (mutually exclusive with role)
-    pub custom_role_id: Option<Uuid>,
-}
-
-pub async fn update_member_role(
-    State(pool): State<PgPool>,
-    axum::Extension(auth): axum::Extension<AuthUser>,
-    axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
-    Json(body): Json<UpdateRoleRequest>,
-) -> Result<StatusCode, StatusCode> {
-    // Requester must be owner
-    let requester_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to get requester role"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::FORBIDDEN)?;
-
-    if requester_role != "owner" {
-        warn!(team_id = %team_id, user_id = %auth.0, "Non-owner tried to change role");
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    // Can't change owner's own role
-    if target_user_id == auth.0 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Get target's current role
-    let target_current_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to get target role"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Can't change an owner's role
-    if target_current_role == "owner" {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    if let Some(custom_role_id) = body.custom_role_id {
-        // Validate custom role belongs to this team
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM custom_roles WHERE id = $1 AND team_id = $2)",
-        )
-        .bind(custom_role_id)
-        .bind(team_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to verify custom role"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-        if !exists {
-            return Err(StatusCode::NOT_FOUND);
-        }
-
-        let updated = sqlx::query_scalar::<_, i64>(
-            r#"WITH upd AS (
-                UPDATE team_members
-                SET role = 'member', custom_role_id = $1
-                WHERE team_id = $2 AND user_id = $3
-                RETURNING 1
-            ) SELECT COUNT(*) FROM upd"#,
-        )
-        .bind(custom_role_id)
-        .bind(team_id)
-        .bind(target_user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to assign custom role"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-        if updated == 0 { return Err(StatusCode::NOT_FOUND); }
-        info!(team_id = %team_id, target_user_id = %target_user_id, custom_role_id = %custom_role_id, "Custom role assigned");
-
-    } else if let Some(ref new_role) = body.role {
-        const VALID_ROLES: &[&str] = &["owner", "manager", "editor", "member"];
-        if !VALID_ROLES.contains(&new_role.as_str()) {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        let updated = sqlx::query_scalar::<_, i64>(
-            r#"WITH upd AS (
-                UPDATE team_members
-                SET role = $1, custom_role_id = NULL
-                WHERE team_id = $2 AND user_id = $3
-                RETURNING 1
-            ) SELECT COUNT(*) FROM upd"#,
-        )
-        .bind(new_role)
-        .bind(team_id)
-        .bind(target_user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to update role"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-        if updated == 0 { return Err(StatusCode::NOT_FOUND); }
-        info!(team_id = %team_id, target_user_id = %target_user_id, new_role = %new_role, "Member role updated");
-
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -398,7 +365,6 @@ pub async fn remove_member(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, user_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    // Members can remove themselves; MANAGE_MEMBERS permission required to remove others
     if auth.0 != user_id {
         let can_manage = crate::permissions::has_team_permission(
             &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
@@ -410,34 +376,38 @@ pub async fn remove_member(
         }
     }
 
-    // Can't remove the owner
-    let target_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
+    // Cannot remove the team owner
+    let is_owner = sqlx::query_scalar::<_, bool>(
+        "SELECT owner_id = $2 FROM teams WHERE id = $1",
     )
     .bind(team_id)
     .bind(user_id)
     .fetch_optional(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to get target member role"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .map_err(|e| { error!(error = %e, "Failed to check team owner"); StatusCode::INTERNAL_SERVER_ERROR })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    if target_role == "owner" {
+    if is_owner {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+    let result = sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
         .bind(team_id)
         .bind(user_id)
         .execute(&pool)
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team member"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     info!(team_id = %team_id, removed_user_id = %user_id, "Member removed");
     notifier.notify_membership_changed(user_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── Search users (instance-wide, for invite autocomplete) ───────────────────
+// ─── Search users ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct SearchUsersQuery {
@@ -516,14 +486,13 @@ pub async fn update_public_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── List custom roles ────────────────────────────────────────────────────────
+// ─── List roles ───────────────────────────────────────────────────────────────
 
 pub async fn list_roles(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
-) -> Result<Json<Vec<CustomRole>>, StatusCode> {
-    // Any team member can see the roles
+) -> Result<Json<Vec<TeamRole>>, StatusCode> {
     let is_member = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
     )
@@ -537,22 +506,25 @@ pub async fn list_roles(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let roles = sqlx::query_as::<_, CustomRole>(
-        "SELECT id, team_id, name, permissions, created_at FROM custom_roles WHERE team_id = $1 ORDER BY created_at ASC",
+    let roles = sqlx::query_as::<_, TeamRole>(
+        "SELECT id, team_id, name, color, permissions, is_builtin, position, created_at
+         FROM team_roles WHERE team_id = $1
+         ORDER BY position ASC, created_at ASC",
     )
     .bind(team_id)
     .fetch_all(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to list custom roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| { error!(error = %e, "Failed to list roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     Ok(Json(roles))
 }
 
-// ─── Create custom role ───────────────────────────────────────────────────────
+// ─── Create role ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct CreateRoleRequest {
     pub name: String,
+    pub color: Option<String>,
     pub permissions: i64,
 }
 
@@ -561,19 +533,12 @@ pub async fn create_role(
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<CreateRoleRequest>,
-) -> Result<(StatusCode, Json<CustomRole>), StatusCode> {
-    // Owner only
-    let requester_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
+) -> Result<(StatusCode, Json<TeamRole>), StatusCode> {
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
-    .bind(team_id)
-    .bind(auth.0)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to get requester role"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::FORBIDDEN)?;
-
-    if requester_role != "owner" {
+    .await?;
+    if !can_manage {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -581,20 +546,21 @@ pub async fn create_role(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Clamp permissions to valid 15-bit range
-    let permissions = body.permissions & 0x7FFF;
+    let permissions = body.permissions & 0xFFFF;
 
-    let role = sqlx::query_as::<_, CustomRole>(
-        "INSERT INTO custom_roles (team_id, name, permissions) VALUES ($1, $2, $3) RETURNING id, team_id, name, permissions, created_at",
+    let role = sqlx::query_as::<_, TeamRole>(
+        r#"INSERT INTO team_roles (team_id, name, color, permissions, is_builtin, position)
+           VALUES ($1, $2, $3, $4, FALSE, 10)
+           RETURNING id, team_id, name, color, permissions, is_builtin, position, created_at"#,
     )
     .bind(team_id)
     .bind(body.name.trim())
+    .bind(&body.color)
     .bind(permissions)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, "Failed to create custom role");
-        // 23505 = unique violation
+        error!(error = %e, "Failed to create role");
         if let sqlx::Error::Database(ref db_err) = e {
             if db_err.code().as_deref() == Some("23505") {
                 return StatusCode::CONFLICT;
@@ -607,11 +573,12 @@ pub async fn create_role(
     Ok((StatusCode::CREATED, Json(role)))
 }
 
-// ─── Update custom role ───────────────────────────────────────────────────────
+// ─── Update role ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct UpdateRoleBody {
     pub name: Option<String>,
+    pub color: Option<String>,
     pub permissions: Option<i64>,
 }
 
@@ -621,33 +588,27 @@ pub async fn update_role(
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateRoleBody>,
 ) -> Result<StatusCode, StatusCode> {
-    // Owner only
-    let requester_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
-    .bind(team_id)
-    .bind(auth.0)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to get requester role"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::FORBIDDEN)?;
-
-    if requester_role != "owner" {
+    .await?;
+    if !can_manage {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Verify role belongs to this team
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM custom_roles WHERE id = $1 AND team_id = $2)",
+    let role_info = sqlx::query_as::<_, (bool,)>(
+        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
     )
     .bind(role_id)
     .bind(team_id)
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| { error!(error = %e, "Failed to fetch role info"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .ok_or(StatusCode::NOT_FOUND)?;
 
-    if !exists {
-        return Err(StatusCode::NOT_FOUND);
+    if role_info.0 {
+        warn!(role_id = %role_id, "Cannot modify builtin role");
+        return Err(StatusCode::FORBIDDEN);
     }
 
     if let Some(ref name) = body.name {
@@ -656,70 +617,65 @@ pub async fn update_role(
         }
     }
 
-    let permissions = body.permissions.map(|p| p & 0x7FFF);
+    let permissions = body.permissions.map(|p| p & 0xFFFF);
 
     sqlx::query(
-        r#"UPDATE custom_roles
+        r#"UPDATE team_roles
            SET name        = COALESCE($1, name),
-               permissions = COALESCE($2, permissions)
-           WHERE id = $3 AND team_id = $4"#,
+               color       = CASE WHEN $2::text IS NOT NULL THEN $2 ELSE color END,
+               permissions = COALESCE($3, permissions)
+           WHERE id = $4 AND team_id = $5"#,
     )
     .bind(body.name.as_deref().map(str::trim))
+    .bind(&body.color)
     .bind(permissions)
     .bind(role_id)
     .bind(team_id)
     .execute(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to update custom role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| { error!(error = %e, "Failed to update role"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    info!(team_id = %team_id, role_id = %role_id, "Custom role updated");
+    info!(team_id = %team_id, role_id = %role_id, "Role updated");
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── Delete custom role ───────────────────────────────────────────────────────
+// ─── Delete role ──────────────────────────────────────────────────────────────
 
 pub async fn delete_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    // Owner only
-    let requester_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
-    .bind(team_id)
-    .bind(auth.0)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to get requester role"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::FORBIDDEN)?;
-
-    if requester_role != "owner" {
+    .await?;
+    if !can_manage {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Fail if any member has this role assigned
-    let in_use = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM team_members WHERE custom_role_id = $1)",
-    )
-    .bind(role_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to check role usage"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if in_use {
-        warn!(role_id = %role_id, "Cannot delete role still assigned to members");
-        return Err(StatusCode::CONFLICT);
-    }
-
-    let result = sqlx::query(
-        "DELETE FROM custom_roles WHERE id = $1 AND team_id = $2",
+    let role_info = sqlx::query_as::<_, (bool,)>(
+        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
     )
     .bind(role_id)
     .bind(team_id)
-    .execute(&pool)
+    .fetch_optional(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to delete custom role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| { error!(error = %e, "Failed to fetch role info"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if role_info.0 {
+        warn!(role_id = %role_id, "Cannot delete builtin role");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // CASCADE on team_member_roles handles removal from members automatically
+    let result = sqlx::query("DELETE FROM team_roles WHERE id = $1 AND team_id = $2")
+        .bind(role_id)
+        .bind(team_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to delete role"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
@@ -729,7 +685,167 @@ pub async fn delete_role(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── Invite member (email-based, creates pending invite if user not found) ────
+// ─── List member roles ────────────────────────────────────────────────────────
+
+pub async fn list_member_roles(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<TeamRole>>, StatusCode> {
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
+    )
+    .bind(team_id)
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let roles = sqlx::query_as::<_, TeamRole>(
+        r#"SELECT tr.id, tr.team_id, tr.name, tr.color, tr.permissions, tr.is_builtin, tr.position, tr.created_at
+           FROM team_member_roles tmr
+           JOIN team_roles tr ON tr.id = tmr.role_id
+           WHERE tmr.team_id = $1 AND tmr.user_id = $2
+           ORDER BY tr.position ASC"#,
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to list member roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    Ok(Json(roles))
+}
+
+// ─── Assign role to member ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AssignRoleRequest {
+    pub role_id: Uuid,
+}
+
+pub async fn assign_member_role(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
+    Json(body): Json<AssignRoleRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
+    )
+    .await?;
+    if !can_manage {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Verify target is a member
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check target membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if !is_member {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Verify role belongs to this team
+    let role_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_roles WHERE id = $1 AND team_id = $2)",
+    )
+    .bind(body.role_id)
+    .bind(team_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if !role_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    sqlx::query(
+        "INSERT INTO team_member_roles (team_id, user_id, role_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .bind(body.role_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to assign role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    info!(team_id = %team_id, target_user_id = %target_user_id, role_id = %body.role_id, "Role assigned to member");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Remove role from member ──────────────────────────────────────────────────
+
+pub async fn remove_member_role(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::extract::Path((team_id, target_user_id, role_id)): axum::extract::Path<(Uuid, Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
+    )
+    .await?;
+    if !can_manage {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Cannot remove the owner role from the team owner
+    let is_target_team_owner = sqlx::query_scalar::<_, bool>(
+        "SELECT owner_id = $2 FROM teams WHERE id = $1",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check team owner"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or(false);
+
+    if is_target_team_owner {
+        let is_owner_role = sqlx::query_scalar::<_, bool>(
+            "SELECT is_builtin AND name = 'owner' FROM team_roles WHERE id = $1 AND team_id = $2",
+        )
+        .bind(role_id)
+        .bind(team_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to check role type"); StatusCode::INTERNAL_SERVER_ERROR })?
+        .unwrap_or(false);
+
+        if is_owner_role {
+            warn!(team_id = %team_id, "Cannot remove owner role from team owner");
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    let result = sqlx::query(
+        "DELETE FROM team_member_roles WHERE team_id = $1 AND user_id = $2 AND role_id = $3",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .bind(role_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to remove member role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    info!(team_id = %team_id, target_user_id = %target_user_id, role_id = %role_id, "Role removed from member");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Invite member (email-based) ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct InviteMemberRequest {
@@ -739,7 +855,6 @@ pub struct InviteMemberRequest {
 
 #[derive(Serialize)]
 pub struct InviteMemberResponse {
-    /// "added" if the user existed and was added directly, "invited" if an email was sent
     pub status: String,
 }
 
@@ -766,7 +881,6 @@ pub async fn invite_member(
 
     let role = body.role.as_deref().unwrap_or("member").to_string();
 
-    // Seat limit check (same logic as add_member)
     let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
         .bind(team_id)
         .fetch_one(&pool)
@@ -800,7 +914,6 @@ pub async fn invite_member(
         }
     }
 
-    // Check if user with that email already exists
     let existing_user = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM users WHERE email = $1")
         .bind(&email)
         .fetch_optional(&pool)
@@ -808,20 +921,42 @@ pub async fn invite_member(
         .map_err(|e| { error!(error = %e, "Failed to look up user by email"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if let Some((user_id,)) = existing_user {
-        // Direct add — same as add_member
         if user_id == auth.0 {
             return Err(StatusCode::BAD_REQUEST);
         }
+
+        let mut tx = pool.begin().await.map_err(|e| {
+            error!(error = %e, "Failed to begin transaction");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
         sqlx::query(
-            "INSERT INTO team_members (team_id, user_id, role, invited_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            "INSERT INTO team_members (team_id, user_id, invited_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .bind(auth.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to add team member directly"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        sqlx::query(
+            r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
+               SELECT $1, $2, id FROM team_roles
+               WHERE team_id = $1 AND name = $3 AND is_builtin = TRUE
+               ON CONFLICT DO NOTHING"#,
         )
         .bind(team_id)
         .bind(user_id)
         .bind(&role)
-        .bind(auth.0)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| { error!(error = %e, "Failed to add team member directly"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| { error!(error = %e, "Failed to assign role on direct invite"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        tx.commit().await.map_err(|e| {
+            error!(error = %e, "Failed to commit direct invite transaction");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         info!(team_id = %team_id, user_id = %user_id, role = %role, "Member directly added via invite endpoint");
         notifier.notify_membership_changed(user_id);
@@ -864,7 +999,6 @@ pub async fn invite_member(
 
     if let Err(e) = crate::email::send_team_invitation(&email, &team_name, &inviter_email, &token, &app_url).await {
         error!(error = %e, "Failed to send invitation email");
-        // Don't fail the request — invitation record is created, email is best-effort
     }
 
     info!(team_id = %team_id, email = %email, "Pending invitation created");
