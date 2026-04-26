@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::auth::{jwt::validate_token, AuthUser};
+use crate::auth::{jwt::validate_token, AuthClaims, AuthUser};
 use crate::terminal_manager::{Participant, TerminalManager};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -77,10 +77,13 @@ pub struct SessionKeyResponse {
 pub async fn create_session(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(auth_claims): Extension<AuthClaims>,
     Extension(manager): Extension<TerminalManager>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), StatusCode> {
     let visibility = body.visibility.as_deref().unwrap_or("vault").to_string();
+
+    let mut vault_owner_id: Option<Uuid> = None;
 
     // For vault sessions: verify the host is a member of at least one vault
     if visibility == "vault" {
@@ -111,6 +114,66 @@ pub async fn create_session(
         if !can_start {
             warn!(user_id = %auth.0, "Insufficient permission to start terminal session");
             return Err(StatusCode::FORBIDDEN);
+        }
+
+        // Tier check: pick the highest-tier owner across all requested vaults
+        let row = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT t.owner_id, u.subscription_tier \
+             FROM teams t JOIN users u ON u.id = t.owner_id \
+             WHERE t.id = ANY($1) \
+             ORDER BY CASE u.subscription_tier \
+               WHEN 'business' THEN 0 WHEN 'teams' THEN 1 ELSE 2 END \
+             LIMIT 1",
+        )
+        .bind(&body.vault_ids)
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let (owner_id, owner_tier) = row;
+        vault_owner_id = Some(owner_id);
+
+        let session_limit: i64 = match owner_tier.as_str() {
+            "business" => 20,
+            "teams"    => 5,
+            _          => return Err(StatusCode::PAYMENT_REQUIRED),
+        };
+
+        let active_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT ts.id) \
+             FROM terminal_sessions ts \
+             JOIN terminal_session_vaults tsv ON tsv.session_id = ts.id \
+             JOIN teams t ON t.id = tsv.team_id \
+             WHERE t.owner_id = $1 AND ts.ended_at IS NULL",
+        )
+        .bind(owner_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        if active_count >= session_limit {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    } else {
+        // invite_link visibility: gate on the host's own JWT tier
+        let session_limit: i64 = match auth_claims.0.tier.as_str() {
+            "business" => 20,
+            "teams"    => 5,
+            "pro"      => 1,
+            _          => return Err(StatusCode::PAYMENT_REQUIRED),
+        };
+
+        let active_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM terminal_sessions \
+             WHERE host_user_id = $1 AND ended_at IS NULL",
+        )
+        .bind(auth.0)
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        if active_count >= session_limit {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     }
 
@@ -196,6 +259,7 @@ pub async fn create_session(
                 host_public_key,
                 connection_name: body.connection_name.clone(),
                 visibility: visibility.clone(),
+                vault_owner_id,
                 participants: std::collections::HashMap::new(),
                 control_holder: auth.0,
                 pending_control_request: None,
@@ -453,10 +517,11 @@ async fn handle_socket(
             s.allowed_roles.clone(),
             s.invite_token.clone(),
             s.host_user_id,
+            s.vault_owner_id,
         ))
     };
 
-    let (vault_ids, visibility, allowed_roles, stored_token, host_user_id) = match session_info {
+    let (vault_ids, visibility, allowed_roles, stored_token, host_user_id, vault_owner_id) = match session_info {
         Some(info) => info,
         None => {
             warn!(session_id = %session_id, user_id = %user_id, "WS: session not found");
@@ -510,6 +575,40 @@ async fn handle_socket(
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // Participant cap: guests only (host is always allowed)
+    if user_id != host_user_id {
+        let effective_tier = if let Some(owner_id) = vault_owner_id {
+            sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
+                .bind(owner_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|_| "free".to_string())
+        } else {
+            sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
+                .bind(host_user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|_| "free".to_string())
+        };
+
+        let guest_cap: usize = match effective_tier.as_str() {
+            "business" => 50,
+            "teams"    => 10,
+            "pro"      => 1,
+            _          => 0,
+        };
+
+        let current_guests = {
+            let sessions = manager.sessions.lock().await;
+            sessions.get(&session_id).map(|s| s.participants.len()).unwrap_or(0)
+        };
+
+        if current_guests >= guest_cap {
+            warn!(session_id = %session_id, user_id = %user_id, guest_cap, "Participant cap reached");
+            return;
+        }
+    }
 
     let (tx, participant_list_json) = {
         let mut sessions = manager.sessions.lock().await;

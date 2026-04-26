@@ -68,6 +68,7 @@ async fn main() {
 
     // Pro-gated sync routes (auth + tier check + rate limit)
     let pro_sync = Router::new()
+        .route("/v1/sync/blob", get(routes::sync::get_blob))
         .route("/v1/sync/blob", put(routes::sync::put_blob))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .layer(middleware::from_fn(auth::require_pro))
@@ -77,16 +78,22 @@ async fn main() {
         .layer(Extension(notifier.clone()))
         .layer(Extension(presence_map.clone()));
 
+    // Teams-gated router — creating a team vault requires Teams or Business tier
+    let teams_gated = Router::new()
+        .route("/v1/teams", post(routes::teams::create_team))
+        .layer(middleware::from_fn(auth::require_teams))
+        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(Extension(notifier.clone()))
+        .layer(Extension(presence_map.clone()));
+
     // Protected routes — auth required + rate limited at 60/hour per IP
     let protected = Router::new()
         .route("/v1/auth/account", delete(routes::auth::delete_account))
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
-        .route("/v1/sync/blob", get(routes::sync::get_blob))
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/blob/:device_id", delete(routes::sync::delete_blob))
-        // Teams — teams-tier only
+        // Teams — read routes open to all authed users
         .route("/v1/teams", get(routes::teams::list_teams))
-        .route("/v1/teams", post(routes::teams::create_team))
         .route("/v1/teams/:team_id/members", get(routes::teams::list_members))
         .route("/v1/teams/:team_id/members", post(routes::teams::add_member))
         .route("/v1/teams/:team_id/members/:user_id", delete(routes::teams::remove_member))
@@ -155,6 +162,7 @@ async fn main() {
         .merge(webhooks)
         .merge(public_invitations)
         .merge(pro_sync)
+        .merge(teams_gated)
         .merge(protected)
         .merge(admin_routes)
         .merge(ws_routes)

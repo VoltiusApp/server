@@ -24,6 +24,9 @@ pub struct SessionState {
     pub host_public_key: String,
     pub connection_name: String,
     pub visibility: String,
+    /// Owner of the vault for vault-visibility sessions; None for invite_link sessions.
+    /// Used to resolve the effective tier for participant cap enforcement.
+    pub vault_owner_id: Option<Uuid>,
     pub participants: HashMap<Uuid, Participant>,
     pub control_holder: Uuid,
     pub pending_control_request: Option<Uuid>,

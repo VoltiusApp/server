@@ -15,7 +15,7 @@ use crate::sync_notifier::SyncNotifier;
 
 const MAX_TEAM_BLOB_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
-// ─── Membership helper ────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Returns true if the given user is a member of the given team.
 async fn is_team_member(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<bool, StatusCode> {
@@ -30,6 +30,27 @@ async fn is_team_member(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<b
         error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team membership");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// Returns Ok if the vault owner has a Teams or Business subscription.
+async fn require_teams_tier_for_vault(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
+    let tier = sqlx::query_scalar::<_, String>(
+        "SELECT u.subscription_tier FROM teams t \
+         JOIN users u ON u.id = t.owner_id \
+         WHERE t.id = $1",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to fetch vault owner tier");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match tier.as_str() {
+        "teams" | "business" => Ok(()),
+        _ => Err(StatusCode::PAYMENT_REQUIRED),
+    }
 }
 
 // ─── GET /v1/teams/:team_id/vault-key ────────────────────────────────────────
@@ -49,6 +70,7 @@ pub async fn get_my_vault_key(
         warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to get vault key");
         return Err(StatusCode::FORBIDDEN);
     }
+    require_teams_tier_for_vault(&pool, team_id).await?;
 
     let row = sqlx::query_as::<_, (String, Uuid)>(
         "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2",
@@ -96,6 +118,7 @@ pub async fn put_vault_keys(
         warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to put vault keys");
         return Err(StatusCode::FORBIDDEN);
     }
+    require_teams_tier_for_vault(&pool, team_id).await?;
 
     if body.keys.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -144,6 +167,7 @@ pub async fn get_team_blob(
         warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to get team blob");
         return Err(StatusCode::FORBIDDEN);
     }
+    require_teams_tier_for_vault(&pool, team_id).await?;
 
     let row = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>)>(
         "SELECT blob, updated_at FROM team_sync_blobs WHERE team_id = $1",
@@ -185,6 +209,7 @@ pub async fn put_team_blob(
         warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to put team blob");
         return Err(StatusCode::FORBIDDEN);
     }
+    require_teams_tier_for_vault(&pool, team_id).await?;
 
     let blob_bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.blob)
