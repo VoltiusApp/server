@@ -13,11 +13,16 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Extension, Router,
 };
+use dashmap::DashMap;
 use rate_limit::RateLimiter;
 use sync_notifier::SyncNotifier;
 use terminal_manager::TerminalManager;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
+
+pub type PresenceMap = Arc<DashMap<Uuid, ()>>;
 use axum::http::{header, HeaderValue};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
@@ -35,6 +40,7 @@ async fn main() {
     let pool = db::create_pool().await;
     let notifier = SyncNotifier::new();
     let terminal_manager = TerminalManager::new();
+    let presence_map: PresenceMap = Arc::new(DashMap::new());
 
     // Rate limiters (configurable via env for dev)
     let sync_rate: usize = std::env::var("SYNC_RATE_LIMIT").ok()
@@ -68,7 +74,8 @@ async fn main() {
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter.clone()))
-        .layer(Extension(notifier.clone()));
+        .layer(Extension(notifier.clone()))
+        .layer(Extension(presence_map.clone()));
 
     // Protected routes — auth required + rate limited at 60/hour per IP
     let protected = Router::new()
@@ -114,7 +121,8 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
         .layer(Extension(notifier.clone()))
-        .layer(Extension(terminal_manager.clone()));
+        .layer(Extension(terminal_manager.clone()))
+        .layer(Extension(presence_map.clone()));
 
     // Admin routes — auth + admin check, no rate limit (internal tool)
     let admin_routes = Router::new()

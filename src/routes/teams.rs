@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::models::team::{CustomRole, Team, TeamMember};
 use crate::sync_notifier::SyncNotifier;
+use crate::PresenceMap;
 
 // ─── Create team ─────────────────────────────────────────────────────────────
 
@@ -96,11 +97,19 @@ pub async fn list_teams(
 
 // ─── Get team members ─────────────────────────────────────────────────────────
 
+#[derive(Debug, Serialize)]
+pub(crate) struct TeamMemberResponse {
+    #[serde(flatten)]
+    member: TeamMember,
+    is_online: bool,
+}
+
 pub async fn list_members(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(presence): axum::Extension<PresenceMap>,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
-) -> Result<Json<Vec<TeamMember>>, StatusCode> {
+) -> Result<Json<Vec<TeamMemberResponse>>, StatusCode> {
     let is_member = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
     )
@@ -139,7 +148,15 @@ pub async fn list_members(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(members))
+    let response: Vec<TeamMemberResponse> = members
+        .into_iter()
+        .map(|m| TeamMemberResponse {
+            is_online: presence.contains_key(&m.user_id),
+            member: m,
+        })
+        .collect();
+
+    Ok(Json(response))
 }
 
 // ─── Add member (by email or user_id) ────────────────────────────────────────

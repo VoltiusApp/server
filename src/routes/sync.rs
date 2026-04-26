@@ -8,8 +8,10 @@ use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::sync_notifier::{SyncEvent, SyncNotifier};
+use crate::PresenceMap;
 
 const MAX_BLOB_SIZE: usize = 5 * 1024 * 1024; // 5 MB
 
@@ -209,26 +211,78 @@ pub async fn delete_blob(
 
 // ─── SSE stream ──────────────────────────────────────────────────────────────
 
+const TEAMMATES_SQL: &str =
+    "SELECT DISTINCT tm2.user_id \
+     FROM team_members tm1 \
+     JOIN team_members tm2 ON tm1.team_id = tm2.team_id \
+     WHERE tm1.user_id = $1 AND tm2.user_id != $1";
+
+struct PresenceGuard {
+    user_id: Uuid,
+    presence: PresenceMap,
+    notifier: SyncNotifier,
+    pool: PgPool,
+}
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        self.presence.remove(&self.user_id);
+        let (notifier, pool, user_id) = (self.notifier.clone(), self.pool.clone(), self.user_id);
+        tokio::spawn(async move {
+            let teammates: Vec<Uuid> = sqlx::query_scalar(TEAMMATES_SQL)
+                .bind(user_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+            for recipient in teammates {
+                notifier.notify_presence_changed(recipient, user_id, false);
+            }
+        });
+    }
+}
+
 /// Long-lived SSE connection. Sends the pusher's device_id whenever another
 /// device uploads a blob for this account. The client ignores events where
 /// the device_id matches its own (preventing push→event→push loops).
 pub async fn sync_stream(
+    State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::Extension(presence): axum::Extension<PresenceMap>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let user_id = auth.0;
-    let rx = notifier.subscribe();
 
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
-        Ok(SyncEvent::BlobPushed { user_id: uid, device_id }) if uid == user_id => {
-            Some(Ok(Event::default().data(device_id)))
+    // Register as online and fan-out to teammates.
+    presence.insert(user_id, ());
+    let teammates: Vec<Uuid> = sqlx::query_scalar(TEAMMATES_SQL)
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+    for recipient in &teammates {
+        notifier.notify_presence_changed(*recipient, user_id, true);
+    }
+
+    let rx = notifier.subscribe();
+    let guard = PresenceGuard { user_id, presence, notifier: notifier.clone(), pool };
+
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        let _guard = &guard;
+        match msg {
+            Ok(SyncEvent::BlobPushed { user_id: uid, device_id }) if uid == user_id => {
+                Some(Ok(Event::default().data(device_id)))
+            }
+            Ok(SyncEvent::MembershipChanged { user_id: uid }) if uid == user_id => {
+                Some(Ok(Event::default().data("membership_changed")))
+            }
+            Ok(SyncEvent::PresenceChanged { recipient, subject, online }) if recipient == user_id => {
+                let status = if online { "online" } else { "offline" };
+                Some(Ok(Event::default().data(format!("presence:{}:{}", subject, status))))
+            }
+            Ok(_) => None,
+            // Lagged: we missed some events, tell the client to sync anyway
+            Err(_) => Some(Ok(Event::default().data("sync"))),
         }
-        Ok(SyncEvent::MembershipChanged { user_id: uid }) if uid == user_id => {
-            Some(Ok(Event::default().data("membership_changed")))
-        }
-        Ok(_) => None,
-        // Lagged: we missed some events, tell the client to sync anyway
-        Err(_) => Some(Ok(Event::default().data("sync"))),
     });
 
     Sse::new(stream).keep_alive(

@@ -8,6 +8,8 @@ pub enum SyncEvent {
     BlobPushed { user_id: Uuid, device_id: String },
     /// The user's team membership changed (added to or removed from a team).
     MembershipChanged { user_id: Uuid },
+    /// A teammate's online/offline status changed. `recipient` is who should receive it.
+    PresenceChanged { recipient: Uuid, subject: Uuid, online: bool },
 }
 
 #[derive(Clone)]
@@ -29,6 +31,10 @@ impl SyncNotifier {
 
     pub fn notify_membership_changed(&self, user_id: Uuid) {
         let _ = self.0.tx.send(SyncEvent::MembershipChanged { user_id });
+    }
+
+    pub fn notify_presence_changed(&self, recipient: Uuid, subject: Uuid, online: bool) {
+        let _ = self.0.tx.send(SyncEvent::PresenceChanged { recipient, subject, online });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SyncEvent> {
