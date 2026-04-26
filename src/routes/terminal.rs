@@ -601,7 +601,9 @@ async fn handle_socket(
 
         let current_guests = {
             let sessions = manager.sessions.lock().await;
-            sessions.get(&session_id).map(|s| s.participants.len()).unwrap_or(0)
+            sessions.get(&session_id).map(|s| {
+                s.participants.values().filter(|p| p.user_id != host_user_id).count()
+            }).unwrap_or(0)
         };
 
         if current_guests >= guest_cap {
