@@ -251,6 +251,7 @@ pub struct UserDetail {
     ls_subscription_id: Option<String>,
     admin_override: bool,
     created_at: DateTime<Utc>,
+    seat_count: Option<i32>,
 }
 
 pub async fn get_user(
@@ -261,7 +262,7 @@ pub async fn get_user(
         r#"
         SELECT id, email, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
-               ls_customer_id, ls_subscription_id, admin_override, created_at
+               ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count
         FROM users WHERE id = $1
         "#,
     )
@@ -288,6 +289,7 @@ pub struct PatchUserRequest {
     discount_pct: Option<i16>,
     admin_notes: Option<String>,
     admin_override: Option<bool>,
+    seat_count: Option<i32>,
 }
 
 pub async fn patch_user(
@@ -346,7 +348,8 @@ pub async fn patch_user(
             trial_used = COALESCE($4, trial_used),
             discount_pct = COALESCE($5, discount_pct),
             admin_notes = COALESCE($6, admin_notes),
-            admin_override = COALESCE($8, admin_override)
+            admin_override = COALESCE($8, admin_override),
+            seat_count = COALESCE($9, seat_count)
         WHERE id = $7
         "#,
     )
@@ -358,6 +361,7 @@ pub async fn patch_user(
     .bind(&body.admin_notes)
     .bind(user_id)
     .bind(body.admin_override)
+    .bind(body.seat_count)
     .execute(&pool)
     .await
     .map_err(|e| {

@@ -245,10 +245,17 @@ pub async fn get_subscription(
         None
     };
 
+    let tier = &row.0;
+    let seats = if (tier == "teams" || tier == "business") && row.2.is_none() {
+        Some(3)
+    } else {
+        row.2
+    };
+
     Ok(Json(SubscriptionInfoResponse {
         tier: row.0,
         trial_ends_at: row.1.map(|t| t.timestamp()),
-        seats: row.2,
+        seats,
         used_seats,
         has_ls_subscription: row.3.is_some(),
     }))

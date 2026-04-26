@@ -120,11 +120,12 @@ pub async fn list_members(
 
     let members = sqlx::query_as::<_, TeamMember>(
         r#"
-        SELECT tm.team_id, tm.user_id, tm.role, tm.invited_by, tm.joined_at,
+        SELECT tm.team_id, tm.user_id, tm.role, inv.email AS invited_by_email, tm.joined_at,
                u.email, u.public_key,
                tm.custom_role_id, cr.name AS custom_role_name, cr.permissions AS custom_role_permissions
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
+        LEFT JOIN users inv ON inv.id = tm.invited_by
         LEFT JOIN custom_roles cr ON cr.id = tm.custom_role_id
         WHERE tm.team_id = $1
         ORDER BY tm.joined_at ASC

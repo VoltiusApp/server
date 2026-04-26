@@ -15,7 +15,7 @@ pub struct TeamMember {
     pub team_id: Uuid,
     pub user_id: Uuid,
     pub role: String,
-    pub invited_by: Option<Uuid>,
+    pub invited_by_email: Option<String>,
     pub joined_at: DateTime<Utc>,
     pub email: String,
     pub public_key: String,
