@@ -9,6 +9,27 @@ use crate::models::team::{Team, TeamMember, TeamRole};
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
+// ─── Plan tier helper ─────────────────────────────────────────────────────────
+
+async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
+    let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
+        .bind(team_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let tier = sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch owner tier"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if tier != "business" {
+        return Err(StatusCode::PAYMENT_REQUIRED);
+    }
+    Ok(())
+}
+
 // ─── Create team ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -534,6 +555,8 @@ pub async fn create_role(
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<TeamRole>), StatusCode> {
+    require_business_tier(&pool, team_id).await?;
+
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
@@ -580,6 +603,7 @@ pub struct UpdateRoleBody {
     pub name: Option<String>,
     pub color: Option<String>,
     pub permissions: Option<i64>,
+    pub position: Option<i32>,
 }
 
 pub async fn update_role(
@@ -588,6 +612,8 @@ pub async fn update_role(
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateRoleBody>,
 ) -> Result<StatusCode, StatusCode> {
+    require_business_tier(&pool, team_id).await?;
+
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
@@ -623,12 +649,14 @@ pub async fn update_role(
         r#"UPDATE team_roles
            SET name        = COALESCE($1, name),
                color       = CASE WHEN $2::text IS NOT NULL THEN $2 ELSE color END,
-               permissions = COALESCE($3, permissions)
-           WHERE id = $4 AND team_id = $5"#,
+               permissions = COALESCE($3, permissions),
+               position    = COALESCE($4, position)
+           WHERE id = $5 AND team_id = $6"#,
     )
     .bind(body.name.as_deref().map(str::trim))
     .bind(&body.color)
     .bind(permissions)
+    .bind(body.position)
     .bind(role_id)
     .bind(team_id)
     .execute(&pool)
@@ -646,6 +674,8 @@ pub async fn delete_role(
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
+    require_business_tier(&pool, team_id).await?;
+
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
