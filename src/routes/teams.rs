@@ -1,4 +1,4 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
@@ -412,10 +412,15 @@ pub async fn remove_member(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin remove_member transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let result = sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
         .bind(team_id)
         .bind(user_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team member"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
@@ -423,8 +428,52 @@ pub async fn remove_member(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    sqlx::query("DELETE FROM team_vault_keys WHERE team_id = $1 AND user_id = $2")
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to remove team vault key"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit remove_member transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     info!(team_id = %team_id, removed_user_id = %user_id, "Member removed");
     notifier.notify_membership_changed(user_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Delete team ──────────────────────────────────────────────────────────────
+
+pub async fn delete_team(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Path(team_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let is_owner = sqlx::query_scalar::<_, bool>(
+        "SELECT owner_id = $2 FROM teams WHERE id = $1",
+    )
+    .bind(team_id)
+    .bind(auth.0)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check team ownership"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if !is_owner {
+        warn!(team_id = %team_id, user_id = %auth.0, "Non-owner tried to delete team");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    sqlx::query("DELETE FROM teams WHERE id = $1")
+        .bind(team_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, team_id = %team_id, "Failed to delete team"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    info!(team_id = %team_id, deleted_by = %auth.0, "Team deleted by owner");
     Ok(StatusCode::NO_CONTENT)
 }
 

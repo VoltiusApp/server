@@ -124,6 +124,26 @@ pub async fn put_vault_keys(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Validate all target users are current team members
+    let member_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM team_members WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to fetch team members for key validation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let member_set: std::collections::HashSet<Uuid> = member_ids.into_iter().collect();
+
+    for entry in &body.keys {
+        if !member_set.contains(&entry.user_id) {
+            warn!(team_id = %team_id, target_user_id = %entry.user_id, "Key upsert rejected: user not in team");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     // Upsert each wrapped key entry
     for entry in &body.keys {
         sqlx::query(
