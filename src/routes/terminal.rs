@@ -300,7 +300,14 @@ pub async fn list_active_sessions(
                 AND (
                   array_length(ts.allowed_roles, 1) IS NULL
                   OR cardinality(ts.allowed_roles) = 0
-                  OR tm.role = ANY(ts.allowed_roles)
+                  OR EXISTS (
+                    SELECT 1
+                    FROM team_member_roles tmr
+                    JOIN team_roles tr ON tr.id = tmr.role_id
+                    WHERE tmr.team_id = tsv.team_id
+                      AND tmr.user_id = $1
+                      AND tr.name = ANY(ts.allowed_roles)
+                  )
                 )
             )
           )
@@ -551,7 +558,12 @@ async fn handle_socket(
                     .unwrap_or(false)
                 } else {
                     sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = ANY($1) AND user_id = $2 AND role = ANY($3))",
+                        "SELECT EXISTS(\
+                          SELECT 1 FROM team_members tm \
+                          JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id \
+                          JOIN team_roles tr ON tr.id = tmr.role_id \
+                          WHERE tm.team_id = ANY($1) AND tm.user_id = $2 AND tr.name = ANY($3)\
+                        )",
                     )
                     .bind(&vault_ids)
                     .bind(user_id)
