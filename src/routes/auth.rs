@@ -85,6 +85,8 @@ pub struct RegisterRequest {
     pub auth_key: String,
     #[serde(default)]
     pub public_key: Option<String>,
+    #[serde(default)]
+    pub machine_fingerprint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -105,16 +107,36 @@ pub async fn register(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let trial_ends_at = Utc::now() + Duration::days(14);
+    // Check if this machine already used a trial
+    let trial_blocked = if let Some(ref fp) = body.machine_fingerprint {
+        sqlx::query_as::<_, (bool,)>(
+            "SELECT EXISTS(SELECT 1 FROM trial_fingerprints WHERE fingerprint = $1)",
+        )
+        .bind(fp)
+        .fetch_one(&pool)
+        .await
+        .map(|r| r.0)
+        .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let (initial_tier, trial_ends_at) = if trial_blocked {
+        warn!(fingerprint = ?body.machine_fingerprint, "Trial blocked: machine fingerprint already used");
+        ("free", None)
+    } else {
+        ("pro", Some(Utc::now() + Duration::days(14)))
+    };
 
     let row = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO users (email, account_id, auth_hash, public_key, subscription_tier, trial_ends_at)
-         VALUES ($1, $2, $3, $4, 'pro', $5) RETURNING id",
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(&body.email)
     .bind(body.account_id)
     .bind(&auth_hash)
     .bind(body.public_key.as_deref())
+    .bind(initial_tier)
     .bind(trial_ends_at)
     .fetch_one(&pool)
     .await
@@ -128,6 +150,21 @@ pub async fn register(
         error!(error = %e, "Failed to register user");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Record fingerprint so future accounts from this machine don't get a trial
+    if !trial_blocked {
+        if let Some(ref fp) = body.machine_fingerprint {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO trial_fingerprints (fingerprint) VALUES ($1) ON CONFLICT DO NOTHING",
+            )
+            .bind(fp)
+            .execute(&pool)
+            .await
+            {
+                error!(error = %e, "Failed to record trial fingerprint");
+            }
+        }
+    }
 
     let user_id = row.0;
 
@@ -162,10 +199,11 @@ pub async fn register(
         info!(user_id = %user_id, count = pending.len(), "Auto-accepted pending invitations on registration");
     }
 
+    let trial_ends_ts = trial_ends_at.map(|t| t.timestamp());
     let jwt_token = create_access_token(
         user_id,
-        "pro",
-        Some(trial_ends_at.timestamp()),
+        initial_tier,
+        trial_ends_ts,
         false,
         false,
         false,
@@ -179,7 +217,11 @@ pub async fn register(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!(user_id = %user_id, account_id = %body.account_id, "User registered with 14-day trial");
+    if trial_blocked {
+        info!(user_id = %user_id, account_id = %body.account_id, "User registered on free tier (trial already used)");
+    } else {
+        info!(user_id = %user_id, account_id = %body.account_id, "User registered with 14-day trial");
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -187,8 +229,8 @@ pub async fn register(
             user_id,
             jwt_token,
             refresh_token,
-            tier: "pro".to_string(),
-            trial_ends_at: Some(trial_ends_at.timestamp()),
+            tier: initial_tier.to_string(),
+            trial_ends_at: trial_ends_ts,
         }),
     ))
 }
