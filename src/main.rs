@@ -60,7 +60,8 @@ async fn main() {
 
     // Webhook — public, signature-verified internally
     let webhooks = Router::new()
-        .route("/v1/webhooks/lemonsqueezy", post(routes::webhooks::lemonsqueezy_webhook));
+        .route("/v1/webhooks/lemonsqueezy", post(routes::webhooks::lemonsqueezy_webhook))
+        .layer(Extension(notifier.clone()));
 
     // Public invitation details — no auth (email link)
     let public_invitations = Router::new()

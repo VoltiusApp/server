@@ -1,8 +1,9 @@
-use axum::{body::Bytes, extract::State, http::{HeaderMap, StatusCode}};
+use axum::{body::Bytes, extract::State, http::{HeaderMap, StatusCode}, Extension};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
+use crate::sync_notifier::SyncNotifier;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,6 +27,7 @@ fn verify_ls_signature(body: &[u8], signature_header: &str) -> bool {
 
 pub async fn lemonsqueezy_webhook(
     State(pool): State<PgPool>,
+    Extension(notifier): Extension<SyncNotifier>,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
@@ -54,11 +56,11 @@ pub async fn lemonsqueezy_webhook(
     info!(event = %event_name, "LemonSqueezy webhook received");
 
     match event_name {
-        "subscription_created" => handle_subscription_created(&pool, &payload).await,
-        "subscription_updated" => handle_subscription_updated(&pool, &payload).await,
+        "subscription_created" => handle_subscription_created(&pool, &notifier, &payload).await,
+        "subscription_updated" => handle_subscription_updated(&pool, &notifier, &payload).await,
         "subscription_cancelled" => handle_subscription_cancelled(&pool, &payload).await,
-        "subscription_expired" => handle_subscription_expired(&pool, &payload).await,
-        "subscription_trial_expired" => handle_trial_expired(&pool, &payload).await,
+        "subscription_expired" => handle_subscription_expired(&pool, &notifier, &payload).await,
+        "subscription_trial_expired" => handle_trial_expired(&pool, &notifier, &payload).await,
         _ => {
             info!(event = %event_name, "LemonSqueezy webhook: unhandled event");
             StatusCode::OK
@@ -66,7 +68,7 @@ pub async fn lemonsqueezy_webhook(
     }
 }
 
-async fn handle_subscription_created(pool: &PgPool, payload: &serde_json::Value) -> StatusCode {
+async fn handle_subscription_created(pool: &PgPool, notifier: &SyncNotifier, payload: &serde_json::Value) -> StatusCode {
     let attrs = &payload["data"]["attributes"];
     let customer_email = attrs["user_email"].as_str().unwrap_or("");
     let ls_customer_id = payload["data"]["relationships"]["customer"]["data"]["id"]
@@ -127,6 +129,18 @@ async fn handle_subscription_created(pool: &PgPool, payload: &serde_json::Value)
     match result {
         Ok(r) if r.rows_affected() > 0 => {
             info!(email = %customer_email, tier = %tier, "Subscription created");
+            // Notify client to refresh JWT so it picks up the new tier immediately
+            if let Some(uid) = user_id {
+                notifier.notify(uid, "token_invalidated".to_string());
+            } else if let Ok(Some((uid,))) = sqlx::query_as::<_, (uuid::Uuid,)>(
+                "SELECT id FROM users WHERE email = $1",
+            )
+            .bind(customer_email)
+            .fetch_optional(pool)
+            .await
+            {
+                notifier.notify(uid, "token_invalidated".to_string());
+            }
             StatusCode::OK
         }
         Ok(_) => {
@@ -140,7 +154,7 @@ async fn handle_subscription_created(pool: &PgPool, payload: &serde_json::Value)
     }
 }
 
-async fn handle_subscription_updated(pool: &PgPool, payload: &serde_json::Value) -> StatusCode {
+async fn handle_subscription_updated(pool: &PgPool, notifier: &SyncNotifier, payload: &serde_json::Value) -> StatusCode {
     let attrs = &payload["data"]["attributes"];
     let ls_subscription_id = payload["data"]["id"].as_str().unwrap_or("");
     let tier = attrs["product_name"]
@@ -149,6 +163,16 @@ async fn handle_subscription_updated(pool: &PgPool, payload: &serde_json::Value)
         .unwrap_or("pro");
 
     let seat_count = attrs["quantity"].as_i64().map(|q| q as i32);
+
+    // Fetch user_id before updating so we can notify them regardless of admin_override
+    let user_row = sqlx::query_as::<_, (uuid::Uuid,)>(
+        "SELECT id FROM users WHERE ls_subscription_id = $1",
+    )
+    .bind(ls_subscription_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
 
     let result = sqlx::query(
         "UPDATE users SET
@@ -165,6 +189,9 @@ async fn handle_subscription_updated(pool: &PgPool, payload: &serde_json::Value)
     match result {
         Ok(_) => {
             info!(ls_subscription_id = %ls_subscription_id, tier = %tier, "Subscription updated");
+            if let Some((uid,)) = user_row {
+                notifier.notify(uid, "token_invalidated".to_string());
+            }
             StatusCode::OK
         }
         Err(e) => {
@@ -183,7 +210,7 @@ async fn handle_subscription_cancelled(pool: &PgPool, payload: &serde_json::Valu
     StatusCode::OK
 }
 
-async fn handle_subscription_expired(pool: &PgPool, payload: &serde_json::Value) -> StatusCode {
+async fn handle_subscription_expired(pool: &PgPool, notifier: &SyncNotifier, payload: &serde_json::Value) -> StatusCode {
     let ls_subscription_id = payload["data"]["id"].as_str().unwrap_or("");
 
     let old_tier_row = sqlx::query_as::<_, (uuid::Uuid, String)>(
@@ -214,6 +241,7 @@ async fn handle_subscription_expired(pool: &PgPool, payload: &serde_json::Value)
                 .bind(&old_tier)
                 .execute(pool)
                 .await;
+                notifier.notify(user_id, "token_invalidated".to_string());
             }
             info!(ls_subscription_id = %ls_subscription_id, "Subscription expired — downgraded to free");
             StatusCode::OK
@@ -229,7 +257,7 @@ async fn handle_subscription_expired(pool: &PgPool, payload: &serde_json::Value)
     }
 }
 
-async fn handle_trial_expired(pool: &PgPool, payload: &serde_json::Value) -> StatusCode {
+async fn handle_trial_expired(pool: &PgPool, notifier: &SyncNotifier, payload: &serde_json::Value) -> StatusCode {
     let customer_email = payload["data"]["attributes"]["user_email"]
         .as_str()
         .unwrap_or("");
@@ -258,6 +286,7 @@ async fn handle_trial_expired(pool: &PgPool, payload: &serde_json::Value) -> Sta
                 .bind(&old_tier)
                 .execute(pool)
                 .await;
+                notifier.notify(user_id, "token_invalidated".to_string());
             }
             info!(email = %customer_email, "Trial expired — downgraded to free");
             StatusCode::OK
