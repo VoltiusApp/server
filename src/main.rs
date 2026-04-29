@@ -14,7 +14,7 @@ use axum::{
     Extension, Router,
 };
 use dashmap::DashMap;
-use rate_limit::RateLimiter;
+use rate_limit::{InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter};
 use sync_notifier::SyncNotifier;
 use terminal_manager::TerminalManager;
 use std::net::SocketAddr;
@@ -45,16 +45,30 @@ async fn main() {
     // Rate limiters (configurable via env for dev)
     let sync_rate: usize = std::env::var("SYNC_RATE_LIMIT").ok()
         .and_then(|v| v.parse().ok()).unwrap_or(60);
-    let auth_limiter = RateLimiter::new(10, Duration::from_secs(60));
-    let sync_limiter = RateLimiter::new(sync_rate, Duration::from_secs(3600));
-    tracing::info!(auth_per_minute = 10, sync_per_hour = sync_rate, "Configured rate limits");
+    let register_per_day: usize = std::env::var("REGISTER_RATE_LIMIT").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(20);
+    let invite_per_hour: usize = std::env::var("INVITE_RATE_LIMIT").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(20);
+    let auth_limiter = RateLimiter::<std::net::IpAddr>::new(10, Duration::from_secs(60));
+    let register_limiter = RegisterRateLimiter(RateLimiter::new(register_per_day, Duration::from_secs(86400)));
+    let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(invite_per_hour, Duration::from_secs(3600)));
+    let sync_limiter = SyncRateLimiter(RateLimiter::<uuid::Uuid>::new(sync_rate, Duration::from_secs(3600)));
+    tracing::info!(auth_per_minute = 10, register_per_day, invite_per_hour, sync_per_hour = sync_rate, "Configured rate limits");
 
-    // Public auth routes — rate limited at 10/min per IP
+    // Register — stricter limit: 5/day per IP on top of the general auth 10/min
+    let register_route = Router::new()
+        .route("/v1/auth/register", post(routes::auth::register))
+        .layer(middleware::from_fn(rate_limit::register_rate_limit))
+        .layer(Extension(register_limiter))
+        .layer(middleware::from_fn(rate_limit::auth_rate_limit))
+        .layer(Extension(auth_limiter.clone()));
+
+    // Public auth + public invitation lookup — rate limited at 10/min per IP
     let public = Router::new()
         .route("/v1/auth/challenge", get(routes::auth::challenge))
-        .route("/v1/auth/register", post(routes::auth::register))
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
+        .route("/v1/invitations/:token", get(routes::invitations::get_invitation))
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
         .layer(Extension(auth_limiter));
 
@@ -63,19 +77,23 @@ async fn main() {
         .route("/v1/webhooks/lemonsqueezy", post(routes::webhooks::lemonsqueezy_webhook))
         .layer(Extension(notifier.clone()));
 
-    // Public invitation details — no auth (email link)
-    let public_invitations = Router::new()
-        .route("/v1/invitations/:token", get(routes::invitations::get_invitation));
+    // Invite — auth required + dedicated 20/hr limit (sends email)
+    let invite_route = Router::new()
+        .route("/v1/teams/:team_id/invite", post(routes::teams::invite_member))
+        .layer(middleware::from_fn(rate_limit::invite_rate_limit))
+        .layer(Extension(invite_limiter))
+        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(Extension(notifier.clone()));
 
-    // Pro-gated sync routes (auth + tier check + rate limit)
+    // Pro-gated sync routes (auth → rate limit → tier check)
     let pro_sync = Router::new()
         .route("/v1/sync/blob", get(routes::sync::get_blob))
         .route("/v1/sync/blob", put(routes::sync::put_blob))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .layer(middleware::from_fn(auth::require_pro))
-        .layer(middleware::from_fn(auth::auth_middleware))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter.clone()))
+        .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(presence_map.clone()));
 
@@ -103,8 +121,7 @@ async fn main() {
         .route("/v1/teams/:team_id/members/:user_id/roles", post(routes::teams::assign_member_role))
         .route("/v1/teams/:team_id/members/:user_id/roles/:role_id", delete(routes::teams::remove_member_role))
         .route("/v1/users/search", get(routes::teams::search_users))
-        // Team invitations
-        .route("/v1/teams/:team_id/invite", post(routes::teams::invite_member))
+        // Team invitations (invite POST is on invite_route with stricter rate limit)
         .route("/v1/teams/:team_id/pending-invitations", get(routes::teams::list_pending_invitations))
         .route("/v1/teams/:team_id/pending-invitations/:inv_id", delete(routes::teams::revoke_pending_invitation))
         .route("/v1/invitations/:token/accept", post(routes::invitations::accept_invitation))
@@ -128,9 +145,9 @@ async fn main() {
         .route("/v1/billing/portal", post(routes::billing::get_portal))
         .route("/v1/billing/seats", post(routes::billing::update_seats))
         .route("/v1/billing/subscription", get(routes::billing::get_subscription))
-        .layer(middleware::from_fn(auth::auth_middleware))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
+        .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
         .layer(Extension(presence_map.clone()));
@@ -161,8 +178,9 @@ async fn main() {
 
     let app = Router::new()
         .merge(public)
+        .merge(register_route)
         .merge(webhooks)
-        .merge(public_invitations)
+        .merge(invite_route)
         .merge(pro_sync)
         .merge(teams_gated)
         .merge(protected)

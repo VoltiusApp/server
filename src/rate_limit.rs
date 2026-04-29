@@ -5,21 +5,33 @@ use axum::{
     response::Response,
 };
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
+use uuid::Uuid;
 
-/// Per-IP sliding window rate limiter.
-#[derive(Clone)]
-pub struct RateLimiter {
-    state: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
+/// Per-key sliding window rate limiter. Key is typically IpAddr or Uuid.
+pub struct RateLimiter<K = IpAddr> {
+    state: Arc<Mutex<HashMap<K, Vec<Instant>>>>,
     max_requests: usize,
     window: Duration,
 }
 
-impl RateLimiter {
+// Manual Clone: Arc clone is always valid regardless of K.
+impl<K> Clone for RateLimiter<K> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            max_requests: self.max_requests,
+            window: self.window,
+        }
+    }
+}
+
+impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
     pub fn new(max_requests: usize, window: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
@@ -28,18 +40,14 @@ impl RateLimiter {
         }
     }
 
-    async fn check(&self, ip: IpAddr) -> bool {
+    pub async fn check(&self, key: K) -> bool {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        let entries = state.entry(ip).or_default();
-
-        // Remove expired entries
+        let entries = state.entry(key).or_default();
         entries.retain(|t| now.duration_since(*t) < self.window);
-
         if entries.len() >= self.max_requests {
             return false;
         }
-
         entries.push(now);
         true
     }
@@ -72,6 +80,59 @@ fn extract_ip(req: &Request) -> IpAddr {
     }
 }
 
+/// Newtype so each limiter can coexist as a distinct Extension type.
+#[derive(Clone)]
+pub struct RegisterRateLimiter(pub RateLimiter<IpAddr>);
+
+/// Per-user (not per-IP) so shared office NAT doesn't block legitimate users.
+#[derive(Clone)]
+pub struct InviteRateLimiter(pub RateLimiter<Uuid>);
+
+#[derive(Clone)]
+pub struct SyncRateLimiter(pub RateLimiter<Uuid>);
+
+/// Register endpoint: N registrations/day per IP.
+pub async fn register_rate_limit(
+    axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let ip = extract_ip(&req);
+    if !limiter.check(ip).await {
+        warn!(%ip, "Register rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Invite endpoint: N invitations/hour per user (auth_middleware must run first).
+pub async fn invite_rate_limit(
+    axum::Extension(InviteRateLimiter(limiter)): axum::Extension<InviteRateLimiter>,
+    axum::Extension(auth): axum::Extension<crate::auth::AuthUser>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !limiter.check(auth.0).await {
+        warn!(user_id = %auth.0, "Invite rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Sync endpoints: N requests/hour per user (auth_middleware must run first).
+pub async fn sync_rate_limit(
+    axum::Extension(SyncRateLimiter(limiter)): axum::Extension<SyncRateLimiter>,
+    axum::Extension(auth): axum::Extension<crate::auth::AuthUser>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !limiter.check(auth.0).await {
+        warn!(user_id = %auth.0, "Sync rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
+
 /// Auth endpoints: 10 requests/minute per IP.
 pub async fn auth_rate_limit(
     axum::Extension(limiter): axum::Extension<RateLimiter>,
@@ -81,29 +142,10 @@ pub async fn auth_rate_limit(
     let ip = extract_ip(&req);
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-
     if !limiter.check(ip).await {
         warn!(%ip, method = %method, path = %path, "Auth rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-
     Ok(next.run(req).await)
 }
 
-/// Sync endpoints: 60 requests/hour per IP.
-pub async fn sync_rate_limit(
-    axum::Extension(limiter): axum::Extension<RateLimiter>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let ip = extract_ip(&req);
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-
-    if !limiter.check(ip).await {
-        warn!(%ip, method = %method, path = %path, "Sync rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    Ok(next.run(req).await)
-}
