@@ -67,9 +67,14 @@ pub async fn create_checkout(
     }
 
     let email = fetch_user_email(&pool, auth.0).await?;
+    let test_mode = std::env::var("LS_TEST_MODE").as_deref() == Ok("true");
     let mut url = format!(
         "https://{store_slug}.lemonsqueezy.com/checkout/buy/{variant_id}?checkout[email]={email}"
     );
+
+    if test_mode {
+        url.push_str("&test=true");
+    }
 
     // Embed user_id so the webhook can match by UUID instead of email
     url.push_str(&format!("&checkout[custom][user_id]={}", auth.0));
