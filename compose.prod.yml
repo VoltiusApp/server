@@ -17,7 +17,6 @@ services:
       ADMIN_SECRET: ${ADMIN_SECRET}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://voltius.app,https://www.voltius.app,https://app.voltius.app,tauri://localhost,https://tauri.localhost,http://localhost:1420,http://localhost:1421}
       LEMONSQUEEZY_SIGNING_SECRET: ${LEMONSQUEEZY_SIGNING_SECRET}
-      LEMONSQUEEZY_STORE_SLUG: ${LEMONSQUEEZY_STORE_SLUG}
       LEMONSQUEEZY_STORE_ID: ${LEMONSQUEEZY_STORE_ID}
       LEMONSQUEEZY_API_KEY: ${LEMONSQUEEZY_API_KEY}
       LS_VARIANT_PRO_MONTHLY: ${LS_VARIANT_PRO_MONTHLY}
