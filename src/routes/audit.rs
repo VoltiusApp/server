@@ -6,7 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use tracing::{error, warn};
@@ -24,7 +24,7 @@ pub struct AuditClientRateLimiter(pub RateLimiter<Uuid>);
 // ─── Write helper (called from other route modules) ───────────────────────────
 
 pub async fn write_audit_event(
-    pool: &PgPool,
+    pool: PgPool,
     team_id: Uuid,
     actor_id: Uuid,
     action: &str,
@@ -45,7 +45,7 @@ pub async fn write_audit_event(
     .bind(target_id)
     .bind(target_name)
     .bind(metadata)
-    .execute(pool)
+    .execute(&pool)
     .await;
 
     if let Err(e) = result {
@@ -84,6 +84,7 @@ pub struct AuditLogsResponse {
 pub struct AuditQuery {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
+    pub vault_id: Option<Uuid>,
     pub action: Option<String>,
     pub actor_id: Option<Uuid>,
     pub from: Option<String>,
@@ -93,6 +94,7 @@ pub struct AuditQuery {
 #[derive(Deserialize)]
 pub struct ExportQuery {
     pub format: Option<String>,
+    pub vault_id: Option<Uuid>,
     pub action: Option<String>,
     pub actor_id: Option<Uuid>,
     pub from: Option<String>,
@@ -117,10 +119,14 @@ pub async fn list_audit_logs(
     let per_page = params.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
-    let from_dt = params.from.as_deref()
+    let from_dt = params
+        .from
+        .as_deref()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
-    let to_dt = params.to.as_deref()
+    let to_dt = params
+        .to
+        .as_deref()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
@@ -128,16 +134,18 @@ pub async fn list_audit_logs(
         r#"SELECT COUNT(*)
            FROM audit_logs al
            WHERE al.team_id = $1
-             AND ($2::text IS NULL OR al.action = $2)
-             AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
-             AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
-             AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)"#,
+              AND ($2::text IS NULL OR al.action = $2)
+              AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
+              AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
+              AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
+              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)"#,
     )
     .bind(team_id)
     .bind(&params.action)
     .bind(params.actor_id)
     .bind(from_dt)
     .bind(to_dt)
+    .bind(params.vault_id)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
@@ -154,18 +162,20 @@ pub async fn list_audit_logs(
            FROM audit_logs al
            JOIN users u ON u.id = al.actor_id
            WHERE al.team_id = $1
-             AND ($2::text IS NULL OR al.action = $2)
-             AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
-             AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
-             AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
-           ORDER BY al.created_at DESC
-           LIMIT $6 OFFSET $7"#,
+              AND ($2::text IS NULL OR al.action = $2)
+              AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
+              AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
+              AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
+              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
+            ORDER BY al.created_at DESC
+            LIMIT $7 OFFSET $8"#,
     )
     .bind(team_id)
     .bind(&params.action)
     .bind(params.actor_id)
     .bind(from_dt)
     .bind(to_dt)
+    .bind(params.vault_id)
     .bind(per_page)
     .bind(offset)
     .fetch_all(&pool)
@@ -192,10 +202,14 @@ pub async fn export_audit_logs(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let from_dt = params.from.as_deref()
+    let from_dt = params
+        .from
+        .as_deref()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
-    let to_dt = params.to.as_deref()
+    let to_dt = params
+        .to
+        .as_deref()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
@@ -208,17 +222,19 @@ pub async fn export_audit_logs(
            FROM audit_logs al
            JOIN users u ON u.id = al.actor_id
            WHERE al.team_id = $1
-             AND ($2::text IS NULL OR al.action = $2)
-             AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
-             AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
-             AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
-           ORDER BY al.created_at DESC"#,
+              AND ($2::text IS NULL OR al.action = $2)
+              AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
+              AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
+              AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
+              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
+            ORDER BY al.created_at DESC"#,
     )
     .bind(team_id)
     .bind(&params.action)
     .bind(params.actor_id)
     .bind(from_dt)
     .bind(to_dt)
+    .bind(params.vault_id)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -248,16 +264,25 @@ pub async fn export_audit_logs(
                     csv_escape(log.target_name.as_deref().unwrap_or("")),
                     log.ip_address.as_deref().unwrap_or(""),
                     log.created_at.to_rfc3339(),
-                    csv_escape(&log.metadata.as_ref().map(|m| m.to_string()).unwrap_or_default()),
+                    csv_escape(
+                        &log.metadata
+                            .as_ref()
+                            .map(|m| m.to_string())
+                            .unwrap_or_default()
+                    ),
                 ));
             }
             Ok((
                 [
                     (header::CONTENT_TYPE, "text/csv"),
-                    (header::CONTENT_DISPOSITION, "attachment; filename=\"audit-logs.csv\""),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"audit-logs.csv\"",
+                    ),
                 ],
                 csv,
-            ).into_response())
+            )
+                .into_response())
         }
         _ => {
             let body = serde_json::to_string(&logs).map_err(|e| {
@@ -267,10 +292,14 @@ pub async fn export_audit_logs(
             Ok((
                 [
                     (header::CONTENT_TYPE, "application/json"),
-                    (header::CONTENT_DISPOSITION, "attachment; filename=\"audit-logs.json\""),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"audit-logs.json\"",
+                    ),
                 ],
                 body,
-            ).into_response())
+            )
+                .into_response())
         }
     }
 }
@@ -285,7 +314,29 @@ fn csv_escape(s: &str) -> String {
 
 // ─── POST /v1/teams/:team_id/audit-logs/client ───────────────────────────────
 
-const CLIENT_WHITELIST: &[&str] = &["connection.started", "connection.ended", "secret.viewed"];
+const CLIENT_WHITELIST: &[&str] = &[
+    "connection.started",
+    "connection.ended",
+    "secret.viewed",
+    "connection.created",
+    "connection.updated",
+    "connection.deleted",
+    "identity.created",
+    "identity.updated",
+    "identity.deleted",
+    "key.created",
+    "key.updated",
+    "key.deleted",
+    "snippet.created",
+    "snippet.updated",
+    "snippet.deleted",
+    "folder.created",
+    "folder.updated",
+    "folder.deleted",
+    "port_forward.created",
+    "port_forward.updated",
+    "port_forward.deleted",
+];
 
 #[derive(Deserialize)]
 pub struct ClientEventRequest {
