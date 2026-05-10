@@ -1,11 +1,13 @@
 use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
+use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
@@ -374,6 +376,22 @@ pub async fn add_member(
     })?;
 
     info!(team_id = %team_id, invitee_id = %invitee_id, role = %role_name, "Member added");
+    let invitee_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
+        .bind(invitee_id)
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.joined",
+        Some("user"),
+        Some(invitee_id.to_string()),
+        invitee_email,
+        Some(json!({ "role": role_name })),
+    ));
     notifier.notify_membership_changed(invitee_id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -441,6 +459,16 @@ pub async fn remove_member(
     })?;
 
     info!(team_id = %team_id, removed_user_id = %user_id, "Member removed");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.removed",
+        Some("user"),
+        Some(user_id.to_string()),
+        None,
+        None,
+    ));
     notifier.notify_membership_changed(user_id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -642,6 +670,16 @@ pub async fn create_role(
     })?;
 
     info!(team_id = %team_id, role_id = %role.id, name = %role.name, "Custom role created");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "role.created",
+        Some("role"),
+        Some(role.id.to_string()),
+        Some(role.name.clone()),
+        Some(json!({ "permissions": role.permissions })),
+    ));
     Ok((StatusCode::CREATED, Json(role)))
 }
 
@@ -713,6 +751,16 @@ pub async fn update_role(
     .map_err(|e| { error!(error = %e, "Failed to update role"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     info!(team_id = %team_id, role_id = %role_id, "Role updated");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "role.updated",
+        Some("role"),
+        Some(role_id.to_string()),
+        body.name.clone(),
+        body.permissions.map(|p| json!({ "permissions": p })),
+    ));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -761,6 +809,16 @@ pub async fn delete_role(
     }
 
     info!(team_id = %team_id, role_id = %role_id, "Custom role deleted");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "role.deleted",
+        Some("role"),
+        Some(role_id.to_string()),
+        None,
+        None,
+    ));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -860,6 +918,16 @@ pub async fn assign_member_role(
     .map_err(|e| { error!(error = %e, "Failed to assign role"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     info!(team_id = %team_id, target_user_id = %target_user_id, role_id = %body.role_id, "Role assigned to member");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.role_changed",
+        Some("user"),
+        Some(target_user_id.to_string()),
+        None,
+        Some(json!({ "role_id": body.role_id, "change": "assigned" })),
+    ));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -921,6 +989,16 @@ pub async fn remove_member_role(
     }
 
     info!(team_id = %team_id, target_user_id = %target_user_id, role_id = %role_id, "Role removed from member");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.role_changed",
+        Some("user"),
+        Some(target_user_id.to_string()),
+        None,
+        Some(json!({ "role_id": role_id, "change": "removed" })),
+    ));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1038,6 +1116,16 @@ pub async fn invite_member(
         })?;
 
         info!(team_id = %team_id, user_id = %user_id, role = %role, "Member directly added via invite endpoint");
+        tokio::spawn(write_audit_event(
+            pool.clone(),
+            team_id,
+            auth.0,
+            "member.invited",
+            Some("user"),
+            Some(user_id.to_string()),
+            Some(email.clone()),
+            Some(json!({ "role": role })),
+        ));
         notifier.notify_membership_changed(user_id);
         return Ok(Json(InviteMemberResponse { status: "added".to_string() }));
     }
@@ -1081,6 +1169,16 @@ pub async fn invite_member(
     }
 
     info!(team_id = %team_id, email = %email, "Pending invitation created");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.invited",
+        Some("user"),
+        None,
+        Some(email.clone()),
+        Some(json!({ "role": role, "status": "pending" })),
+    ));
     Ok(Json(InviteMemberResponse { status: "invited".to_string() }))
 }
 

@@ -1,10 +1,12 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
+use serde_json::json;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
 
 // ─── Get invitation details (public — no auth required) ───────────────────────
@@ -146,6 +148,16 @@ pub async fn accept_invitation(
     })?;
 
     info!(user_id = %auth.0, team_id = %team_id, role = %role, "Invitation accepted");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.joined",
+        Some("user"),
+        Some(auth.0.to_string()),
+        Some(user_email.clone()),
+        Some(json!({ "role": role, "via": "invitation" })),
+    ));
     notifier.notify_membership_changed(auth.0);
     Ok(StatusCode::NO_CONTENT)
 }

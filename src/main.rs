@@ -15,6 +15,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use rate_limit::{InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter};
+use routes::audit::AuditClientRateLimiter;
 use sync_notifier::SyncNotifier;
 use terminal_manager::TerminalManager;
 use std::net::SocketAddr;
@@ -38,6 +39,29 @@ async fn main() {
         .init();
 
     let pool = db::create_pool().await;
+
+    // Audit log retention: delete entries older than each team's retention window (runs every 24h)
+    let retention_pool = pool.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(86_400));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            match sqlx::query(
+                r#"DELETE FROM audit_logs
+                   USING teams
+                   WHERE audit_logs.team_id = teams.id
+                     AND audit_logs.created_at < NOW() - (teams.audit_retention_days * INTERVAL '1 day')"#,
+            )
+            .execute(&retention_pool)
+            .await
+            {
+                Ok(r) => tracing::info!(deleted = r.rows_affected(), "Audit log retention cleanup completed"),
+                Err(e) => tracing::error!(error = %e, "Audit log retention cleanup failed"),
+            }
+        }
+    });
+
     let notifier = SyncNotifier::new();
     let terminal_manager = TerminalManager::new();
     let presence_map: PresenceMap = Arc::new(DashMap::new());
@@ -53,6 +77,7 @@ async fn main() {
     let register_limiter = RegisterRateLimiter(RateLimiter::new(register_per_day, Duration::from_secs(86400)));
     let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(invite_per_hour, Duration::from_secs(3600)));
     let sync_limiter = SyncRateLimiter(RateLimiter::<uuid::Uuid>::new(sync_rate, Duration::from_secs(3600)));
+    let audit_client_limiter = AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
     tracing::info!(auth_per_minute = 10, register_per_day, invite_per_hour, sync_per_hour = sync_rate, "Configured rate limits");
 
     // Register — stricter limit: 5/day per IP on top of the general auth 10/min
@@ -105,6 +130,15 @@ async fn main() {
         .layer(Extension(notifier.clone()))
         .layer(Extension(presence_map.clone()));
 
+    // Audit log — client self-reporting (CONNECT permission + rate limit by team_id)
+    let audit_client = Router::new()
+        .route(
+            "/v1/teams/:team_id/audit-logs/client",
+            axum::routing::post(routes::audit::report_client_event),
+        )
+        .layer(Extension(audit_client_limiter))
+        .layer(middleware::from_fn(auth::auth_middleware));
+
     // Protected routes — auth required + rate limited at 60/hour per IP
     let protected = Router::new()
         .route("/v1/auth/account", delete(routes::auth::delete_account))
@@ -140,6 +174,9 @@ async fn main() {
         .route("/v1/terminal-sessions", post(routes::terminal::create_session))
         .route("/v1/terminal-sessions/:id/my-key", get(routes::terminal::get_my_session_key))
         .route("/v1/terminal-sessions/:id", delete(routes::terminal::end_session))
+        // Audit logs — read + export (VIEW_AUDIT_LOG enforced in handler)
+        .route("/v1/teams/:team_id/audit-logs", get(routes::audit::list_audit_logs))
+        .route("/v1/teams/:team_id/audit-logs/export", get(routes::audit::export_audit_logs))
         // Billing
         .route("/v1/billing/checkout", post(routes::billing::create_checkout))
         .route("/v1/billing/portal", post(routes::billing::get_portal))
@@ -183,6 +220,7 @@ async fn main() {
         .merge(invite_route)
         .merge(pro_sync)
         .merge(teams_gated)
+        .merge(audit_client)
         .merge(protected)
         .merge(admin_routes)
         .merge(ws_routes)
