@@ -16,11 +16,11 @@ use axum::{
 use dashmap::DashMap;
 use rate_limit::{InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter};
 use routes::audit::AuditClientRateLimiter;
-use sync_notifier::SyncNotifier;
-use terminal_manager::TerminalManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use sync_notifier::SyncNotifier;
+use terminal_manager::TerminalManager;
 use uuid::Uuid;
 
 pub type PresenceMap = Arc<DashMap<Uuid, ()>>;
@@ -67,18 +67,40 @@ async fn main() {
     let presence_map: PresenceMap = Arc::new(DashMap::new());
 
     // Rate limiters (configurable via env for dev)
-    let sync_rate: usize = std::env::var("SYNC_RATE_LIMIT").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(60);
-    let register_per_day: usize = std::env::var("REGISTER_RATE_LIMIT").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(20);
-    let invite_per_hour: usize = std::env::var("INVITE_RATE_LIMIT").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(20);
+    let sync_rate: usize = std::env::var("SYNC_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let register_per_day: usize = std::env::var("REGISTER_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let invite_per_hour: usize = std::env::var("INVITE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     let auth_limiter = RateLimiter::<std::net::IpAddr>::new(10, Duration::from_secs(60));
-    let register_limiter = RegisterRateLimiter(RateLimiter::new(register_per_day, Duration::from_secs(86400)));
-    let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(invite_per_hour, Duration::from_secs(3600)));
-    let sync_limiter = SyncRateLimiter(RateLimiter::<uuid::Uuid>::new(sync_rate, Duration::from_secs(3600)));
-    let audit_client_limiter = AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
-    tracing::info!(auth_per_minute = 10, register_per_day, invite_per_hour, sync_per_hour = sync_rate, "Configured rate limits");
+    let register_limiter = RegisterRateLimiter(RateLimiter::new(
+        register_per_day,
+        Duration::from_secs(86400),
+    ));
+    let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(
+        invite_per_hour,
+        Duration::from_secs(3600),
+    ));
+    let sync_limiter = SyncRateLimiter(RateLimiter::<uuid::Uuid>::new(
+        sync_rate,
+        Duration::from_secs(3600),
+    ));
+    let audit_client_limiter =
+        AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
+    tracing::info!(
+        auth_per_minute = 10,
+        register_per_day,
+        invite_per_hour,
+        sync_per_hour = sync_rate,
+        "Configured rate limits"
+    );
 
     // Register — stricter limit: 5/day per IP on top of the general auth 10/min
     let register_route = Router::new()
@@ -93,18 +115,27 @@ async fn main() {
         .route("/v1/auth/challenge", get(routes::auth::challenge))
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
-        .route("/v1/invitations/:token", get(routes::invitations::get_invitation))
+        .route(
+            "/v1/invitations/:token",
+            get(routes::invitations::get_invitation),
+        )
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
         .layer(Extension(auth_limiter));
 
     // Webhook — public, signature-verified internally
     let webhooks = Router::new()
-        .route("/v1/webhooks/lemonsqueezy", post(routes::webhooks::lemonsqueezy_webhook))
+        .route(
+            "/v1/webhooks/lemonsqueezy",
+            post(routes::webhooks::lemonsqueezy_webhook),
+        )
         .layer(Extension(notifier.clone()));
 
     // Invite — auth required + dedicated 20/hr limit (sends email)
     let invite_route = Router::new()
-        .route("/v1/teams/:team_id/invite", post(routes::teams::invite_member))
+        .route(
+            "/v1/teams/:team_id/invite",
+            post(routes::teams::invite_member),
+        )
         .layer(middleware::from_fn(rate_limit::invite_rate_limit))
         .layer(Extension(invite_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
@@ -144,44 +175,124 @@ async fn main() {
         .route("/v1/auth/account", delete(routes::auth::delete_account))
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
         .route("/v1/sync/devices", get(routes::sync::list_devices))
-        .route("/v1/sync/blob/:device_id", delete(routes::sync::delete_blob))
+        .route(
+            "/v1/sync/blob/:device_id",
+            delete(routes::sync::delete_blob),
+        )
         // Teams — read routes open to all authed users
         .route("/v1/teams", get(routes::teams::list_teams))
-        .route("/v1/teams/:team_id/members", get(routes::teams::list_members))
-        .route("/v1/teams/:team_id/members", post(routes::teams::add_member))
+        .route(
+            "/v1/teams/:team_id/members",
+            get(routes::teams::list_members),
+        )
+        .route(
+            "/v1/teams/:team_id/members",
+            post(routes::teams::add_member),
+        )
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team))
-        .route("/v1/teams/:team_id/members/:user_id", delete(routes::teams::remove_member))
-        .route("/v1/teams/:team_id/members/:user_id/roles", get(routes::teams::list_member_roles))
-        .route("/v1/teams/:team_id/members/:user_id/roles", post(routes::teams::assign_member_role))
-        .route("/v1/teams/:team_id/members/:user_id/roles/:role_id", delete(routes::teams::remove_member_role))
+        .route(
+            "/v1/teams/:team_id/members/:user_id",
+            delete(routes::teams::remove_member),
+        )
+        .route(
+            "/v1/teams/:team_id/members/:user_id/roles",
+            get(routes::teams::list_member_roles),
+        )
+        .route(
+            "/v1/teams/:team_id/members/:user_id/roles",
+            post(routes::teams::assign_member_role),
+        )
+        .route(
+            "/v1/teams/:team_id/members/:user_id/roles/:role_id",
+            delete(routes::teams::remove_member_role),
+        )
         .route("/v1/users/search", get(routes::teams::search_users))
         // Team invitations (invite POST is on invite_route with stricter rate limit)
-        .route("/v1/teams/:team_id/pending-invitations", get(routes::teams::list_pending_invitations))
-        .route("/v1/teams/:team_id/pending-invitations/:inv_id", delete(routes::teams::revoke_pending_invitation))
-        .route("/v1/invitations/:token/accept", post(routes::invitations::accept_invitation))
+        .route(
+            "/v1/teams/:team_id/pending-invitations",
+            get(routes::teams::list_pending_invitations),
+        )
+        .route(
+            "/v1/teams/:team_id/pending-invitations/:inv_id",
+            delete(routes::teams::revoke_pending_invitation),
+        )
+        .route(
+            "/v1/invitations/:token/accept",
+            post(routes::invitations::accept_invitation),
+        )
         // Custom roles
         .route("/v1/teams/:team_id/roles", get(routes::teams::list_roles))
         .route("/v1/teams/:team_id/roles", post(routes::teams::create_role))
-        .route("/v1/teams/:team_id/roles/:role_id", patch(routes::teams::update_role))
-        .route("/v1/teams/:team_id/roles/:role_id", delete(routes::teams::delete_role))
+        .route(
+            "/v1/teams/:team_id/roles/:role_id",
+            patch(routes::teams::update_role),
+        )
+        .route(
+            "/v1/teams/:team_id/roles/:role_id",
+            delete(routes::teams::delete_role),
+        )
         // Team vault sync
-        .route("/v1/teams/:team_id/vault-key", get(routes::team_sync::get_my_vault_key))
-        .route("/v1/teams/:team_id/vault-key", put(routes::team_sync::put_vault_keys))
-        .route("/v1/teams/:team_id/sync-blob", get(routes::team_sync::get_team_blob))
-        .route("/v1/teams/:team_id/sync-blob", put(routes::team_sync::put_team_blob))
+        .route(
+            "/v1/teams/:team_id/vault-key",
+            get(routes::team_sync::get_my_vault_key),
+        )
+        .route(
+            "/v1/teams/:team_id/vault-key",
+            put(routes::team_sync::put_vault_keys),
+        )
+        .route(
+            "/v1/teams/:team_id/sync-blob",
+            get(routes::team_sync::get_team_blob),
+        )
+        .route(
+            "/v1/teams/:team_id/sync-blob",
+            put(routes::team_sync::put_team_blob),
+        )
         // Terminal sessions (REST) — Pro-gated at handler level via claims
-        .route("/v1/terminal-sessions", get(routes::terminal::list_active_sessions))
-        .route("/v1/terminal-sessions", post(routes::terminal::create_session))
-        .route("/v1/terminal-sessions/:id/my-key", get(routes::terminal::get_my_session_key))
-        .route("/v1/terminal-sessions/:id", delete(routes::terminal::end_session))
+        .route(
+            "/v1/terminal-sessions",
+            get(routes::terminal::list_active_sessions),
+        )
+        .route(
+            "/v1/terminal-sessions",
+            post(routes::terminal::create_session),
+        )
+        .route(
+            "/v1/terminal-sessions/:id/my-key",
+            get(routes::terminal::get_my_session_key),
+        )
+        .route(
+            "/v1/terminal-sessions/:id",
+            delete(routes::terminal::end_session),
+        )
         // Audit logs — read + export (VIEW_AUDIT_LOG enforced in handler)
-        .route("/v1/teams/:team_id/audit-logs", get(routes::audit::list_audit_logs))
-        .route("/v1/teams/:team_id/audit-logs/export", get(routes::audit::export_audit_logs))
+        .route(
+            "/v1/teams/:team_id/audit-logs",
+            get(routes::audit::list_audit_logs),
+        )
+        .route(
+            "/v1/teams/:team_id/audit-logs/export",
+            get(routes::audit::export_audit_logs),
+        )
         // Billing
-        .route("/v1/billing/checkout", post(routes::billing::create_checkout))
+        .route(
+            "/v1/billing/checkout",
+            post(routes::billing::create_checkout),
+        )
         .route("/v1/billing/portal", post(routes::billing::get_portal))
         .route("/v1/billing/seats", post(routes::billing::update_seats))
-        .route("/v1/billing/subscription", get(routes::billing::get_subscription))
+        .route(
+            "/v1/billing/subscription",
+            get(routes::billing::get_subscription),
+        )
+        .route(
+            "/v1/billing/subscription/cancel",
+            post(routes::billing::cancel_subscription),
+        )
+        .route(
+            "/v1/billing/subscription/resume",
+            post(routes::billing::resume_subscription),
+        )
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
@@ -192,17 +303,32 @@ async fn main() {
     // Admin routes — auth + admin check, no rate limit (internal tool)
     let admin_routes = Router::new()
         .route("/v1/admin/stats", get(routes::admin::get_stats))
-        .route("/v1/admin/users/export", get(routes::admin::export_users_csv))
+        .route(
+            "/v1/admin/users/export",
+            get(routes::admin::export_users_csv),
+        )
         .route("/v1/admin/users", get(routes::admin::list_users))
         .route("/v1/admin/users/:id", get(routes::admin::get_user))
         .route("/v1/admin/users/:id", patch(routes::admin::patch_user))
         .route("/v1/admin/users/:id/ban", post(routes::admin::ban_user))
         .route("/v1/admin/users/:id/unban", post(routes::admin::unban_user))
-        .route("/v1/admin/users/:id/extend-trial", post(routes::admin::extend_trial))
-        .route("/v1/admin/users/:id/devices", get(routes::admin::list_devices))
+        .route(
+            "/v1/admin/users/:id/extend-trial",
+            post(routes::admin::extend_trial),
+        )
+        .route(
+            "/v1/admin/users/:id/devices",
+            get(routes::admin::list_devices),
+        )
         .route("/v1/admin/users/:id/flags", get(routes::admin::list_flags))
-        .route("/v1/admin/users/:id/flags/:flag", put(routes::admin::set_flag))
-        .route("/v1/admin/users/:id/churn", get(routes::admin::list_user_churn))
+        .route(
+            "/v1/admin/users/:id/flags/:flag",
+            put(routes::admin::set_flag),
+        )
+        .route(
+            "/v1/admin/users/:id/churn",
+            get(routes::admin::list_user_churn),
+        )
         .route("/v1/admin/audit-log", get(routes::admin::list_audit_log))
         .route("/v1/admin/churn", get(routes::admin::list_churn))
         .layer(middleware::from_fn(auth::require_admin_key))
@@ -210,7 +336,10 @@ async fn main() {
 
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()
-        .route("/v1/terminal-sessions/:id/ws", get(routes::terminal::ws_handler))
+        .route(
+            "/v1/terminal-sessions/:id/ws",
+            get(routes::terminal::ws_handler),
+        )
         .layer(Extension(terminal_manager));
 
     let app = Router::new()
@@ -228,11 +357,13 @@ async fn main() {
         .layer({
             let allow_origin = match std::env::var("CORS_ORIGINS") {
                 Ok(s) => {
-                    let origins: Vec<HeaderValue> = s
-                        .split(',')
-                        .filter_map(|o| o.trim().parse().ok())
-                        .collect();
-                    if origins.is_empty() { AllowOrigin::any() } else { AllowOrigin::list(origins) }
+                    let origins: Vec<HeaderValue> =
+                        s.split(',').filter_map(|o| o.trim().parse().ok()).collect();
+                    if origins.is_empty() {
+                        AllowOrigin::any()
+                    } else {
+                        AllowOrigin::list(origins)
+                    }
                 }
                 Err(_) => AllowOrigin::any(),
             };

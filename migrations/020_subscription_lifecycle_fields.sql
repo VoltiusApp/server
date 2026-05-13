@@ -1,0 +1,6 @@
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS ls_subscription_status TEXT NULL,
+    ADD COLUMN IF NOT EXISTS ls_variant_id TEXT NULL,
+    ADD COLUMN IF NOT EXISTS subscription_cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS subscription_renews_at TIMESTAMPTZ NULL,
+    ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMPTZ NULL;
