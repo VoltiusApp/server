@@ -145,7 +145,6 @@ async fn main() {
     let pro_sync = Router::new()
         .route("/v1/sync/blob", get(routes::sync::get_blob))
         .route("/v1/sync/blob", put(routes::sync::put_blob))
-        .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .layer(middleware::from_fn(auth::require_pro))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter.clone()))
@@ -175,6 +174,7 @@ async fn main() {
         .route("/v1/auth/account", delete(routes::auth::delete_account))
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
         .route("/v1/sync/devices", get(routes::sync::list_devices))
+        .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .route(
             "/v1/sync/blob/:device_id",
             delete(routes::sync::delete_blob),

@@ -11,6 +11,28 @@ use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
+async fn notify_team_members(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    team_id: Uuid,
+    payload: String,
+) {
+    let member_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM team_members WHERE team_id = $1")
+            .bind(team_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+    for member_id in member_ids {
+        notifier.notify(member_id, payload.clone());
+    }
+}
+
+async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
+    notify_team_members(pool, notifier, team_id, format!("team_members:{team_id}")).await;
+}
+
 // ─── Plan tier helper ─────────────────────────────────────────────────────────
 
 async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
@@ -393,6 +415,7 @@ pub async fn add_member(
         Some(json!({ "role": role_name })),
     ));
     notifier.notify_membership_changed(invitee_id);
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -470,6 +493,7 @@ pub async fn remove_member(
         None,
     ));
     notifier.notify_membership_changed(user_id);
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -478,6 +502,7 @@ pub async fn remove_member(
 pub async fn delete_team(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     Path(team_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let is_owner = sqlx::query_scalar::<_, bool>(
@@ -495,6 +520,16 @@ pub async fn delete_team(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let member_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM team_members WHERE team_id = $1")
+            .bind(team_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, team_id = %team_id, "Failed to fetch team members before delete");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
     sqlx::query("DELETE FROM teams WHERE id = $1")
         .bind(team_id)
         .execute(&pool)
@@ -502,6 +537,9 @@ pub async fn delete_team(
         .map_err(|e| { error!(error = %e, team_id = %team_id, "Failed to delete team"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     info!(team_id = %team_id, deleted_by = %auth.0, "Team deleted by owner");
+    for member_id in member_ids {
+        notifier.notify_membership_changed(member_id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -629,6 +667,7 @@ pub struct CreateRoleRequest {
 pub async fn create_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<TeamRole>), StatusCode> {
@@ -680,6 +719,7 @@ pub async fn create_role(
         Some(role.name.clone()),
         Some(json!({ "permissions": role.permissions })),
     ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok((StatusCode::CREATED, Json(role)))
 }
 
@@ -696,6 +736,7 @@ pub struct UpdateRoleBody {
 pub async fn update_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateRoleBody>,
 ) -> Result<StatusCode, StatusCode> {
@@ -761,6 +802,7 @@ pub async fn update_role(
         body.name.clone(),
         body.permissions.map(|p| json!({ "permissions": p })),
     ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -769,6 +811,7 @@ pub async fn update_role(
 pub async fn delete_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     require_business_tier(&pool, team_id).await?;
@@ -819,6 +862,7 @@ pub async fn delete_role(
         None,
         None,
     ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -868,6 +912,7 @@ pub struct AssignRoleRequest {
 pub async fn assign_member_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<AssignRoleRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -928,6 +973,7 @@ pub async fn assign_member_role(
         None,
         Some(json!({ "role_id": body.role_id, "change": "assigned" })),
     ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -936,6 +982,7 @@ pub async fn assign_member_role(
 pub async fn remove_member_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, target_user_id, role_id)): axum::extract::Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     let can_manage = crate::permissions::has_team_permission(
@@ -999,6 +1046,7 @@ pub async fn remove_member_role(
         None,
         Some(json!({ "role_id": role_id, "change": "removed" })),
     ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1179,6 +1227,7 @@ pub async fn invite_member(
         Some(email.clone()),
         Some(json!({ "role": role, "status": "pending" })),
     ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(Json(InviteMemberResponse { status: "invited".to_string() }))
 }
 
@@ -1240,6 +1289,7 @@ pub async fn list_pending_invitations(
 pub async fn revoke_pending_invitation(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, invitation_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     let can_manage = crate::permissions::has_team_permission(
@@ -1264,5 +1314,6 @@ pub async fn revoke_pending_invitation(
     }
 
     info!(team_id = %team_id, invitation_id = %invitation_id, "Pending invitation revoked");
+    notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
