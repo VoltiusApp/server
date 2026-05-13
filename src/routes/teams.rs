@@ -1175,6 +1175,7 @@ pub async fn invite_member(
             Some(json!({ "role": role })),
         ));
         notifier.notify_membership_changed(user_id);
+        notify_team_members_changed(&pool, &notifier, team_id).await;
         return Ok(Json(InviteMemberResponse { status: "added".to_string() }));
     }
 
