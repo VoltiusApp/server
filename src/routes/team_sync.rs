@@ -71,6 +71,13 @@ pub async fn get_my_vault_key(
         return Err(StatusCode::FORBIDDEN);
     }
     require_teams_tier_for_vault(&pool, team_id).await?;
+    crate::permissions::require_all_team_permissions(
+        &pool,
+        team_id,
+        auth.0,
+        &[crate::permissions::PERM_VIEW_SECRETS],
+    )
+    .await?;
 
     let row = sqlx::query_as::<_, (String, Uuid)>(
         "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2",
@@ -119,6 +126,16 @@ pub async fn put_vault_keys(
         return Err(StatusCode::FORBIDDEN);
     }
     require_teams_tier_for_vault(&pool, team_id).await?;
+    crate::permissions::require_all_team_permissions(
+        &pool,
+        team_id,
+        auth.0,
+        &[
+            crate::permissions::PERM_VIEW_SECRETS,
+            crate::permissions::PERM_COPY_SECRETS,
+        ],
+    )
+    .await?;
 
     if body.keys.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -230,6 +247,24 @@ pub async fn put_team_blob(
         return Err(StatusCode::FORBIDDEN);
     }
     require_teams_tier_for_vault(&pool, team_id).await?;
+
+    // Legacy whole-blob writes can replace every object and secret in a team
+    // vault. Keep this endpoint for migration/bootstrap, but require broad
+    // rights so lower-privilege roles cannot bypass object-level routes.
+    crate::permissions::require_all_team_permissions(
+        &pool,
+        team_id,
+        auth.0,
+        &[
+            crate::permissions::PERM_EDIT_CONNECTIONS,
+            crate::permissions::PERM_EDIT_IDENTITIES,
+            crate::permissions::PERM_EDIT_KEYS,
+            crate::permissions::PERM_EDIT_FOLDERS,
+            crate::permissions::PERM_VIEW_SECRETS,
+            crate::permissions::PERM_COPY_SECRETS,
+        ],
+    )
+    .await?;
 
     let blob_bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.blob)

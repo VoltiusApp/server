@@ -5,6 +5,7 @@ pub mod billing;
 pub mod invitations;
 pub mod sync;
 pub mod team_sync;
+pub mod team_objects;
 pub mod teams;
 pub mod terminal;
 pub mod webhooks;

@@ -248,6 +248,26 @@ async fn main() {
             "/v1/teams/:team_id/sync-blob",
             put(routes::team_sync::put_team_blob),
         )
+        .route(
+            "/v1/teams/:team_id/objects",
+            get(routes::team_objects::list_objects),
+        )
+        .route(
+            "/v1/teams/:team_id/objects",
+            put(routes::team_objects::upsert_object),
+        )
+        .route(
+            "/v1/teams/:team_id/objects/:object_id",
+            delete(routes::team_objects::delete_object),
+        )
+        .route(
+            "/v1/teams/:team_id/secrets",
+            get(routes::team_objects::list_secrets),
+        )
+        .route(
+            "/v1/teams/:team_id/secrets",
+            put(routes::team_objects::upsert_secret),
+        )
         // Terminal sessions (REST) — Pro-gated at handler level via claims
         .route(
             "/v1/terminal-sessions",
