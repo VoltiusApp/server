@@ -11,7 +11,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::sync_notifier::SyncNotifier;
+use crate::sync_notifier::{
+    notify_team_vault_changed, team_vault_notification_payload, SyncNotifier,
+};
 
 const MAX_TEAM_BLOB_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
@@ -308,22 +310,22 @@ pub async fn put_team_blob(
 
     info!(team_id = %team_id, user_id = %auth.0, blob_size = blob_bytes.len(), "Team sync blob upserted");
 
-    // Fan out a personal SSE notification to every other team member so their
-    // single persistent SSE connection handles the team update without needing
-    // a separate per-team SSE stream.
-    let member_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
-        "SELECT user_id FROM team_members WHERE team_id = $1 AND user_id != $2",
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-
-    let payload = format!("team:{}", team_id);
-    for member_id in member_ids {
-        sync_notifier.notify(member_id, payload.clone());
-    }
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_vault_notification_payload_uses_team_prefix() {
+        let team_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+
+        assert_eq!(
+            team_vault_notification_payload(team_id),
+            "team:11111111-1111-4111-8111-111111111111"
+        );
+    }
 }

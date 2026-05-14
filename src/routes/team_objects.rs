@@ -14,6 +14,7 @@ use crate::permissions::{
     require_all_team_permissions, require_team_member, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS,
     PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_VIEW_SECRETS,
 };
+use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -104,15 +105,18 @@ pub async fn list_objects(
 ) -> Result<Json<Vec<TeamObjectResponse>>, StatusCode> {
     require_team_member(&pool, team_id, auth.0).await?;
 
-    let rows = sqlx::query_as::<_, (
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        serde_json::Value,
-        DateTime<Utc>,
-        Option<DateTime<Utc>>,
-    )>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            serde_json::Value,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
         r#"SELECT object_id, object_type, name, folder_id, metadata, updated_at, deleted_at
            FROM team_vault_objects
            WHERE team_id = $1
@@ -144,10 +148,17 @@ pub async fn list_objects(
 pub async fn upsert_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
     Path(team_id): Path<Uuid>,
     Json(body): Json<UpsertTeamObjectRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    require_all_team_permissions(&pool, team_id, auth.0, &[body.object_type.edit_permission()]).await?;
+    require_all_team_permissions(
+        &pool,
+        team_id,
+        auth.0,
+        &[body.object_type.edit_permission()],
+    )
+    .await?;
 
     sqlx::query(
         r#"INSERT INTO team_vault_objects
@@ -176,12 +187,15 @@ pub async fn upsert_object(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
     Path((team_id, object_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
     let object_type = sqlx::query_scalar::<_, String>(
@@ -212,6 +226,8 @@ pub async fn delete_object(
         error!(error = %e, team_id = %team_id, object_id = %object_id, "Failed to delete team vault object");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -253,6 +269,7 @@ pub async fn list_secrets(
 pub async fn upsert_secret(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
     Path(team_id): Path<Uuid>,
     Json(body): Json<UpsertSecretRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -295,6 +312,8 @@ pub async fn upsert_secret(
         error!(error = %e, team_id = %team_id, secret_id = %body.secret_id, "Failed to upsert team vault secret");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
