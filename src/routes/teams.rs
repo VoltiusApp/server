@@ -199,6 +199,24 @@ pub(crate) struct TeamMemberResponse {
     is_online: bool,
 }
 
+fn member_public_key_for_response(public_key: Option<String>) -> String {
+    public_key.unwrap_or_default()
+}
+
+#[cfg(test)]
+mod team_member_tests {
+    use super::*;
+
+    #[test]
+    fn nullable_member_public_key_serializes_as_empty_string() {
+        assert_eq!(member_public_key_for_response(None), "");
+        assert_eq!(
+            member_public_key_for_response(Some("public-key".to_string())),
+            "public-key",
+        );
+    }
+}
+
 pub async fn list_members(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
@@ -223,7 +241,18 @@ pub async fn list_members(
     }
 
     // Returns one row per (member, role) — aggregated in Rust
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>, String, String, Option<Uuid>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+            String,
+            Option<String>,
+            Option<Uuid>,
+        ),
+    >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.email AS invited_by_email, tm.joined_at,
                u.email, u.public_key, tmr.role_id
@@ -258,7 +287,7 @@ pub async fn list_members(
                         team_id: t_id,
                         user_id,
                         email,
-                        public_key,
+                        public_key: member_public_key_for_response(public_key),
                         invited_by_email,
                         joined_at,
                         role_ids: role_id.into_iter().collect(),
@@ -567,7 +596,7 @@ pub async fn search_users(
     }
 
     let pattern = format!("%{}%", params.q.to_lowercase());
-    let results = sqlx::query_as::<_, (Uuid, String, String)>(
+    let results = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
         r#"
         SELECT id, email, public_key
         FROM users
@@ -592,7 +621,11 @@ pub async fn search_users(
     Ok(Json(
         results
             .into_iter()
-            .map(|(user_id, email, public_key)| UserSearchResult { user_id, email, public_key })
+            .map(|(user_id, email, public_key)| UserSearchResult {
+                user_id,
+                email,
+                public_key: member_public_key_for_response(public_key),
+            })
             .collect(),
     ))
 }
