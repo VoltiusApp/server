@@ -117,9 +117,23 @@ pub struct PutVaultKeysRequest {
     pub keys: Vec<WrappedKeyEntry>,
 }
 
+fn vault_key_notification_targets(actor_user_id: Uuid, keys: &[WrappedKeyEntry]) -> Vec<Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    keys.iter()
+        .filter_map(|entry| {
+            if entry.user_id == actor_user_id || !seen.insert(entry.user_id) {
+                None
+            } else {
+                Some(entry.user_id)
+            }
+        })
+        .collect()
+}
+
 pub async fn put_vault_keys(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(sync_notifier): axum::Extension<SyncNotifier>,
     Path(team_id): Path<Uuid>,
     Json(body): Json<PutVaultKeysRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -186,6 +200,9 @@ pub async fn put_vault_keys(
     }
 
     info!(team_id = %team_id, upserter = %auth.0, key_count = body.keys.len(), "Vault keys upserted");
+    for user_id in vault_key_notification_targets(auth.0, &body.keys) {
+        sync_notifier.notify_membership_changed(user_id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -327,5 +344,22 @@ mod tests {
             team_vault_notification_payload(team_id),
             "team:11111111-1111-4111-8111-111111111111"
         );
+    }
+
+    #[test]
+    fn vault_key_update_notifies_targets_except_actor_once() {
+        let actor = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let target = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+
+        let targets = vault_key_notification_targets(
+            actor,
+            &[
+                WrappedKeyEntry { user_id: actor, wrapped_key: "self".to_string() },
+                WrappedKeyEntry { user_id: target, wrapped_key: "target-1".to_string() },
+                WrappedKeyEntry { user_id: target, wrapped_key: "target-2".to_string() },
+            ],
+        );
+
+        assert_eq!(targets, vec![target]);
     }
 }
