@@ -29,7 +29,7 @@ async fn notify_team_members(
     }
 }
 
-async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
+pub(crate) async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
     notify_team_members(pool, notifier, team_id, format!("team_members:{team_id}")).await;
 }
 
@@ -315,7 +315,7 @@ pub async fn add_member(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<AddMemberRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<(StatusCode, Json<InviteMemberResponse>), StatusCode> {
     let can_invite = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_INVITE_MEMBERS,
     )
@@ -381,71 +381,66 @@ pub async fn add_member(
         }
     }
 
-    let role_name = body.role.as_deref().unwrap_or("member");
+    let role_name = body.role.as_deref().unwrap_or("member").to_string();
     const VALID_ROLES: &[&str] = &["owner", "manager", "editor", "member", "connect-only"];
-    if !VALID_ROLES.contains(&role_name) {
+    if !VALID_ROLES.contains(&role_name.as_str()) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!(error = %e, "Failed to begin transaction");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    sqlx::query(
-        "INSERT INTO team_members (team_id, user_id, invited_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    // Already a member — no-op
+    let already_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
     )
     .bind(team_id)
     .bind(invitee_id)
-    .bind(auth.0)
-    .execute(&mut *tx)
+    .fetch_one(&pool)
     .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to add team member");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .map_err(|e| { error!(error = %e, "Failed to check existing membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    sqlx::query(
-        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
-           SELECT $1, $2, id FROM team_roles
-           WHERE team_id = $1 AND name = $3 AND is_builtin = TRUE
-           ON CONFLICT DO NOTHING"#,
-    )
-    .bind(team_id)
-    .bind(invitee_id)
-    .bind(role_name)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to assign builtin role");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    if already_member {
+        return Ok((StatusCode::OK, Json(InviteMemberResponse { status: "already_member".to_string() })));
+    }
 
-    tx.commit().await.map_err(|e| {
-        error!(error = %e, "Failed to commit add member transaction");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    info!(team_id = %team_id, invitee_id = %invitee_id, role = %role_name, "Member added");
     let invitee_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
         .bind(invitee_id)
-        .fetch_optional(&pool)
+        .fetch_one(&pool)
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| { error!(error = %e, "Failed to fetch invitee email"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    sqlx::query(
+        "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (team_id, email) DO UPDATE
+           SET user_id = EXCLUDED.user_id,
+               role = EXCLUDED.role,
+               invited_by = EXCLUDED.invited_by,
+               expires_at = now() + INTERVAL '7 days',
+               accepted_at = NULL",
+    )
+    .bind(team_id)
+    .bind(invitee_id)
+    .bind(&invitee_email)
+    .bind(&role_name)
+    .bind(auth.0)
+    .execute(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to create pending invitation"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    info!(team_id = %team_id, invitee_id = %invitee_id, role = %role_name, "Pending invitation created for existing user");
     tokio::spawn(write_audit_event(
         pool.clone(),
         team_id,
         auth.0,
-        "member.joined",
+        "member.invited",
         Some("user"),
         Some(invitee_id.to_string()),
-        invitee_email,
-        Some(json!({ "role": role_name })),
+        Some(invitee_email.clone()),
+        Some(json!({ "role": role_name, "status": "pending" })),
     ));
-    notifier.notify_membership_changed(invitee_id);
+    // Notify the invitee so their client refreshes pending invitations
+    notifier.notify(invitee_id, format!("pending_invitations_changed:{invitee_id}"));
     notify_team_members_changed(&pool, &notifier, team_id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
 }
 
 // ─── Remove member ────────────────────────────────────────────────────────────
@@ -1163,40 +1158,39 @@ pub async fn invite_member(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        let mut tx = pool.begin().await.map_err(|e| {
-            error!(error = %e, "Failed to begin transaction");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        sqlx::query(
-            "INSERT INTO team_members (team_id, user_id, invited_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        let already_member = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
         )
         .bind(team_id)
         .bind(user_id)
-        .bind(auth.0)
-        .execute(&mut *tx)
+        .fetch_one(&pool)
         .await
-        .map_err(|e| { error!(error = %e, "Failed to add team member directly"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| { error!(error = %e, "Failed to check existing membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        if already_member {
+            return Ok(Json(InviteMemberResponse { status: "already_member".to_string() }));
+        }
 
         sqlx::query(
-            r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
-               SELECT $1, $2, id FROM team_roles
-               WHERE team_id = $1 AND name = $3 AND is_builtin = TRUE
-               ON CONFLICT DO NOTHING"#,
+            "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (team_id, email) DO UPDATE
+               SET user_id = EXCLUDED.user_id,
+                   role = EXCLUDED.role,
+                   invited_by = EXCLUDED.invited_by,
+                   expires_at = now() + INTERVAL '7 days',
+                   accepted_at = NULL",
         )
         .bind(team_id)
         .bind(user_id)
+        .bind(&email)
         .bind(&role)
-        .execute(&mut *tx)
+        .bind(auth.0)
+        .execute(&pool)
         .await
-        .map_err(|e| { error!(error = %e, "Failed to assign role on direct invite"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| { error!(error = %e, "Failed to create pending invitation for existing user"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-        tx.commit().await.map_err(|e| {
-            error!(error = %e, "Failed to commit direct invite transaction");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        info!(team_id = %team_id, user_id = %user_id, role = %role, "Member directly added via invite endpoint");
+        info!(team_id = %team_id, user_id = %user_id, role = %role, "Pending invitation created for existing user via invite endpoint");
         tokio::spawn(write_audit_event(
             pool.clone(),
             team_id,
@@ -1205,11 +1199,11 @@ pub async fn invite_member(
             Some("user"),
             Some(user_id.to_string()),
             Some(email.clone()),
-            Some(json!({ "role": role })),
+            Some(json!({ "role": role, "status": "pending" })),
         ));
-        notifier.notify_membership_changed(user_id);
+        notifier.notify(user_id, format!("pending_invitations_changed:{user_id}"));
         notify_team_members_changed(&pool, &notifier, team_id).await;
-        return Ok(Json(InviteMemberResponse { status: "added".to_string() }));
+        return Ok(Json(InviteMemberResponse { status: "invited".to_string() }));
     }
 
     // User doesn't exist — create pending invitation and send email

@@ -220,6 +220,19 @@ async fn main() {
             "/v1/invitations/:token/accept",
             post(routes::invitations::accept_invitation),
         )
+        // In-app pending invitation consent flow
+        .route(
+            "/v1/my/pending-invitations",
+            get(routes::invitations::list_my_pending_invitations),
+        )
+        .route(
+            "/v1/my/pending-invitations/:inv_id/accept",
+            post(routes::invitations::accept_my_pending_invitation),
+        )
+        .route(
+            "/v1/my/pending-invitations/:inv_id",
+            delete(routes::invitations::decline_my_pending_invitation),
+        )
         // Custom roles
         .route("/v1/teams/:team_id/roles", get(routes::teams::list_roles))
         .route("/v1/teams/:team_id/roles", post(routes::teams::create_role))
