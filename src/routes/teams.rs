@@ -141,6 +141,7 @@ pub struct TeamWithRole {
     pub id: Uuid,
     pub name: String,
     pub owner_id: Uuid,
+    pub owner_tier: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub role_ids: Vec<Uuid>,
 }
@@ -150,11 +151,12 @@ pub async fn list_teams(
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<TeamWithRole>>, StatusCode> {
     // Returns one row per (team, role) — aggregated in Rust
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>)>(
         r#"
-        SELECT t.id, t.name, t.owner_id, t.created_at, tmr.role_id
+        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
+        JOIN users u ON u.id = t.owner_id
         LEFT JOIN team_member_roles tmr ON tmr.team_id = t.id AND tmr.user_id = $1
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
@@ -168,7 +170,7 @@ pub async fn list_teams(
     })?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
-    for (id, name, owner_id, created_at, role_id) in rows {
+    for (id, name, owner_id, owner_tier, created_at, role_id) in rows {
         match teams.last_mut() {
             Some(last) if last.id == id => {
                 if let Some(rid) = role_id {
@@ -180,6 +182,7 @@ pub async fn list_teams(
                     id,
                     name,
                     owner_id,
+                    owner_tier,
                     created_at,
                     role_ids: role_id.into_iter().collect(),
                 });
