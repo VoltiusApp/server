@@ -9,11 +9,13 @@ pub struct Claims {
     pub exp: i64,
     pub iat: i64,
     pub kind: String,
-    pub tier: String,           // "free" | "pro" | "teams" | "business"
+    pub tier: String,               // "free" | "pro" | "teams" | "business"
     pub trial_ends_at: Option<i64>, // unix timestamp, null when trial unused or expired
     pub trial_used: bool,
     pub is_admin: bool,
     pub is_banned: bool,
+    #[serde(default)]
+    pub email_verified: bool,
 }
 
 impl Claims {
@@ -39,6 +41,7 @@ pub fn create_access_token(
     trial_used: bool,
     is_admin: bool,
     is_banned: bool,
+    email_verified: bool,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
@@ -51,6 +54,7 @@ pub fn create_access_token(
         trial_used,
         is_admin,
         is_banned,
+        email_verified,
     };
     encode(
         &Header::default(),
@@ -72,6 +76,7 @@ pub fn create_refresh_token(user_id: Uuid) -> Result<String, jsonwebtoken::error
         trial_used: false,
         is_admin: false,
         is_banned: false,
+        email_verified: false,
     };
     encode(
         &Header::default(),
@@ -80,7 +85,10 @@ pub fn create_refresh_token(user_id: Uuid) -> Result<String, jsonwebtoken::error
     )
 }
 
-pub fn validate_token(token: &str, expected_kind: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+pub fn validate_token(
+    token: &str,
+    expected_kind: &str,
+) -> Result<Claims, jsonwebtoken::errors::Error> {
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(&secret()),
@@ -92,4 +100,63 @@ pub fn validate_token(token: &str, expected_kind: &str) -> Result<Claims, jsonwe
         ));
     }
     Ok(data.claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    #[derive(Serialize)]
+    struct LegacyClaims {
+        sub: Uuid,
+        exp: i64,
+        iat: i64,
+        kind: String,
+        tier: String,
+        trial_ends_at: Option<i64>,
+        trial_used: bool,
+        is_admin: bool,
+        is_banned: bool,
+    }
+
+    #[test]
+    fn access_token_includes_email_verified_claim() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let user_id = Uuid::new_v4();
+
+        let token = create_access_token(user_id, "pro", None, false, false, false, true).unwrap();
+        let claims = validate_token(&token, "access").unwrap();
+
+        assert!(claims.email_verified);
+        assert_eq!(claims.sub, user_id);
+    }
+
+    #[test]
+    fn legacy_token_without_email_verified_decodes_as_unverified() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let now = Utc::now();
+        let user_id = Uuid::new_v4();
+        let token = encode(
+            &Header::default(),
+            &LegacyClaims {
+                sub: user_id,
+                iat: now.timestamp(),
+                exp: (now + Duration::hours(1)).timestamp(),
+                kind: "access".to_string(),
+                tier: "pro".to_string(),
+                trial_ends_at: None,
+                trial_used: false,
+                is_admin: false,
+                is_banned: false,
+            },
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+
+        let claims = validate_token(&token, "access").unwrap();
+
+        assert!(!claims.email_verified);
+        assert_eq!(claims.sub, user_id);
+    }
 }

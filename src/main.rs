@@ -115,6 +115,7 @@ async fn main() {
         .route("/v1/auth/challenge", get(routes::auth::challenge))
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
+        .route("/v1/auth/verify-email", post(routes::auth::verify_email))
         .route(
             "/v1/invitations/:token",
             get(routes::invitations::get_invitation),
@@ -172,6 +173,10 @@ async fn main() {
     // Protected routes — auth required + rate limited at 60/hour per IP
     let protected = Router::new()
         .route("/v1/auth/account", delete(routes::auth::delete_account))
+        .route(
+            "/v1/auth/resend-verification-email",
+            post(routes::auth::resend_verification_email),
+        )
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))

@@ -10,6 +10,7 @@ use crate::auth::{
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
+use crate::email::send_verification_email;
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
 
@@ -19,11 +20,12 @@ struct TierInfo {
     trial_used: bool,
     is_admin: bool,
     is_banned: bool,
+    email_verified: bool,
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool)>(
-        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool)>(
+        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -39,6 +41,7 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         trial_used: row.2,
         is_admin: row.3,
         is_banned: row.4,
+        email_verified: row.5,
     })
 }
 
@@ -71,9 +74,7 @@ pub async fn challenge(
             StatusCode::NOT_FOUND
         })?;
 
-    Ok(Json(ChallengeResponse {
-        account_id: row.0,
-    }))
+    Ok(Json(ChallengeResponse { account_id: row.0 }))
 }
 
 // ─── Register ────────────────────────────────────────────────────────────────
@@ -167,6 +168,40 @@ pub async fn register(
     }
 
     let user_id = row.0;
+    let email_verified = if std::env::var("RESEND_API_KEY")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        sqlx::query(
+            "UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %user_id, "Failed to auto-verify user email");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        true
+    } else {
+        let token: String = sqlx::query_scalar(
+            "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %user_id, "Failed to create email verification token");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let app_url = std::env::var("VOLTIUS_APP_URL")
+            .unwrap_or_else(|_| "https://app.voltius.app".to_string());
+        if let Err(e) = send_verification_email(&body.email, &token, &app_url).await {
+            error!(error = %e, user_id = %user_id, "Failed to send verification email");
+        }
+        false
+    };
 
     // Auto-accept any pending invitations for this email
     let pending = sqlx::query_as::<_, (Uuid, String)>(
@@ -207,6 +242,7 @@ pub async fn register(
         false,
         false,
         false,
+        email_verified,
     )
     .map_err(|err| {
         error!(error = %err, user_id = %user_id, "Failed to create access token during registration");
@@ -247,18 +283,20 @@ pub async fn login(
     State(pool): State<PgPool>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, StatusCode> {
-    let user = sqlx::query_as::<_, (Uuid, String, bool)>("SELECT id, auth_hash, is_banned FROM users WHERE account_id = $1")
-        .bind(body.account_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|err| {
-            error!(error = %err, "Failed to query user during login");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or_else(|| {
-            warn!("Login failed: unknown user");
-            StatusCode::UNAUTHORIZED
-        })?;
+    let user = sqlx::query_as::<_, (Uuid, String, bool)>(
+        "SELECT id, auth_hash, is_banned FROM users WHERE account_id = $1",
+    )
+    .bind(body.account_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|err| {
+        error!(error = %err, "Failed to query user during login");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or_else(|| {
+        warn!("Login failed: unknown user");
+        StatusCode::UNAUTHORIZED
+    })?;
 
     let (user_id, auth_hash, is_banned) = user;
 
@@ -277,11 +315,19 @@ pub async fn login(
     }
 
     let tier = fetch_tier(&pool, user_id).await?;
-    let jwt_token = create_access_token(user_id, &tier.tier, tier.trial_ends_at, tier.trial_used, tier.is_admin, tier.is_banned)
-        .map_err(|err| {
-            error!(error = %err, user_id = %user_id, "Failed to create access token during login");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let jwt_token = create_access_token(
+        user_id,
+        &tier.tier,
+        tier.trial_ends_at,
+        tier.trial_used,
+        tier.is_admin,
+        tier.is_banned,
+        tier.email_verified,
+    )
+    .map_err(|err| {
+        error!(error = %err, user_id = %user_id, "Failed to create access token during login");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let refresh_token = create_refresh_token(user_id).map_err(|err| {
         error!(error = %err, user_id = %user_id, "Failed to create refresh token during login");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -320,15 +366,148 @@ pub async fn refresh(
     })?;
 
     let tier = fetch_tier(&pool, claims.sub).await?;
-    let jwt_token = create_access_token(claims.sub, &tier.tier, tier.trial_ends_at, tier.trial_used, tier.is_admin, tier.is_banned)
-        .map_err(|err| {
-            error!(error = %err, user_id = %claims.sub, "Failed to create access token during refresh");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let jwt_token = create_access_token(
+        claims.sub,
+        &tier.tier,
+        tier.trial_ends_at,
+        tier.trial_used,
+        tier.is_admin,
+        tier.is_banned,
+        tier.email_verified,
+    )
+    .map_err(|err| {
+        error!(error = %err, user_id = %claims.sub, "Failed to create access token during refresh");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     info!(user_id = %claims.sub, tier = %tier.tier, "Access token refreshed");
 
     Ok(Json(RefreshResponse { jwt_token }))
+}
+
+// ─── Email verification ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct VerifyEmailRequest {
+    pub token: String,
+}
+
+#[derive(Serialize)]
+pub struct VerifyEmailResponse {
+    pub email: String,
+}
+
+pub async fn verify_email(
+    State(pool): State<PgPool>,
+    Json(body): Json<VerifyEmailRequest>,
+) -> Result<Json<VerifyEmailResponse>, StatusCode> {
+    let email = sqlx::query_scalar::<_, String>(
+        "WITH consumed AS (
+           UPDATE email_verification_tokens
+           SET consumed_at = now()
+           WHERE token = $1 AND consumed_at IS NULL AND expires_at > now()
+           RETURNING user_id
+         )
+         UPDATE users
+         SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now())
+         FROM consumed
+         WHERE users.id = consumed.user_id
+         RETURNING users.email",
+    )
+    .bind(&body.token)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to verify email token");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Some(email) = email {
+        info!(email = %email, "User email verified");
+        return Ok(Json(VerifyEmailResponse { email }));
+    }
+
+    let token_status = sqlx::query_as::<_, (DateTime<Utc>, Option<DateTime<Utc>>)>(
+        "SELECT expires_at, consumed_at FROM email_verification_tokens WHERE token = $1",
+    )
+    .bind(&body.token)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to fetch rejected email verification token status");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match token_status {
+        Some((expires_at, None)) if expires_at <= Utc::now() => Err(StatusCode::GONE),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+pub async fn resend_verification_email(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+) -> Result<StatusCode, StatusCode> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin verification resend transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let row = sqlx::query_as::<_, (String, bool)>(
+        "SELECT email, email_verified FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(auth.0)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to lock user for verification resend");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if row.1 {
+        tx.commit().await.map_err(|e| {
+            error!(error = %e, "Failed to commit verified email resend no-op");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        return Ok(StatusCode::OK);
+    }
+
+    let token: String = sqlx::query_scalar(
+        "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
+    )
+    .bind(auth.0)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to create email verification token");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "UPDATE email_verification_tokens SET consumed_at = now()
+         WHERE user_id = $1 AND consumed_at IS NULL AND token <> $2",
+    )
+    .bind(auth.0)
+    .bind(&token)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to consume prior email verification tokens");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit verification resend transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let app_url =
+        std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string());
+    if let Err(e) = send_verification_email(&row.0, &token, &app_url).await {
+        error!(error = %e, user_id = %auth.0, "Failed to resend verification email");
+    }
+
+    Ok(StatusCode::OK)
 }
 
 // ─── Delete account ──────────────────────────────────────────────────────────

@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::error;
@@ -41,6 +46,18 @@ pub struct CheckoutRequest {
 #[derive(Serialize)]
 pub struct CheckoutResponse {
     pub checkout_url: String,
+}
+
+fn status_response(status: StatusCode) -> Response {
+    status.into_response()
+}
+
+fn email_not_verified_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": "EMAIL_NOT_VERIFIED" })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Clone)]
@@ -236,7 +253,14 @@ pub async fn create_checkout(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<CheckoutRequest>,
-) -> Result<Json<CheckoutResponse>, StatusCode> {
+) -> Result<Json<CheckoutResponse>, Response> {
+    let (email, email_verified) = fetch_checkout_user(&pool, auth.0)
+        .await
+        .map_err(status_response)?;
+    if !email_verified {
+        return Err(email_not_verified_response());
+    }
+
     let store_id = std::env::var("LEMONSQUEEZY_STORE_ID").unwrap_or_default();
     let api_key = std::env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default();
     let yearly = body.interval.as_deref().unwrap_or("monthly") == "yearly";
@@ -245,30 +269,29 @@ pub async fn create_checkout(
         ("pro", true) => std::env::var("LS_VARIANT_PRO_YEARLY").unwrap_or_default(),
         ("teams", false) => std::env::var("LS_VARIANT_TEAMS_MONTHLY").unwrap_or_default(),
         ("teams", true) => std::env::var("LS_VARIANT_TEAMS_YEARLY").unwrap_or_default(),
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => return Err(status_response(StatusCode::BAD_REQUEST)),
     };
 
     if store_id.is_empty() || api_key.is_empty() || variant_id.is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(status_response(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     // Teams requires at least 3 seats; default to 3 if not specified
     let seats = if body.plan == "teams" {
         let s = body.seats.unwrap_or(3);
         if s < 3 {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(status_response(StatusCode::UNPROCESSABLE_ENTITY));
         }
         Some(s)
     } else {
         None
     };
 
-    let email = fetch_user_email(&pool, auth.0).await?;
     let test_mode = std::env::var("LS_TEST_MODE").as_deref() == Ok("true");
 
     let variant_id_num: u64 = variant_id.parse().map_err(|_| {
         error!("LS variant ID is not a valid number: {variant_id}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        status_response(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
     let mut checkout_data = serde_json::json!({
@@ -308,24 +331,24 @@ pub async fn create_checkout(
         .await
         .map_err(|e| {
             error!(error = %e, "LS checkout creation request failed");
-            StatusCode::BAD_GATEWAY
+            status_response(StatusCode::BAD_GATEWAY)
         })?;
 
     if !ls_res.status().is_success() {
         error!(status = %ls_res.status(), "LS checkout creation failed");
-        return Err(StatusCode::BAD_GATEWAY);
+        return Err(status_response(StatusCode::BAD_GATEWAY));
     }
 
     let ls_body: serde_json::Value = ls_res.json().await.map_err(|e| {
         error!(error = %e, "LS checkout response parse failed");
-        StatusCode::BAD_GATEWAY
+        status_response(StatusCode::BAD_GATEWAY)
     })?;
 
     let checkout_url = ls_body["data"]["attributes"]["url"]
         .as_str()
         .ok_or_else(|| {
             error!("LS checkout response missing url");
-            StatusCode::BAD_GATEWAY
+            status_response(StatusCode::BAD_GATEWAY)
         })?
         .to_string();
 
@@ -529,20 +552,21 @@ pub async fn get_subscription(
     }))
 }
 
-async fn fetch_user_email(pool: &PgPool, user_id: Uuid) -> Result<String, StatusCode> {
-    sqlx::query_as::<_, (String,)>("SELECT email FROM users WHERE id = $1")
+async fn fetch_checkout_user(pool: &PgPool, user_id: Uuid) -> Result<(String, bool), StatusCode> {
+    sqlx::query_as::<_, (String, bool)>("SELECT email, email_verified FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_one(pool)
         .await
-        .map(|r| r.0)
         .map_err(|e| {
-            error!(error = %e, user_id = %user_id, "Failed to fetch user email for checkout");
+            error!(error = %e, user_id = %user_id, "Failed to fetch user for checkout");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::to_bytes, response::IntoResponse};
+
     use super::*;
 
     fn set_variant_env() {
@@ -570,6 +594,16 @@ mod tests {
     fn tier_from_variant_id_rejects_unknown_variant() {
         set_variant_env();
         assert_eq!(tier_from_variant_id("999"), None);
+    }
+
+    #[tokio::test]
+    async fn email_not_verified_checkout_response_is_forbidden_json() {
+        let response = email_not_verified_response().into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({ "error": "EMAIL_NOT_VERIFIED" }));
     }
 
     #[test]
