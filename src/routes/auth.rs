@@ -87,6 +87,8 @@ pub struct RegisterRequest {
     #[serde(default)]
     pub public_key: Option<String>,
     #[serde(default)]
+    pub wrapped_user_secrets: Option<String>,
+    #[serde(default)]
     pub machine_fingerprint: Option<String>,
 }
 
@@ -97,6 +99,7 @@ pub struct AuthResponse {
     pub refresh_token: String,
     pub tier: String,
     pub trial_ends_at: Option<i64>,
+    pub wrapped_user_secrets: Option<String>,
 }
 
 pub async fn register(
@@ -130,13 +133,14 @@ pub async fn register(
     };
 
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, account_id, auth_hash, public_key, subscription_tier, trial_ends_at)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(&body.email)
     .bind(body.account_id)
     .bind(&auth_hash)
     .bind(body.public_key.as_deref())
+    .bind(body.wrapped_user_secrets.as_deref())
     .bind(initial_tier)
     .bind(trial_ends_at)
     .fetch_one(&pool)
@@ -267,6 +271,7 @@ pub async fn register(
             refresh_token,
             tier: initial_tier.to_string(),
             trial_ends_at: trial_ends_ts,
+            wrapped_user_secrets: body.wrapped_user_secrets,
         }),
     ))
 }
@@ -283,8 +288,8 @@ pub async fn login(
     State(pool): State<PgPool>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, StatusCode> {
-    let user = sqlx::query_as::<_, (Uuid, String, bool)>(
-        "SELECT id, auth_hash, is_banned FROM users WHERE account_id = $1",
+    let user = sqlx::query_as::<_, (Uuid, String, bool, Option<String>)>(
+        "SELECT id, auth_hash, is_banned, wrapped_user_secrets FROM users WHERE account_id = $1",
     )
     .bind(body.account_id)
     .fetch_optional(&pool)
@@ -298,7 +303,7 @@ pub async fn login(
         StatusCode::UNAUTHORIZED
     })?;
 
-    let (user_id, auth_hash, is_banned) = user;
+    let (user_id, auth_hash, is_banned, wrapped_user_secrets) = user;
 
     if is_banned {
         warn!(user_id = %user_id, "Login attempt by banned user");
@@ -341,6 +346,7 @@ pub async fn login(
         refresh_token,
         tier: tier.tier,
         trial_ends_at: tier.trial_ends_at,
+        wrapped_user_secrets,
     }))
 }
 
@@ -508,6 +514,245 @@ pub async fn resend_verification_email(
     }
 
     Ok(StatusCode::OK)
+}
+
+// ─── Me ─────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct MeResponse {
+    pub email: String,
+    pub account_id: Uuid,
+    pub tier: String,
+    pub trial_ends_at: Option<i64>,
+    pub email_verified: bool,
+    pub wrapped_user_secrets: Option<String>,
+}
+
+pub async fn get_me(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+) -> Result<Json<MeResponse>, StatusCode> {
+    let row = sqlx::query_as::<_, (String, Uuid, Option<String>)>(
+        "SELECT email, account_id, wrapped_user_secrets FROM users WHERE id = $1",
+    )
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to fetch user in get_me");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let tier = fetch_tier(&pool, auth.0).await?;
+
+    Ok(Json(MeResponse {
+        email: row.0,
+        account_id: row.1,
+        tier: tier.tier,
+        trial_ends_at: tier.trial_ends_at,
+        email_verified: tier.email_verified,
+        wrapped_user_secrets: row.2,
+    }))
+}
+
+// ─── Update email ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdateEmailRequest {
+    pub new_email: String,
+    pub auth_key: String,
+}
+
+pub async fn update_email(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Json(body): Json<UpdateEmailRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let auth_hash = sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = $1")
+        .bind(auth.0)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %auth.0, "Failed to fetch auth_hash in update_email");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let valid = verify_auth_key(&body.auth_key, &auth_hash).map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to verify auth key in update_email");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if !valid {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin update_email transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, updated_at = now() WHERE id = $2",
+    )
+    .bind(&body.new_email)
+    .bind(auth.0)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(ref db_err) = e {
+            if db_err.constraint() == Some("users_email_key") {
+                return StatusCode::CONFLICT;
+            }
+        }
+        error!(error = %e, user_id = %auth.0, "Failed to update email");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let token: String = sqlx::query_scalar(
+        "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
+    )
+    .bind(auth.0)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to create verification token for email update");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "UPDATE email_verification_tokens SET consumed_at = now()
+         WHERE user_id = $1 AND consumed_at IS NULL AND token <> $2",
+    )
+    .bind(auth.0)
+    .bind(&token)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to consume prior tokens in update_email");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit update_email transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let app_url =
+        std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string());
+    if let Err(e) = send_verification_email(&body.new_email, &token, &app_url).await {
+        error!(error = %e, user_id = %auth.0, "Failed to send verification email after email update");
+    }
+
+    info!(user_id = %auth.0, new_email = %body.new_email, "User email updated");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Update password ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdatePasswordRequest {
+    pub old_auth_key: String,
+    pub new_auth_key: String,
+    pub new_wrapped_user_secrets: String,
+}
+
+pub async fn update_password(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Json(body): Json<UpdatePasswordRequest>,
+) -> Result<Json<AuthResponse>, StatusCode> {
+    let auth_hash = sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = $1")
+        .bind(auth.0)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %auth.0, "Failed to fetch auth_hash in update_password");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let valid = verify_auth_key(&body.old_auth_key, &auth_hash).map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to verify old auth key in update_password");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if !valid {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let new_auth_hash = hash_auth_key(&body.new_auth_key).map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to hash new auth key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "UPDATE users SET auth_hash = $1, wrapped_user_secrets = $2, updated_at = now() WHERE id = $3",
+    )
+    .bind(&new_auth_hash)
+    .bind(&body.new_wrapped_user_secrets)
+    .bind(auth.0)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to update password");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let tier = fetch_tier(&pool, auth.0).await?;
+    let jwt_token = create_access_token(
+        auth.0,
+        &tier.tier,
+        tier.trial_ends_at,
+        tier.trial_used,
+        tier.is_admin,
+        tier.is_banned,
+        tier.email_verified,
+    )
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to create access token after password update");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let refresh_token = create_refresh_token(auth.0).map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to create refresh token after password update");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!(user_id = %auth.0, "User password updated");
+
+    Ok(Json(AuthResponse {
+        user_id: auth.0,
+        jwt_token,
+        refresh_token,
+        tier: tier.tier,
+        trial_ends_at: tier.trial_ends_at,
+        wrapped_user_secrets: Some(body.new_wrapped_user_secrets),
+    }))
+}
+
+// ─── Upload wrapped user secrets (migration) ──────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UploadWrappedSecretsRequest {
+    pub wrapped_user_secrets: String,
+}
+
+pub async fn upload_wrapped_user_secrets(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Json(body): Json<UploadWrappedSecretsRequest>,
+) -> Result<StatusCode, StatusCode> {
+    sqlx::query(
+        "UPDATE users SET wrapped_user_secrets = $1, updated_at = now() WHERE id = $2",
+    )
+    .bind(&body.wrapped_user_secrets)
+    .bind(auth.0)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %auth.0, "Failed to upload wrapped_user_secrets");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!(user_id = %auth.0, "Uploaded wrapped_user_secrets (migration)");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── Delete account ──────────────────────────────────────────────────────────

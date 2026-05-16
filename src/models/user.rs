@@ -9,6 +9,7 @@ pub struct User {
     pub account_id: Uuid,
     pub auth_hash: String,
     pub public_key: String,
+    pub wrapped_user_secrets: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
