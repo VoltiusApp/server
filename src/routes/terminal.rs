@@ -61,6 +61,7 @@ pub struct ActiveSession {
     pub visibility: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub participant_count: i64,
+    pub participants: Vec<Participant>,
 }
 
 #[derive(Serialize)]
@@ -327,13 +328,12 @@ pub async fn list_active_sessions(
         .into_iter()
         .filter(|(id, ..)| sessions_lock.contains_key(id))
         .map(|(id, connection_name, host_user_id, visibility, created_at)| {
-            let participant_count = sessions_lock
+            let (participant_count, participants, host_public_key) = sessions_lock
                 .get(&id)
-                .map(|s| s.participants.len() as i64)
-                .unwrap_or(0);
-            let host_public_key = sessions_lock
-                .get(&id)
-                .map(|s| s.host_public_key.clone())
+                .map(|s| {
+                    let ps: Vec<Participant> = s.participants.values().cloned().collect();
+                    (ps.len() as i64, ps, s.host_public_key.clone())
+                })
                 .unwrap_or_default();
             ActiveSession {
                 id,
@@ -343,6 +343,7 @@ pub async fn list_active_sessions(
                 visibility,
                 created_at,
                 participant_count,
+                participants,
             }
         })
         .collect();
