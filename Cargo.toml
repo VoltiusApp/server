@@ -2,7 +2,7 @@
 name = "voltius-server"
 version = "0.1.0"
 edition = "2021"
-description = "E2EE sync server for Term Forge"
+description = "E2EE sync server for Voltius"
 
 [profile.release]
 codegen-units = 1
