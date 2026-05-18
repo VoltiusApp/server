@@ -156,7 +156,7 @@ pub async fn list_audit_logs(
     let logs = sqlx::query_as::<_, AuditLogRow>(
         r#"SELECT
                al.id, al.team_id, al.vault_id, al.actor_id,
-               u.email AS actor_name,
+               u.display_name AS actor_name,
                al.action, al.source, al.target_type, al.target_id, al.target_name,
                al.metadata, al.ip_address::text AS ip_address, al.created_at
            FROM audit_logs al
@@ -216,7 +216,7 @@ pub async fn export_audit_logs(
     let logs = sqlx::query_as::<_, AuditLogRow>(
         r#"SELECT
                al.id, al.team_id, al.vault_id, al.actor_id,
-               u.email AS actor_name,
+               u.display_name AS actor_name,
                al.action, al.source, al.target_type, al.target_id, al.target_name,
                al.metadata, al.ip_address::text AS ip_address, al.created_at
            FROM audit_logs al

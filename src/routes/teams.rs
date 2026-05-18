@@ -257,8 +257,8 @@ pub async fn list_members(
         ),
     >(
         r#"
-        SELECT tm.team_id, tm.user_id, inv.email AS invited_by_email, tm.joined_at,
-               u.email, u.public_key, tmr.role_id
+        SELECT tm.team_id, tm.user_id, inv.display_name AS invited_by_display_name, tm.joined_at,
+               u.display_name, u.public_key, tmr.role_id
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
@@ -276,7 +276,7 @@ pub async fn list_members(
     })?;
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
-    for (t_id, user_id, invited_by_email, joined_at, email, public_key, role_id) in rows {
+    for (t_id, user_id, invited_by_display_name, joined_at, display_name, public_key, role_id) in rows {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
                 if let Some(rid) = role_id {
@@ -289,9 +289,9 @@ pub async fn list_members(
                     member: TeamMember {
                         team_id: t_id,
                         user_id,
-                        email,
+                        display_name,
                         public_key: member_public_key_for_response(public_key),
-                        invited_by_email,
+                        invited_by_display_name,
                         joined_at,
                         role_ids: role_id.into_iter().collect(),
                     },
@@ -404,11 +404,13 @@ pub async fn add_member(
         return Ok((StatusCode::OK, Json(InviteMemberResponse { status: "already_member".to_string() })));
     }
 
-    let invitee_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
-        .bind(invitee_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to fetch invitee email"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let (invitee_email, invitee_display_name) = sqlx::query_as::<_, (String, String)>(
+        "SELECT email, display_name FROM users WHERE id = $1",
+    )
+    .bind(invitee_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to fetch invitee"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     sqlx::query(
         "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by)
@@ -437,7 +439,7 @@ pub async fn add_member(
         "member.invited",
         Some("user"),
         Some(invitee_id.to_string()),
-        Some(invitee_email.clone()),
+        Some(invitee_display_name),
         Some(json!({ "role": role_name, "status": "pending" })),
     ));
     // Notify the invitee so their client refreshes pending invitations
@@ -508,6 +510,12 @@ pub async fn remove_member(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let removed_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+
     info!(team_id = %team_id, removed_user_id = %user_id, "Member removed");
     tokio::spawn(write_audit_event(
         pool.clone(),
@@ -516,7 +524,7 @@ pub async fn remove_member(
         "member.removed",
         Some("user"),
         Some(user_id.to_string()),
-        None,
+        removed_display_name,
         None,
     ));
     notifier.notify_membership_changed(user_id);
@@ -580,7 +588,7 @@ pub struct SearchUsersQuery {
 #[derive(Serialize)]
 pub struct UserSearchResult {
     pub user_id: Uuid,
-    pub email: String,
+    pub display_name: String,
     pub public_key: String,
 }
 
@@ -594,21 +602,22 @@ pub async fn search_users(
     }
 
     let pattern = format!("%{}%", params.q.to_lowercase());
+    let prefix = format!("{}%", params.q.to_lowercase());
     let results = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
         r#"
-        SELECT id, email, public_key
+        SELECT id, display_name, public_key
         FROM users
-        WHERE LOWER(email) LIKE $1
+        WHERE (LOWER(display_name) LIKE $1 OR LOWER(email) LIKE $1)
           AND id != $2
         ORDER BY
-          CASE WHEN LOWER(email) LIKE $3 THEN 0 ELSE 1 END,
-          email
+          CASE WHEN LOWER(display_name) LIKE $3 OR LOWER(email) LIKE $3 THEN 0 ELSE 1 END,
+          display_name
         LIMIT 8
         "#,
     )
     .bind(&pattern)
     .bind(auth.0)
-    .bind(format!("{}%", params.q.to_lowercase()))
+    .bind(&prefix)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -619,9 +628,9 @@ pub async fn search_users(
     Ok(Json(
         results
             .into_iter()
-            .map(|(user_id, email, public_key)| UserSearchResult {
+            .map(|(user_id, display_name, public_key)| UserSearchResult {
                 user_id,
-                email,
+                display_name,
                 public_key: member_public_key_for_response(public_key),
             })
             .collect(),
@@ -983,6 +992,12 @@ pub async fn assign_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let target_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+        .bind(target_user_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+
     sqlx::query(
         "INSERT INTO team_member_roles (team_id, user_id, role_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
@@ -1001,7 +1016,7 @@ pub async fn assign_member_role(
         "member.role_changed",
         Some("user"),
         Some(target_user_id.to_string()),
-        None,
+        target_display_name,
         Some(json!({ "role_id": body.role_id, "change": "assigned" })),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
@@ -1066,6 +1081,12 @@ pub async fn remove_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let target_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+        .bind(target_user_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+
     info!(team_id = %team_id, target_user_id = %target_user_id, role_id = %role_id, "Role removed from member");
     tokio::spawn(write_audit_event(
         pool.clone(),
@@ -1074,7 +1095,7 @@ pub async fn remove_member_role(
         "member.role_changed",
         Some("user"),
         Some(target_user_id.to_string()),
-        None,
+        target_display_name,
         Some(json!({ "role_id": role_id, "change": "removed" })),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
@@ -1194,6 +1215,11 @@ pub async fn invite_member(
         .map_err(|e| { error!(error = %e, "Failed to create pending invitation for existing user"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
         info!(team_id = %team_id, user_id = %user_id, role = %role, "Pending invitation created for existing user via invite endpoint");
+        let invite_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None);
         tokio::spawn(write_audit_event(
             pool.clone(),
             team_id,
@@ -1201,7 +1227,7 @@ pub async fn invite_member(
             "member.invited",
             Some("user"),
             Some(user_id.to_string()),
-            Some(email.clone()),
+            invite_display_name,
             Some(json!({ "role": role, "status": "pending" })),
         ));
         notifier.notify(user_id, format!("pending_invitations_changed:{user_id}"));
@@ -1248,6 +1274,7 @@ pub async fn invite_member(
     }
 
     info!(team_id = %team_id, email = %email, "Pending invitation created");
+    let invite_display_name = email.split('@').next().unwrap_or(&email).to_string();
     tokio::spawn(write_audit_event(
         pool.clone(),
         team_id,
@@ -1255,7 +1282,7 @@ pub async fn invite_member(
         "member.invited",
         Some("user"),
         None,
-        Some(email.clone()),
+        Some(invite_display_name),
         Some(json!({ "role": role, "status": "pending" })),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
@@ -1267,9 +1294,9 @@ pub async fn invite_member(
 #[derive(Serialize)]
 pub struct PendingInvitation {
     pub id: Uuid,
-    pub email: String,
+    pub display_name: String,
     pub role: String,
-    pub invited_by_email: Option<String>,
+    pub invited_by_display_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1293,9 +1320,10 @@ pub async fn list_pending_invitations(
     }
 
     let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT pi.id, pi.email, pi.role, u.email, pi.created_at, pi.expires_at
+        r#"SELECT pi.id, COALESCE(invitee.display_name, pi.email), pi.role, inv.display_name, pi.created_at, pi.expires_at
            FROM pending_invitations pi
-           LEFT JOIN users u ON u.id = pi.invited_by
+           LEFT JOIN users inv ON inv.id = pi.invited_by
+           LEFT JOIN users invitee ON invitee.id = pi.user_id
            WHERE pi.team_id = $1
              AND pi.accepted_at IS NULL
              AND pi.expires_at > now()
@@ -1308,8 +1336,8 @@ pub async fn list_pending_invitations(
 
     Ok(Json(
         rows.into_iter()
-            .map(|(id, email, role, invited_by_email, created_at, expires_at)| PendingInvitation {
-                id, email, role, invited_by_email, created_at, expires_at,
+            .map(|(id, display_name, role, invited_by_display_name, created_at, expires_at)| PendingInvitation {
+                id, display_name, role, invited_by_display_name, created_at, expires_at,
             })
             .collect(),
     ))

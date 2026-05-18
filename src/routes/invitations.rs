@@ -15,7 +15,7 @@ use crate::sync_notifier::SyncNotifier;
 #[derive(Serialize)]
 pub struct InvitationDetails {
     pub team_name: String,
-    pub inviter_email: String,
+    pub inviter_display_name: String,
     pub role: String,
     pub expires_at: i64,
 }
@@ -25,7 +25,7 @@ pub async fn get_invitation(
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<Json<InvitationDetails>, StatusCode> {
     let row = sqlx::query_as::<_, (String, Option<String>, String, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT t.name, u.email, pi.role, pi.expires_at
+        r#"SELECT t.name, u.display_name, pi.role, pi.expires_at
            FROM pending_invitations pi
            JOIN teams t ON t.id = pi.team_id
            LEFT JOIN users u ON u.id = pi.invited_by
@@ -44,7 +44,7 @@ pub async fn get_invitation(
 
     Ok(Json(InvitationDetails {
         team_name: row.0,
-        inviter_email: row.1.unwrap_or_else(|| "A teammate".to_string()),
+        inviter_display_name: row.1.unwrap_or_else(|| "A teammate".to_string()),
         role: row.2,
         expires_at: row.3.timestamp(),
     }))
@@ -171,7 +171,7 @@ pub struct MyPendingInvitation {
     pub id: Uuid,
     pub team_id: Uuid,
     pub team_name: String,
-    pub inviter_email: Option<String>,
+    pub inviter_display_name: Option<String>,
     pub role: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
@@ -182,7 +182,7 @@ pub async fn list_my_pending_invitations(
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<MyPendingInvitation>>, StatusCode> {
     let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT pi.id, pi.team_id, t.name, u.email, pi.role, pi.created_at, pi.expires_at
+        r#"SELECT pi.id, pi.team_id, t.name, u.display_name, pi.role, pi.created_at, pi.expires_at
            FROM pending_invitations pi
            JOIN teams t ON t.id = pi.team_id
            LEFT JOIN users u ON u.id = pi.invited_by
@@ -201,8 +201,8 @@ pub async fn list_my_pending_invitations(
 
     Ok(Json(
         rows.into_iter()
-            .map(|(id, team_id, team_name, inviter_email, role, created_at, expires_at)| {
-                MyPendingInvitation { id, team_id, team_name, inviter_email, role, created_at, expires_at }
+            .map(|(id, team_id, team_name, inviter_display_name, role, created_at, expires_at)| {
+                MyPendingInvitation { id, team_id, team_name, inviter_display_name, role, created_at, expires_at }
             })
             .collect(),
     ))

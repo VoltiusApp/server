@@ -133,8 +133,8 @@ pub async fn register(
     };
 
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at)
+         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(&body.email)
     .bind(body.account_id)
@@ -521,6 +521,7 @@ pub async fn resend_verification_email(
 #[derive(Serialize)]
 pub struct MeResponse {
     pub email: String,
+    pub display_name: String,
     pub account_id: Uuid,
     pub tier: String,
     pub trial_ends_at: Option<i64>,
@@ -532,8 +533,8 @@ pub async fn get_me(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<MeResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Uuid, Option<String>)>(
-        "SELECT email, account_id, wrapped_user_secrets FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>)>(
+        "SELECT email, display_name, account_id, wrapped_user_secrets FROM users WHERE id = $1",
     )
     .bind(auth.0)
     .fetch_one(&pool)
@@ -547,12 +548,44 @@ pub async fn get_me(
 
     Ok(Json(MeResponse {
         email: row.0,
-        account_id: row.1,
+        display_name: row.1,
+        account_id: row.2,
         tier: tier.tier,
         trial_ends_at: tier.trial_ends_at,
         email_verified: tier.email_verified,
-        wrapped_user_secrets: row.2,
+        wrapped_user_secrets: row.3,
     }))
+}
+
+// ─── Update display name ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdateDisplayNameRequest {
+    pub display_name: String,
+}
+
+pub async fn update_display_name(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Json(body): Json<UpdateDisplayNameRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let display_name = body.display_name.trim().to_string();
+    if display_name.is_empty() || display_name.len() > 50 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+        .bind(&display_name)
+        .bind(auth.0)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %auth.0, "Failed to update display name");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(user_id = %auth.0, display_name = %display_name, "Display name updated");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── Update email ─────────────────────────────────────────────────────────────
