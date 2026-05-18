@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::sync_notifier::{SyncEvent, SyncNotifier};
-use crate::PresenceMap;
+use crate::{PresenceMap, UsageMap};
 
 const MAX_BLOB_SIZE: usize = 5 * 1024 * 1024; // 5 MB
 
@@ -220,6 +220,7 @@ const TEAMMATES_SQL: &str =
 struct PresenceGuard {
     user_id: Uuid,
     presence: PresenceMap,
+    usage: UsageMap,
     notifier: SyncNotifier,
     pool: PgPool,
 }
@@ -227,6 +228,12 @@ struct PresenceGuard {
 impl Drop for PresenceGuard {
     fn drop(&mut self) {
         self.presence.remove(&self.user_id);
+        // Snapshot and clear any in-flight connection-usage entries before fan-out.
+        let stale_connections: Vec<String> = self
+            .usage
+            .remove(&self.user_id)
+            .map(|(_, set)| set.iter().map(|s| s.clone()).collect())
+            .unwrap_or_default();
         let (notifier, pool, user_id) = (self.notifier.clone(), self.pool.clone(), self.user_id);
         tokio::spawn(async move {
             let teammates: Vec<Uuid> = sqlx::query_scalar(TEAMMATES_SQL)
@@ -234,8 +241,34 @@ impl Drop for PresenceGuard {
                 .fetch_all(&pool)
                 .await
                 .unwrap_or_default();
-            for recipient in teammates {
-                notifier.notify_presence_changed(recipient, user_id, false);
+            for recipient in &teammates {
+                notifier.notify_presence_changed(*recipient, user_id, false);
+            }
+            // For each connection the user was broadcasting, fan out stop events to
+            // teammates that share at least one team owning that connection.
+            for connection_id in stale_connections {
+                let recipients: Vec<Uuid> = sqlx::query_scalar(
+                    r#"SELECT DISTINCT tm.user_id
+                       FROM team_members tm
+                       JOIN team_vault_objects tvo ON tvo.team_id = tm.team_id
+                       WHERE tvo.object_id = $1
+                         AND tvo.object_type = 'connection'
+                         AND tvo.deleted_at IS NULL
+                         AND tm.user_id != $2"#,
+                )
+                .bind(&connection_id)
+                .bind(user_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+                for recipient in recipients {
+                    notifier.notify_connection_usage_changed(
+                        recipient,
+                        user_id,
+                        connection_id.clone(),
+                        false,
+                    );
+                }
             }
         });
     }
@@ -249,6 +282,7 @@ pub async fn sync_stream(
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::Extension(presence): axum::Extension<PresenceMap>,
+    axum::Extension(usage): axum::Extension<UsageMap>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let user_id = auth.0;
 
@@ -264,7 +298,7 @@ pub async fn sync_stream(
     }
 
     let rx = notifier.subscribe();
-    let guard = PresenceGuard { user_id, presence, notifier: notifier.clone(), pool };
+    let guard = PresenceGuard { user_id, presence, usage, notifier: notifier.clone(), pool };
 
     let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         let _guard = &guard;
@@ -278,6 +312,15 @@ pub async fn sync_stream(
             Ok(SyncEvent::PresenceChanged { recipient, subject, online }) if recipient == user_id => {
                 let status = if online { "online" } else { "offline" };
                 Some(Ok(Event::default().data(format!("presence:{}:{}", subject, status))))
+            }
+            Ok(SyncEvent::ConnectionUsageChanged { recipient, subject, connection_id, in_use })
+                if recipient == user_id =>
+            {
+                let flag = if in_use { 1 } else { 0 };
+                Some(Ok(Event::default().data(format!(
+                    "using:{}:{}:{}",
+                    subject, connection_id, flag
+                ))))
             }
             Ok(_) => None,
             // Lagged: we missed some events, tell the client to sync anyway

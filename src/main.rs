@@ -13,7 +13,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Extension, Router,
 };
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rate_limit::{InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter};
 use routes::audit::AuditClientRateLimiter;
 use std::net::SocketAddr;
@@ -24,6 +24,9 @@ use terminal_manager::TerminalManager;
 use uuid::Uuid;
 
 pub type PresenceMap = Arc<DashMap<Uuid, ()>>;
+/// Per-user set of connection IDs the user is currently broadcasting as "in use".
+/// Connection IDs are stored as strings to match team_vault_objects.object_id (TEXT).
+pub type UsageMap = Arc<DashMap<Uuid, DashSet<String>>>;
 use axum::http::{header, HeaderValue};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
@@ -65,6 +68,7 @@ async fn main() {
     let notifier = SyncNotifier::new();
     let terminal_manager = TerminalManager::new();
     let presence_map: PresenceMap = Arc::new(DashMap::new());
+    let usage_map: UsageMap = Arc::new(DashMap::new());
 
     // Rate limiters (configurable via env for dev)
     let sync_rate: usize = std::env::var("SYNC_RATE_LIMIT")
@@ -187,6 +191,14 @@ async fn main() {
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
+        .route(
+            "/v1/presence/connection-usage",
+            get(routes::presence::get_connection_usage),
+        )
+        .route(
+            "/v1/presence/connection-usage",
+            post(routes::presence::post_connection_usage),
+        )
         .route(
             "/v1/sync/blob/:device_id",
             delete(routes::sync::delete_blob),
@@ -343,7 +355,8 @@ async fn main() {
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
-        .layer(Extension(presence_map.clone()));
+        .layer(Extension(presence_map.clone()))
+        .layer(Extension(usage_map.clone()));
 
     // Admin routes — auth + admin check, no rate limit (internal tool)
     let admin_routes = Router::new()

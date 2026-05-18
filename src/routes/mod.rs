@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod invitations;
+pub mod presence;
 pub mod sync;
 pub mod team_sync;
 pub mod team_objects;

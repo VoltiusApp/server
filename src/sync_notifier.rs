@@ -15,6 +15,13 @@ pub enum SyncEvent {
         subject: Uuid,
         online: bool,
     },
+    /// A teammate started or stopped using a connection (terminal session in a team vault).
+    ConnectionUsageChanged {
+        recipient: Uuid,
+        subject: Uuid,
+        connection_id: String,
+        in_use: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -46,6 +53,21 @@ impl SyncNotifier {
             recipient,
             subject,
             online,
+        });
+    }
+
+    pub fn notify_connection_usage_changed(
+        &self,
+        recipient: Uuid,
+        subject: Uuid,
+        connection_id: String,
+        in_use: bool,
+    ) {
+        let _ = self.0.tx.send(SyncEvent::ConnectionUsageChanged {
+            recipient,
+            subject,
+            connection_id,
+            in_use,
         });
     }
 
