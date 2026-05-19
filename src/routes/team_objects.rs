@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::permissions::{
     require_all_team_permissions, require_team_member, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS,
-    PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_VIEW_SECRETS,
+    PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS,
 };
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
@@ -43,7 +43,8 @@ impl TeamObjectType {
 
     fn edit_permission(&self) -> i64 {
         match self {
-            Self::Connection | Self::Snippet | Self::PortForwardingRule => PERM_EDIT_CONNECTIONS,
+            Self::Connection | Self::PortForwardingRule => PERM_EDIT_CONNECTIONS,
+            Self::Snippet => PERM_EDIT_SNIPPETS,
             Self::Identity => PERM_EDIT_IDENTITIES,
             Self::Key => PERM_EDIT_KEYS,
             Self::Folder | Self::SnippetFolder => PERM_EDIT_FOLDERS,
@@ -53,7 +54,8 @@ impl TeamObjectType {
 
 fn edit_permission_for_str(object_type: &str) -> Option<i64> {
     match object_type {
-        "connection" | "snippet" | "port_forwarding_rule" => Some(PERM_EDIT_CONNECTIONS),
+        "connection" | "port_forwarding_rule" => Some(PERM_EDIT_CONNECTIONS),
+        "snippet" => Some(PERM_EDIT_SNIPPETS),
         "identity" => Some(PERM_EDIT_IDENTITIES),
         "key" => Some(PERM_EDIT_KEYS),
         "folder" | "snippet_folder" => Some(PERM_EDIT_FOLDERS),
@@ -78,6 +80,7 @@ pub struct TeamObjectResponse {
     pub folder_id: Option<String>,
     pub metadata: serde_json::Value,
     pub updated_at: DateTime<Utc>,
+    pub updated_by: Uuid,
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
@@ -114,10 +117,11 @@ pub async fn list_objects(
             Option<String>,
             serde_json::Value,
             DateTime<Utc>,
+            Uuid,
             Option<DateTime<Utc>>,
         ),
     >(
-        r#"SELECT object_id, object_type, name, folder_id, metadata, updated_at, deleted_at
+        r#"SELECT object_id, object_type, name, folder_id, metadata, updated_at, updated_by, deleted_at
            FROM team_vault_objects
            WHERE team_id = $1
            ORDER BY updated_at ASC"#,
@@ -139,7 +143,8 @@ pub async fn list_objects(
                 folder_id: row.3,
                 metadata: row.4,
                 updated_at: row.5,
-                deleted_at: row.6,
+                updated_by: row.6,
+                deleted_at: row.7,
             })
             .collect(),
     ))
@@ -226,6 +231,16 @@ pub async fn delete_object(
         error!(error = %e, team_id = %team_id, object_id = %object_id, "Failed to delete team vault object");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Personal pin/hide prefs for this object become meaningless once it's
+    // removed from the team vault. Cascading delete to avoid orphan rows.
+    let _ = sqlx::query(
+        "DELETE FROM team_user_object_prefs WHERE team_id = $1 AND object_id = $2",
+    )
+    .bind(team_id)
+    .bind(&object_id)
+    .execute(&pool)
+    .await;
 
     notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
 

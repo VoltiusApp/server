@@ -299,6 +299,18 @@ async fn main() {
             delete(routes::team_objects::delete_object),
         )
         .route(
+            "/v1/teams/:team_id/object_prefs",
+            get(routes::team_object_prefs::list_object_prefs),
+        )
+        .route(
+            "/v1/teams/:team_id/object_prefs/:object_id",
+            put(routes::team_object_prefs::upsert_object_pref),
+        )
+        .route(
+            "/v1/teams/:team_id/object_prefs/:object_id",
+            delete(routes::team_object_prefs::delete_object_pref),
+        )
+        .route(
             "/v1/teams/:team_id/secrets",
             get(routes::team_objects::list_secrets),
         )

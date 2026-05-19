@@ -20,15 +20,17 @@ pub const PERM_START_TERMINAL_SESSION: i64 = 1 << 12; // 4096
 pub const PERM_JOIN_TERMINAL_SESSION: i64  = 1 << 13; // 8192
 pub const PERM_VIEW_TERMINAL_SESSIONS: i64 = 1 << 14; // 16384
 pub const PERM_MANAGE_ROLES: i64           = 1 << 15; // 32768
+pub const PERM_EDIT_SNIPPETS: i64          = 1 << 16; // 65536
 
 // Builtin role definitions: (name, permissions, position)
-// owner=0xFFFF, manager=0x7FFF&!MANAGE_VAULT|MANAGE_ROLES, editor/member/connect-only = subset
+// Every role that today grants PERM_EDIT_CONNECTIONS (bit 3 = 8) also grants
+// PERM_EDIT_SNIPPETS — Phase 2 is a zero-loss refactor.
 pub const BUILTIN_ROLES: &[(&str, i64, i32)] = &[
-    ("owner",        0xFFFF, 0),
-    ("manager",      63487,  1), // 0x7FFF & !PERM_MANAGE_VAULT | PERM_MANAGE_ROLES
-    ("editor",       28799,  2),
-    ("member",       28679,  3),
-    ("connect-only", 28676,  4),
+    ("owner",        0x1FFFF,                     0), // all 17 bits
+    ("manager",      63487 | PERM_EDIT_SNIPPETS,  1),
+    ("editor",       28799 | PERM_EDIT_SNIPPETS,  2),
+    ("member",       28679 | PERM_EDIT_SNIPPETS,  3),
+    ("connect-only", 28676,                       4), // no edit perms today
 ];
 
 /// Returns the union of all role permission bits for (team_id, user_id).
