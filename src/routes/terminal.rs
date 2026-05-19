@@ -62,6 +62,9 @@ pub struct ActiveSession {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub participant_count: i64,
     pub participants: Vec<Participant>,
+    /// Team IDs (= vault IDs on the client) this session is shared with.
+    /// Empty for invite_link sessions.
+    pub vault_ids: Vec<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -284,9 +287,18 @@ pub async fn list_active_sessions(
     // (respecting role filter if set).
     // Invite-link sessions are NOT listed here — they're accessible only via the link.
     // Host always sees their own sessions.
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<Utc>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<Utc>, Vec<Uuid>)>(
         r#"
-        SELECT ts.id, ts.connection_name, ts.host_user_id, ts.visibility, ts.created_at
+        SELECT
+            ts.id,
+            ts.connection_name,
+            ts.host_user_id,
+            ts.visibility,
+            ts.created_at,
+            COALESCE(
+                (SELECT array_agg(tsv.team_id) FROM terminal_session_vaults tsv WHERE tsv.session_id = ts.id),
+                ARRAY[]::uuid[]
+            ) AS vault_ids
         FROM terminal_sessions ts
         WHERE ts.ended_at IS NULL
           AND ts.visibility = 'vault'
@@ -335,7 +347,7 @@ pub async fn list_active_sessions(
     let result = rows
         .into_iter()
         .filter(|(id, ..)| sessions_lock.contains_key(id))
-        .map(|(id, connection_name, host_user_id, visibility, created_at)| {
+        .map(|(id, connection_name, host_user_id, visibility, created_at, vault_ids)| {
             let (participant_count, participants, host_public_key) = sessions_lock
                 .get(&id)
                 .map(|s| {
@@ -352,6 +364,7 @@ pub async fn list_active_sessions(
                 created_at,
                 participant_count,
                 participants,
+                vault_ids,
             }
         })
         .collect();
