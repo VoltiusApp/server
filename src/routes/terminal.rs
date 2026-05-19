@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{jwt::validate_token, AuthClaims, AuthUser};
-use crate::terminal_manager::{Participant, TerminalManager};
+use crate::terminal_manager::{Participant, TerminalManager, BROADCAST_CAPACITY};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -247,7 +247,7 @@ pub async fn create_session(
         })?;
 
     // Create in-memory session state
-    let (tx, _) = tokio::sync::broadcast::channel(512);
+    let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
     {
         let mut sessions = manager.sessions.lock().await;
         sessions.insert(
@@ -258,7 +258,6 @@ pub async fn create_session(
                 invite_token: invite_token.clone(),
                 host_user_id: auth.0,
                 host_public_key,
-                connection_name: body.connection_name.clone(),
                 visibility: visibility.clone(),
                 vault_owner_id,
                 participants: std::collections::HashMap::new(),
@@ -298,6 +297,14 @@ pub async fn list_active_sessions(
               FROM terminal_session_vaults tsv
               JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
               WHERE tsv.session_id = ts.id
+                AND EXISTS (
+                  SELECT 1
+                  FROM team_member_roles tmr_perm
+                  JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
+                  WHERE tmr_perm.team_id = tsv.team_id
+                    AND tmr_perm.user_id = $1
+                    AND (tr_perm.permissions & $2) != 0
+                )
                 AND (
                   array_length(ts.allowed_roles, 1) IS NULL
                   OR cardinality(ts.allowed_roles) = 0
@@ -316,6 +323,7 @@ pub async fn list_active_sessions(
         "#,
     )
     .bind(auth.0)
+    .bind(crate::permissions::PERM_VIEW_TERMINAL_SESSIONS)
     .fetch_all(&pool)
     .await
     .map_err(|e| {

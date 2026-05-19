@@ -725,7 +725,7 @@ pub async fn create_role(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let permissions = body.permissions & 0xFFFF;
+    let permissions = body.permissions & crate::permissions::ALL_PERMISSIONS;
 
     let role = sqlx::query_as::<_, TeamRole>(
         r#"INSERT INTO team_roles (team_id, name, color, permissions, is_builtin, position)
@@ -811,7 +811,7 @@ pub async fn update_role(
         }
     }
 
-    let permissions = body.permissions.map(|p| p & 0xFFFF);
+    let permissions = body.permissions.map(|p| p & crate::permissions::ALL_PERMISSIONS);
 
     sqlx::query(
         r#"UPDATE team_roles

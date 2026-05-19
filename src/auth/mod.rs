@@ -115,21 +115,6 @@ pub async fn require_admin_key(mut req: Request, next: Next) -> Result<Response,
     Ok(next.run(req).await)
 }
 
-/// Middleware that gates a route to admin users only.
-pub async fn require_admin(
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    match req.extensions().get::<AuthClaims>().cloned() {
-        Some(AuthClaims(c)) if c.is_admin => Ok(next.run(req).await),
-        Some(_) => {
-            warn!(path = %req.uri().path(), "Admin route accessed by non-admin user");
-            Err(StatusCode::FORBIDDEN)
-        }
-        None => Err(StatusCode::UNAUTHORIZED),
-    }
-}
-
 /// Middleware that gates a route to Teams-or-above users.
 pub async fn require_teams(
     req: Request,

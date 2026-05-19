@@ -14,19 +14,37 @@ pub const PERM_EDIT_FOLDERS: i64           = 1 << 6;  // 64
 pub const PERM_VIEW_AUDIT_LOG: i64         = 1 << 7;  // 128
 pub const PERM_INVITE_MEMBERS: i64         = 1 << 8;  // 256
 pub const PERM_MANAGE_MEMBERS: i64         = 1 << 9;  // 512
-pub const PERM_CREATE_CUSTOM_ROLES: i64    = 1 << 10; // 1024 — retired, kept for compat
-pub const PERM_MANAGE_VAULT: i64           = 1 << 11; // 2048
+pub const PERM_CREATE_CUSTOM_ROLES: i64 = 1 << 10; // 1024 — retired, kept for compat
+pub const PERM_MANAGE_VAULT: i64 = 1 << 11; // 2048
 pub const PERM_START_TERMINAL_SESSION: i64 = 1 << 12; // 4096
 pub const PERM_JOIN_TERMINAL_SESSION: i64  = 1 << 13; // 8192
 pub const PERM_VIEW_TERMINAL_SESSIONS: i64 = 1 << 14; // 16384
 pub const PERM_MANAGE_ROLES: i64           = 1 << 15; // 32768
 pub const PERM_EDIT_SNIPPETS: i64          = 1 << 16; // 65536
 
+pub const ALL_PERMISSIONS: i64 = PERM_VIEW_SECRETS
+    | PERM_COPY_SECRETS
+    | PERM_CONNECT
+    | PERM_EDIT_CONNECTIONS
+    | PERM_EDIT_IDENTITIES
+    | PERM_EDIT_KEYS
+    | PERM_EDIT_FOLDERS
+    | PERM_VIEW_AUDIT_LOG
+    | PERM_INVITE_MEMBERS
+    | PERM_MANAGE_MEMBERS
+    | PERM_CREATE_CUSTOM_ROLES
+    | PERM_MANAGE_VAULT
+    | PERM_START_TERMINAL_SESSION
+    | PERM_JOIN_TERMINAL_SESSION
+    | PERM_VIEW_TERMINAL_SESSIONS
+    | PERM_MANAGE_ROLES
+    | PERM_EDIT_SNIPPETS;
+
 // Builtin role definitions: (name, permissions, position)
 // Every role that today grants PERM_EDIT_CONNECTIONS (bit 3 = 8) also grants
 // PERM_EDIT_SNIPPETS — Phase 2 is a zero-loss refactor.
 pub const BUILTIN_ROLES: &[(&str, i64, i32)] = &[
-    ("owner",        0x1FFFF,                     0), // all 17 bits
+    ("owner",        ALL_PERMISSIONS,             0), // all 17 bits
     ("manager",      63487 | PERM_EDIT_SNIPPETS,  1),
     ("editor",       28799 | PERM_EDIT_SNIPPETS,  2),
     ("member",       28679 | PERM_EDIT_SNIPPETS,  3),
@@ -59,19 +77,6 @@ pub async fn has_team_permission(
     })?;
 
     Ok((effective & permission) != 0)
-}
-
-pub async fn require_team_permission(
-    pool: &PgPool,
-    team_id: Uuid,
-    user_id: Uuid,
-    permission: i64,
-) -> Result<(), StatusCode> {
-    if has_team_permission(pool, team_id, user_id, permission).await? {
-        Ok(())
-    } else {
-        Err(StatusCode::FORBIDDEN)
-    }
 }
 
 pub async fn require_all_team_permissions(

@@ -11,9 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::sync_notifier::{
-    notify_team_vault_changed, team_vault_notification_payload, SyncNotifier,
-};
+use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 const MAX_TEAM_BLOB_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
@@ -341,7 +339,7 @@ mod tests {
         let team_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
 
         assert_eq!(
-            team_vault_notification_payload(team_id),
+            crate::sync_notifier::team_vault_notification_payload(team_id),
             "team:11111111-1111-4111-8111-111111111111"
         );
     }

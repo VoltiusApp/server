@@ -71,8 +71,6 @@ struct LemonSubscriptionState {
     renews_at: Option<chrono::DateTime<chrono::Utc>>,
     ends_at: Option<chrono::DateTime<chrono::Utc>>,
     seat_count: Option<i32>,
-    portal_url: Option<String>,
-    update_payment_url: Option<String>,
 }
 
 fn tier_from_variant_id(variant_id: &str) -> Option<&'static str> {
@@ -122,12 +120,6 @@ fn parse_ls_subscription(body: &serde_json::Value) -> Option<LemonSubscriptionSt
         renews_at: parse_ls_datetime(attrs["renews_at"].as_str()),
         ends_at: parse_ls_datetime(attrs["ends_at"].as_str()),
         seat_count,
-        portal_url: attrs["urls"]["customer_portal"]
-            .as_str()
-            .map(ToOwned::to_owned),
-        update_payment_url: attrs["urls"]["update_payment_method"]
-            .as_str()
-            .map(ToOwned::to_owned),
     })
 }
 
@@ -641,14 +633,6 @@ mod tests {
         assert_eq!(parsed.renews_at.unwrap().timestamp(), 1_780_272_000);
         assert_eq!(parsed.ends_at.unwrap().timestamp(), 1_780_272_000);
         assert_eq!(parsed.seat_count, Some(1));
-        assert_eq!(
-            parsed.portal_url.as_deref(),
-            Some("https://example.test/billing")
-        );
-        assert_eq!(
-            parsed.update_payment_url.as_deref(),
-            Some("https://example.test/payment")
-        );
     }
 
     #[test]
@@ -663,8 +647,6 @@ mod tests {
             renews_at: None,
             ends_at: None,
             seat_count: Some(1),
-            portal_url: None,
-            update_payment_url: None,
         };
 
         assert_eq!(

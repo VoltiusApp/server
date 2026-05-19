@@ -3,7 +3,7 @@ use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 
-const BROADCAST_CAPACITY: usize = 512;
+pub const BROADCAST_CAPACITY: usize = 512;
 /// Maximum number of encrypted output messages kept per session for late-join replay.
 pub const OUTPUT_HISTORY_MAX: usize = 500;
 
@@ -22,7 +22,6 @@ pub struct SessionState {
     pub invite_token: Option<String>,
     pub host_user_id: Uuid,
     pub host_public_key: String,
-    pub connection_name: String,
     pub visibility: String,
     /// Owner of the vault for vault-visibility sessions; None for invite_link sessions.
     /// Used to resolve the effective tier for participant cap enforcement.
