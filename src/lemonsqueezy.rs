@@ -134,10 +134,13 @@ impl LsCache {
         // ── 1. Active-ish subscriptions ──────────────────────────────────────
         // We pull every subscription for the store and bucket by status. MRR
         // counts active + on_trial + past_due (still entitled, still billed).
-        let subs_url = format!(
-            "https://api.lemonsqueezy.com/v1/subscriptions?filter[store_id]={store_id}"
-        );
-        let subs = fetch_all_pages(&client, api_key, &subs_url).await?;
+        let subs = fetch_all_pages(
+            &client,
+            api_key,
+            "https://api.lemonsqueezy.com/v1/subscriptions",
+            &[("filter[store_id]", store_id)],
+        )
+        .await?;
 
         let mut paying_count: i64 = 0;
         let mut on_trial_count: i64 = 0;
@@ -204,13 +207,11 @@ impl LsCache {
         // ── 2. Orders for revenue + recent feed + refunds ────────────────────
         // We fetch the last 30 days (capped at ~500 rows). LS returns
         // newest-first when sort=-created_at.
-        let orders_url = format!(
-            "https://api.lemonsqueezy.com/v1/orders?filter[store_id]={store_id}&sort=-created_at"
-        );
         let orders = fetch_pages_until_older_than(
             &client,
             api_key,
-            &orders_url,
+            "https://api.lemonsqueezy.com/v1/orders",
+            &[("filter[store_id]", store_id), ("sort", "-created_at")],
             Utc::now() - Duration::days(30),
         )
         .await?;
@@ -260,11 +261,14 @@ impl LsCache {
         }
 
         // ── 3. Failed subscription invoices in last 30d ──────────────────────
-        let inv_url = format!(
-            "https://api.lemonsqueezy.com/v1/subscription-invoices?filter[store_id]={store_id}&sort=-created_at"
-        );
-        let invoices =
-            fetch_pages_until_older_than(&client, api_key, &inv_url, cutoff_30d).await?;
+        let invoices = fetch_pages_until_older_than(
+            &client,
+            api_key,
+            "https://api.lemonsqueezy.com/v1/subscription-invoices",
+            &[("filter[store_id]", store_id), ("sort", "-created_at")],
+            cutoff_30d,
+        )
+        .await?;
         let mut failed_payments_30d: i64 = 0;
         for inv in &invoices {
             let attrs = &inv["attributes"];
@@ -381,27 +385,48 @@ fn start_of_current_month() -> DateTime<Utc> {
         .unwrap_or(now)
 }
 
+async fn ls_get_page(
+    client: &reqwest::Client,
+    api_key: &str,
+    base_url: &str,
+    extra_query: &[(&str, &str)],
+    page: u64,
+) -> Result<Value, String> {
+    let page_str = page.to_string();
+    let mut query: Vec<(&str, &str)> = extra_query.to_vec();
+    query.push(("page[size]", "100"));
+    query.push(("page[number]", &page_str));
+
+    let res = client
+        .get(base_url)
+        .bearer_auth(api_key)
+        .header("Accept", "application/vnd.api+json")
+        .query(&query)
+        .send()
+        .await
+        .map_err(|e| format!("GET {base_url}: {e}"))?;
+
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        let snippet = body.chars().take(500).collect::<String>();
+        return Err(format!("GET {base_url} -> {status}: {snippet}"));
+    }
+    res.json::<Value>()
+        .await
+        .map_err(|e| format!("parse {base_url}: {e}"))
+}
+
 async fn fetch_all_pages(
     client: &reqwest::Client,
     api_key: &str,
     base_url: &str,
+    extra_query: &[(&str, &str)],
 ) -> Result<Vec<Value>, String> {
     let mut all = Vec::new();
     let mut page = 1u64;
     loop {
-        let sep = if base_url.contains('?') { '&' } else { '?' };
-        let url = format!("{base_url}{sep}page[size]=100&page[number]={page}");
-        let res = client
-            .get(&url)
-            .bearer_auth(api_key)
-            .header("Accept", "application/vnd.api+json")
-            .send()
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !res.status().is_success() {
-            return Err(format!("GET {url} -> {}", res.status()));
-        }
-        let body: Value = res.json().await.map_err(|e| format!("parse: {e}"))?;
+        let body = ls_get_page(client, api_key, base_url, extra_query, page).await?;
         if let Some(data) = body["data"].as_array() {
             all.extend(data.clone());
         }
@@ -418,29 +443,20 @@ async fn fetch_all_pages(
     Ok(all)
 }
 
-/// Paginate newest-first and stop once we cross the cutoff.
+/// Paginate (caller is responsible for passing a sort=-created_at-style param)
+/// and stop once we cross the cutoff. If the caller doesn't pass a sort, we
+/// still fetch all pages and let the consumer filter — costlier but correct.
 async fn fetch_pages_until_older_than(
     client: &reqwest::Client,
     api_key: &str,
     base_url: &str,
+    extra_query: &[(&str, &str)],
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<Value>, String> {
     let mut all = Vec::new();
     let mut page = 1u64;
     loop {
-        let sep = if base_url.contains('?') { '&' } else { '?' };
-        let url = format!("{base_url}{sep}page[size]=100&page[number]={page}");
-        let res = client
-            .get(&url)
-            .bearer_auth(api_key)
-            .header("Accept", "application/vnd.api+json")
-            .send()
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !res.status().is_success() {
-            return Err(format!("GET {url} -> {}", res.status()));
-        }
-        let body: Value = res.json().await.map_err(|e| format!("parse: {e}"))?;
+        let body = ls_get_page(client, api_key, base_url, extra_query, page).await?;
         let mut stop = false;
         if let Some(data) = body["data"].as_array() {
             for row in data {
