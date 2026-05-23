@@ -145,8 +145,8 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
     let seat_row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
         r#"
         SELECT
-            SUM(COALESCE(seat_count, 3))::bigint FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL),
-            SUM(COALESCE(seat_count, 3))::bigint FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL)
+            SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL),
+            SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL)
         FROM users
         "#,
     )
