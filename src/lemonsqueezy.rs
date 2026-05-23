@@ -205,16 +205,21 @@ impl LsCache {
         }
 
         // ── 2. Orders for revenue + recent feed + refunds ────────────────────
-        // We fetch the last 30 days (capped at ~500 rows). LS returns
-        // newest-first when sort=-created_at.
-        let orders = fetch_pages_until_older_than(
+        // LS rejects sort on /orders ("Sort parameter created_at is not
+        // allowed"), so we fetch all pages (capped) and sort in Rust. For
+        // stores with long history this fetches more than needed; revisit if
+        // it becomes a perf issue.
+        let mut orders = fetch_all_pages_capped(
             &client,
             api_key,
             "https://api.lemonsqueezy.com/v1/orders",
-            &[("filter[store_id]", store_id), ("sort", "-created_at")],
-            Utc::now() - Duration::days(30),
+            &[("filter[store_id]", store_id)],
+            20,
         )
         .await?;
+        orders.sort_by_key(|o| {
+            std::cmp::Reverse(parse_iso(o["attributes"]["created_at"].as_str()))
+        });
 
         let month_start = start_of_current_month();
         let cutoff_30d = Utc::now() - Duration::days(30);
@@ -261,12 +266,13 @@ impl LsCache {
         }
 
         // ── 3. Failed subscription invoices in last 30d ──────────────────────
-        let invoices = fetch_pages_until_older_than(
+        // Same sort-not-allowed story applies; fetch all & filter in Rust.
+        let invoices = fetch_all_pages_capped(
             &client,
             api_key,
             "https://api.lemonsqueezy.com/v1/subscription-invoices",
-            &[("filter[store_id]", store_id), ("sort", "-created_at")],
-            cutoff_30d,
+            &[("filter[store_id]", store_id)],
+            20,
         )
         .await?;
         let mut failed_payments_30d: i64 = 0;
@@ -443,41 +449,33 @@ async fn fetch_all_pages(
     Ok(all)
 }
 
-/// Paginate (caller is responsible for passing a sort=-created_at-style param)
-/// and stop once we cross the cutoff. If the caller doesn't pass a sort, we
-/// still fetch all pages and let the consumer filter — costlier but correct.
-async fn fetch_pages_until_older_than(
+/// Fetch all pages up to a hard cap. Used when LS doesn't support sort and we
+/// have to filter in Rust.
+async fn fetch_all_pages_capped(
     client: &reqwest::Client,
     api_key: &str,
     base_url: &str,
     extra_query: &[(&str, &str)],
-    cutoff: DateTime<Utc>,
+    max_pages: u64,
 ) -> Result<Vec<Value>, String> {
     let mut all = Vec::new();
     let mut page = 1u64;
     loop {
         let body = ls_get_page(client, api_key, base_url, extra_query, page).await?;
-        let mut stop = false;
         if let Some(data) = body["data"].as_array() {
-            for row in data {
-                let created_at =
-                    parse_iso(row["attributes"]["created_at"].as_str()).unwrap_or_else(Utc::now);
-                if created_at < cutoff {
-                    stop = true;
-                }
-                all.push(row.clone());
-            }
-        }
-        if stop {
-            break;
+            all.extend(data.clone());
         }
         let last_page = body["meta"]["page"]["last_page"].as_u64().unwrap_or(1);
         if page >= last_page {
             break;
         }
         page += 1;
-        if page > 50 {
-            warn!(url = %base_url, "fetch_pages_until_older_than: bailing after 50 pages");
+        if page > max_pages {
+            warn!(
+                url = %base_url,
+                cap = max_pages,
+                "fetch_all_pages_capped: bailing at cap"
+            );
             break;
         }
     }
