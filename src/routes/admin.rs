@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::AdminEmail;
 use crate::sync_notifier::SyncNotifier;
+use crate::PresenceMap;
 
 // ─── Audit helper ─────────────────────────────────────────────────────────────
 
@@ -892,6 +893,23 @@ pub async fn list_churn(
     })?;
 
     Ok(Json(rows))
+}
+
+// ─── Presence (live online users) ─────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct PresenceResponse {
+    online: Vec<Uuid>,
+    count: usize,
+}
+
+/// GET /v1/admin/presence — snapshot of users with at least one active sync SSE.
+pub async fn get_presence(
+    Extension(presence): Extension<PresenceMap>,
+) -> Json<PresenceResponse> {
+    let online: Vec<Uuid> = presence.iter().map(|e| *e.key()).collect();
+    let count = online.len();
+    Json(PresenceResponse { online, count })
 }
 
 // ─── CSV export ───────────────────────────────────────────────────────────────

@@ -407,8 +407,10 @@ async fn main() {
         )
         .route("/v1/admin/audit-log", get(routes::admin::list_audit_log))
         .route("/v1/admin/churn", get(routes::admin::list_churn))
+        .route("/v1/admin/presence", get(routes::admin::get_presence))
         .layer(middleware::from_fn(auth::require_admin_key))
-        .layer(Extension(notifier.clone()));
+        .layer(Extension(notifier.clone()))
+        .layer(Extension(presence_map.clone()));
 
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()
