@@ -63,7 +63,7 @@ pub struct TierBreakdown {
 }
 
 pub async fn get_stats(State(pool): State<PgPool>) -> Result<Json<StatsResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, Option<f64>)>(
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64)>(
         r#"
         SELECT
             COUNT(*),
