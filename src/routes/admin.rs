@@ -40,19 +40,7 @@ async fn write_audit(
     }
 }
 
-// ─── Stats ────────────────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct StatsResponse {
-    total_users: i64,
-    by_tier: TierBreakdown,
-    trials_active: i64,
-    trials_expiring_7d: i64,
-    banned_count: i64,
-    signups_last_30d: i64,
-    churned_last_30d: i64,
-    total_blob_gb: f64,
-}
+// ─── Overview (home page) ─────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct TierBreakdown {
@@ -62,72 +50,274 @@ pub struct TierBreakdown {
     business: i64,
 }
 
-pub async fn get_stats(State(pool): State<PgPool>) -> Result<Json<StatsResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64)>(
+#[derive(Serialize)]
+pub struct OverviewResponse {
+    mrr_total: i64,
+    mrr_by_tier: TierMrr,
+    paying_subscribers: i64,
+    trials_active: i64,
+    trials_expiring_7d: i64,
+    signups_7d: i64,
+    signups_30d: i64,
+    churn_7d: i64,
+    churn_30d: i64,
+    total_users: i64,
+    deleted_pending: i64,
+    total_blob_gb: f64,
+    conversion_pct: f64,
+    tier_breakdown: TierBreakdown,
+    signups_series: Vec<DayBucket>,
+    churn_series: Vec<DayBucket>,
+    recent_signups: Vec<RecentUser>,
+    recent_churn: Vec<RecentChurnRow>,
+}
+
+#[derive(Serialize)]
+pub struct TierMrr {
+    pro: i64,
+    teams: i64,
+    business: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DayBucket {
+    day: chrono::NaiveDate,
+    count: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct RecentUser {
+    id: Uuid,
+    email: String,
+    subscription_tier: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct RecentChurnRow {
+    id: Uuid,
+    user_id: Uuid,
+    from_tier: String,
+    to_tier: String,
+    reason: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+// Monthly price per paying unit. teams/business are per-seat; pro is per-user.
+const PRICE_PRO: i64 = 7;
+const PRICE_TEAMS_PER_SEAT: i64 = 15;
+const PRICE_BUSINESS_PER_SEAT: i64 = 49;
+
+pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewResponse>, StatusCode> {
+    // ── Headline counts ──────────────────────────────────────────────────────
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, Option<f64>)>(
         r#"
         SELECT
-            COUNT(*),
-            COUNT(*) FILTER (WHERE subscription_tier = 'free'),
-            COUNT(*) FILTER (WHERE subscription_tier = 'pro'),
-            COUNT(*) FILTER (WHERE subscription_tier = 'teams'),
-            COUNT(*) FILTER (WHERE subscription_tier = 'business'),
-            COUNT(*) FILTER (WHERE trial_ends_at IS NOT NULL AND trial_ends_at > now()),
-            COUNT(*) FILTER (WHERE trial_ends_at IS NOT NULL AND trial_ends_at > now() AND trial_ends_at < now() + interval '7 days'),
-            COUNT(*) FILTER (WHERE is_banned = TRUE)
+            COUNT(*) FILTER (WHERE deleted_at IS NULL),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'free'),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro'),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams'),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'business'),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now()),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now() AND trial_ends_at < now() + interval '7 days'),
+            COUNT(*) FILTER (WHERE deleted_at IS NOT NULL),
+            NULL::float8
         FROM users
         "#,
     )
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, "Failed to fetch stats");
+        error!(error = %e, "overview: counts failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let signups_row = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM users WHERE created_at > now() - interval '30 days'",
+    let total_users = row.0;
+    let free_users = row.1;
+    let pro_users = row.2;
+    let teams_users = row.3;
+    let business_users = row.4;
+    let trials_active = row.5;
+    let trials_expiring_7d = row.6;
+    let deleted_pending = row.7;
+
+    // ── MRR (seat-aware for teams/business) ──────────────────────────────────
+    let seat_row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+        r#"
+        SELECT
+            SUM(COALESCE(seat_count, 3))::bigint FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL),
+            SUM(COALESCE(seat_count, 3))::bigint FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL)
+        FROM users
+        "#,
     )
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, "Failed to fetch signups count");
+        error!(error = %e, "overview: seat sums failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let churned_row = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM churn_events WHERE created_at > now() - interval '30 days'",
+    let teams_seats = seat_row.0.unwrap_or(0);
+    let business_seats = seat_row.1.unwrap_or(0);
+
+    let mrr_pro = pro_users * PRICE_PRO;
+    let mrr_teams = teams_seats * PRICE_TEAMS_PER_SEAT;
+    let mrr_business = business_seats * PRICE_BUSINESS_PER_SEAT;
+    let mrr_total = mrr_pro + mrr_teams + mrr_business;
+    let paying_subscribers = pro_users + teams_users + business_users;
+
+    // ── Recent windows ───────────────────────────────────────────────────────
+    let (signups_7d, signups_30d): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE created_at > now() - interval '7 days'),
+            COUNT(*) FILTER (WHERE created_at > now() - interval '30 days')
+        FROM users
+        WHERE deleted_at IS NULL
+        "#,
     )
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, "Failed to fetch churn count");
+        error!(error = %e, "overview: signups windows failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let (churn_7d, churn_30d): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE created_at > now() - interval '7 days'),
+            COUNT(*) FILTER (WHERE created_at > now() - interval '30 days')
+        FROM churn_events
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: churn windows failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // ── Storage ──────────────────────────────────────────────────────────────
     let blob_row = sqlx::query_as::<_, (Option<f64>,)>(
         "SELECT SUM(size_bytes)::float8 / 1073741824.0 FROM sync_blobs",
     )
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, "Failed to fetch blob size");
+        error!(error = %e, "overview: blob size failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(StatsResponse {
-        total_users: row.0,
-        by_tier: TierBreakdown {
-            free: row.1,
-            pro: row.2,
-            teams: row.3,
-            business: row.4,
+    // ── Time series: signups & churn per day, last 90 days (gap-filled) ──────
+    let signups_series = sqlx::query_as::<_, DayBucket>(
+        r#"
+        WITH days AS (
+          SELECT generate_series(
+            date_trunc('day', now() - interval '89 days'),
+            date_trunc('day', now()),
+            interval '1 day'
+          )::date AS day
+        )
+        SELECT d.day, COALESCE(COUNT(u.id), 0)::bigint AS count
+        FROM days d
+        LEFT JOIN users u
+          ON date_trunc('day', u.created_at)::date = d.day
+          AND u.deleted_at IS NULL
+        GROUP BY d.day
+        ORDER BY d.day
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: signups series failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let churn_series = sqlx::query_as::<_, DayBucket>(
+        r#"
+        WITH days AS (
+          SELECT generate_series(
+            date_trunc('day', now() - interval '89 days'),
+            date_trunc('day', now()),
+            interval '1 day'
+          )::date AS day
+        )
+        SELECT d.day, COALESCE(COUNT(c.id), 0)::bigint AS count
+        FROM days d
+        LEFT JOIN churn_events c
+          ON date_trunc('day', c.created_at)::date = d.day
+        GROUP BY d.day
+        ORDER BY d.day
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: churn series failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // ── Recent lists ─────────────────────────────────────────────────────────
+    let recent_signups = sqlx::query_as::<_, RecentUser>(
+        "SELECT id, email, subscription_tier, created_at
+         FROM users
+         WHERE deleted_at IS NULL
+         ORDER BY created_at DESC LIMIT 5",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: recent signups failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let recent_churn = sqlx::query_as::<_, RecentChurnRow>(
+        "SELECT id, user_id, from_tier, to_tier, reason, created_at
+         FROM churn_events ORDER BY created_at DESC LIMIT 5",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: recent churn failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let conversion_pct = if total_users > 0 {
+        (paying_subscribers as f64 / total_users as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(OverviewResponse {
+        mrr_total,
+        mrr_by_tier: TierMrr {
+            pro: mrr_pro,
+            teams: mrr_teams,
+            business: mrr_business,
         },
-        trials_active: row.5,
-        trials_expiring_7d: row.6,
-        banned_count: row.7,
-        signups_last_30d: signups_row.0,
-        churned_last_30d: churned_row.0,
+        paying_subscribers,
+        trials_active,
+        trials_expiring_7d,
+        signups_7d,
+        signups_30d,
+        churn_7d,
+        churn_30d,
+        total_users,
+        deleted_pending,
         total_blob_gb: blob_row.0.unwrap_or(0.0),
+        conversion_pct,
+        tier_breakdown: TierBreakdown {
+            free: free_users,
+            pro: pro_users,
+            teams: teams_users,
+            business: business_users,
+        },
+        signups_series,
+        churn_series,
+        recent_signups,
+        recent_churn,
     }))
 }
 

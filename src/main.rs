@@ -373,7 +373,7 @@ async fn main() {
 
     // Admin routes — auth + admin check, no rate limit (internal tool)
     let admin_routes = Router::new()
-        .route("/v1/admin/stats", get(routes::admin::get_stats))
+        .route("/v1/admin/overview", get(routes::admin::get_overview))
         .route(
             "/v1/admin/users/export",
             get(routes::admin::export_users_csv),
