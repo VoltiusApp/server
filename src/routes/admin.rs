@@ -139,6 +139,8 @@ pub struct UsersQuery {
     search: Option<String>,
     tier: Option<String>,
     banned: Option<bool>,
+    /// "exclude" (default), "only", "any".
+    deleted: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -155,6 +157,7 @@ pub struct UserListRow {
     total_blob_bytes: Option<i64>,
     device_count: Option<i64>,
     last_churn_at: Option<DateTime<Utc>>,
+    deleted_at: Option<DateTime<Utc>>,
 }
 
 pub async fn list_users(
@@ -165,7 +168,14 @@ pub async fn list_users(
     let limit = params.limit.unwrap_or(50).min(200);
     let offset = (page - 1) * limit;
 
-    let rows = sqlx::query_as::<_, UserListRow>(
+    // deleted: "exclude" (default) / "only" / "any"
+    let deleted_clause = match params.deleted.as_deref() {
+        Some("only") => "AND u.deleted_at IS NOT NULL",
+        Some("any") => "",
+        _ => "AND u.deleted_at IS NULL",
+    };
+
+    let list_sql = format!(
         r#"
         SELECT
             u.id,
@@ -179,7 +189,8 @@ pub async fn list_users(
             u.ls_customer_id,
             COALESCE(SUM(sb.size_bytes), 0)::bigint AS total_blob_bytes,
             COUNT(DISTINCT sb.device_id)::bigint AS device_count,
-            MAX(ce.created_at) AS last_churn_at
+            MAX(ce.created_at) AS last_churn_at,
+            u.deleted_at
         FROM users u
         LEFT JOIN sync_blobs sb ON sb.user_id = u.id
         LEFT JOIN churn_events ce ON ce.user_id = u.id
@@ -187,41 +198,47 @@ pub async fn list_users(
             ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%')
             AND ($2::text IS NULL OR u.subscription_tier = $2)
             AND ($3::boolean IS NULL OR u.is_banned = $3)
+            {deleted_clause}
         GROUP BY u.id
         ORDER BY u.created_at DESC
         LIMIT $4 OFFSET $5
-        "#,
-    )
-    .bind(&params.search)
-    .bind(&params.tier)
-    .bind(params.banned)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to list users");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        "#
+    );
 
-    let total_row = sqlx::query_as::<_, (i64,)>(
+    let rows = sqlx::query_as::<_, UserListRow>(&list_sql)
+        .bind(&params.search)
+        .bind(&params.tier)
+        .bind(params.banned)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to list users");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let count_sql = format!(
         r#"
         SELECT COUNT(*) FROM users u
         WHERE
             ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%')
             AND ($2::text IS NULL OR u.subscription_tier = $2)
             AND ($3::boolean IS NULL OR u.is_banned = $3)
-        "#,
-    )
-    .bind(&params.search)
-    .bind(&params.tier)
-    .bind(params.banned)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to count users");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+            {deleted_clause}
+        "#
+    );
+
+    let total_row = sqlx::query_as::<_, (i64,)>(&count_sql)
+        .bind(&params.search)
+        .bind(&params.tier)
+        .bind(params.banned)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to count users");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(json!({
         "users": rows,
@@ -252,6 +269,9 @@ pub struct UserDetail {
     admin_override: bool,
     created_at: DateTime<Utc>,
     seat_count: Option<i32>,
+    deleted_at: Option<DateTime<Utc>>,
+    deletion_reason: Option<String>,
+    deleted_by: Option<String>,
 }
 
 pub async fn get_user(
@@ -262,7 +282,8 @@ pub async fn get_user(
         r#"
         SELECT id, email, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
-               ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count
+               ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
+               deleted_at, deletion_reason, deleted_by
         FROM users WHERE id = $1
         "#,
     )
@@ -463,6 +484,156 @@ pub async fn unban_user(
 
     notifier.notify(user_id, "token_invalidated".to_string());
     info!(admin = %admin_email, user = %user_id, "User unbanned");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Delete / restore ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DeleteQuery {
+    /// When true, hard-delete immediately. Otherwise mark deleted_at (soft).
+    force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct DeleteBody {
+    reason: Option<String>,
+}
+
+/// DELETE /v1/admin/users/:id        → soft delete
+/// DELETE /v1/admin/users/:id?force=true → hard delete (returns 409 if FK blocks)
+pub async fn delete_user(
+    State(pool): State<PgPool>,
+    Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Extension(notifier): Extension<SyncNotifier>,
+    Path(user_id): Path<Uuid>,
+    Query(q): Query<DeleteQuery>,
+    Json(body): Json<DeleteBody>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let force = q.force.unwrap_or(false);
+
+    let current = sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
+        "SELECT email, deleted_at FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to fetch user before delete");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "fetch_failed"})))
+    })?
+    .ok_or((StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))))?;
+
+    if force {
+        // Hard delete. May fail on FK RESTRICT constraints (teams.owner_id,
+        // audit_logs.actor_id, team_vault_*.updated_by, terminal_sessions.host_user_id).
+        // Surface a structured 409 with the constraint name so the dashboard can
+        // explain what blocks the purge.
+        let result = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+
+        match result {
+            Ok(r) if r.rows_affected() > 0 => {
+                write_audit(
+                    &pool,
+                    &admin_email,
+                    None, // target is gone — store id in detail instead
+                    "delete_user_force",
+                    json!({
+                        "user_id": user_id,
+                        "email": current.0,
+                        "reason": body.reason,
+                    }),
+                )
+                .await;
+                notifier.notify(user_id, "token_invalidated".to_string());
+                info!(admin = %admin_email, user = %user_id, "User hard-deleted");
+                Ok((StatusCode::NO_CONTENT, Json(json!({}))))
+            }
+            Ok(_) => Err((StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))),
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23503") => {
+                let constraint = db_err.constraint().unwrap_or("unknown").to_string();
+                error!(constraint = %constraint, user = %user_id, "Hard delete blocked by FK");
+                Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "fk_blocks_delete",
+                        "constraint": constraint,
+                        "message": "User cannot be hard-deleted while referenced by other rows. Soft-delete instead or remove the references first.",
+                    })),
+                ))
+            }
+            Err(e) => {
+                error!(error = %e, "Hard delete failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "delete_failed"})),
+                ))
+            }
+        }
+    } else {
+        // Soft delete: mark deleted_at, lock the account. PII intact for restore.
+        if current.1.is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "already_deleted"})),
+            ));
+        }
+
+        sqlx::query(
+            "UPDATE users SET deleted_at = now(), deletion_reason = $1, deleted_by = $2 WHERE id = $3",
+        )
+        .bind(body.reason.as_deref())
+        .bind(&admin_email)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to soft-delete user");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "delete_failed"})))
+        })?;
+
+        write_audit(
+            &pool,
+            &admin_email,
+            Some(user_id),
+            "delete_user_soft",
+            json!({"reason": body.reason, "email": current.0}),
+        )
+        .await;
+
+        notifier.notify(user_id, "token_invalidated".to_string());
+        info!(admin = %admin_email, user = %user_id, "User soft-deleted");
+        Ok((StatusCode::NO_CONTENT, Json(json!({}))))
+    }
+}
+
+/// POST /v1/admin/users/:id/restore — clear deleted_at within grace period.
+pub async fn restore_user(
+    State(pool): State<PgPool>,
+    Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let result = sqlx::query(
+        "UPDATE users SET deleted_at = NULL, deletion_reason = NULL, deleted_by = NULL
+         WHERE id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to restore user");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    write_audit(&pool, &admin_email, Some(user_id), "restore_user", json!({})).await;
+    info!(admin = %admin_email, user = %user_id, "User restored");
     Ok(StatusCode::NO_CONTENT)
 }
 

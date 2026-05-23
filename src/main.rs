@@ -381,6 +381,11 @@ async fn main() {
         .route("/v1/admin/users", get(routes::admin::list_users))
         .route("/v1/admin/users/:id", get(routes::admin::get_user))
         .route("/v1/admin/users/:id", patch(routes::admin::patch_user))
+        .route("/v1/admin/users/:id", delete(routes::admin::delete_user))
+        .route(
+            "/v1/admin/users/:id/restore",
+            post(routes::admin::restore_user),
+        )
         .route("/v1/admin/users/:id/ban", post(routes::admin::ban_user))
         .route("/v1/admin/users/:id/unban", post(routes::admin::unban_user))
         .route(
