@@ -13,6 +13,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::auth::AdminEmail;
+use crate::lemonsqueezy::{LsCache, LsSummaryResponse};
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
@@ -38,6 +39,24 @@ async fn write_audit(
     if let Err(e) = result {
         error!(error = %e, admin_email = %admin_email, action = %action, "Failed to write audit log");
     }
+}
+
+// ─── Lemon Squeezy live summary ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct LsSummaryQuery {
+    /// If true, force a fresh fetch from LS before returning.
+    refresh: Option<bool>,
+}
+
+pub async fn get_lemonsqueezy_summary(
+    Extension(cache): Extension<LsCache>,
+    Query(q): Query<LsSummaryQuery>,
+) -> Json<LsSummaryResponse> {
+    if q.refresh.unwrap_or(false) {
+        let _ = cache.refresh().await;
+    }
+    Json(cache.summary().await)
 }
 
 // ─── Overview (home page) ─────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod email;
+mod lemonsqueezy;
 mod models;
 mod permissions;
 mod rate_limit;
@@ -98,6 +99,10 @@ async fn main() {
     ));
     let audit_client_limiter =
         AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
+
+    // Lemon Squeezy live metrics cache (background refresh every 5 min).
+    let ls_cache = lemonsqueezy::LsCache::default();
+    lemonsqueezy::spawn_refresher(ls_cache.clone());
     tracing::info!(
         auth_per_minute = 10,
         register_per_day,
@@ -375,6 +380,10 @@ async fn main() {
     let admin_routes = Router::new()
         .route("/v1/admin/overview", get(routes::admin::get_overview))
         .route(
+            "/v1/admin/lemonsqueezy/summary",
+            get(routes::admin::get_lemonsqueezy_summary),
+        )
+        .route(
             "/v1/admin/users/export",
             get(routes::admin::export_users_csv),
         )
@@ -410,7 +419,8 @@ async fn main() {
         .route("/v1/admin/presence", get(routes::admin::get_presence))
         .layer(middleware::from_fn(auth::require_admin_key))
         .layer(Extension(notifier.clone()))
-        .layer(Extension(presence_map.clone()));
+        .layer(Extension(presence_map.clone()))
+        .layer(Extension(ls_cache.clone()));
 
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()
