@@ -2,46 +2,39 @@ services:
   db:
     image: postgres:16-alpine
     container_name: voltius-db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: voltius
-      POSTGRES_PASSWORD: voltius
-      POSTGRES_DB: voltius
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-voltius}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voltius}
+      POSTGRES_DB: ${POSTGRES_DB:-voltius}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U voltius -d voltius"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voltius} -d ${POSTGRES_DB:-voltius}"]
       interval: 2s
       timeout: 5s
       retries: 10
 
   server:
-    image: ghcr.io/VoltiusApp/voltius-server:latest
+    image: ghcr.io/voltiusapp/voltius-server:latest
     container_name: voltius-server
-    networks:
-      - default
-      - cloudflare
+    restart: unless-stopped
     ports:
-      - "14372:8080"
+      - "${HOST_PORT:-14372}:8080"
     environment:
-      DATABASE_URL: postgres://voltius:voltius@db/voltius
-      JWT_SECRET: dev-secret-change-me-in-production-32bytes
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-voltius}:${POSTGRES_PASSWORD:-voltius}@db/${POSTGRES_DB:-voltius}}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — generate one with `openssl rand -hex 32`}
       PORT: "8080"
-      RUST_LOG: info
-      SYNC_RATE_LIMIT: ${SYNC_RATE_LIMIT:-10000}
-      REGISTER_RATE_LIMIT: ${REGISTER_RATE_LIMIT:-1000}
-      INVITE_RATE_LIMIT: ${INVITE_RATE_LIMIT:-1000}
-      ADMIN_SECRET: ${ADMIN_SECRET}
-      LEMONSQUEEZY_SIGNING_SECRET: ${LEMONSQUEEZY_SIGNING_SECRET:-}
-      LEMONSQUEEZY_STORE_ID: ${LEMONSQUEEZY_STORE_ID:-}
-      LEMONSQUEEZY_API_KEY: ${LEMONSQUEEZY_API_KEY:-}
-      LS_VARIANT_PRO_MONTHLY: ${LS_VARIANT_PRO_MONTHLY:-}
-      LS_VARIANT_PRO_YEARLY: ${LS_VARIANT_PRO_YEARLY:-}
-      LS_VARIANT_TEAMS_MONTHLY: ${LS_VARIANT_TEAMS_MONTHLY:-}
-      LS_VARIANT_TEAMS_YEARLY: ${LS_VARIANT_TEAMS_YEARLY:-}
-      LS_TEST_MODE: ${LS_TEST_MODE:-false}
+      RUST_LOG: ${RUST_LOG:-info}
+      # Optional knobs — see .env.example
       RESEND_API_KEY: ${RESEND_API_KEY:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TRUSTED_PROXY_IP: ${TRUSTED_PROXY_IP:-}
+      SYNC_RATE_LIMIT: ${SYNC_RATE_LIMIT:-}
+      REGISTER_RATE_LIMIT: ${REGISTER_RATE_LIMIT:-}
+      INVITE_RATE_LIMIT: ${INVITE_RATE_LIMIT:-}
+      # Only needed if you also run the admin dashboard.
+      ADMIN_SECRET: ${ADMIN_SECRET:-}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
       interval: 5s
@@ -54,7 +47,3 @@ services:
 
 volumes:
   pgdata:
-
-networks:
-  cloudflare:
-    external: true

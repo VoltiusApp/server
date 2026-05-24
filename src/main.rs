@@ -6,6 +6,7 @@ mod models;
 mod permissions;
 mod rate_limit;
 mod routes;
+mod self_host;
 mod sync_notifier;
 mod terminal_manager;
 
@@ -132,12 +133,13 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
         .layer(Extension(auth_limiter));
 
-    // Webhook — public, signature-verified internally
+    // Webhook — public, signature-verified internally. Disabled in self-hosted mode.
     let webhooks = Router::new()
         .route(
             "/v1/webhooks/lemonsqueezy",
             post(routes::webhooks::lemonsqueezy_webhook),
         )
+        .layer(middleware::from_fn(self_host::block_when_self_hosted))
         .layer(Extension(notifier.clone()));
 
     // Invite — auth required + dedicated 20/hr limit (sends email)
@@ -442,6 +444,7 @@ async fn main() {
         .merge(admin_routes)
         .merge(ws_routes)
         .route("/health", get(|| async { "ok" }))
+        .route("/v1/meta", get(routes::meta::get_meta))
         .layer({
             let allow_origin = match std::env::var("CORS_ORIGINS") {
                 Ok(s) => {

@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::self_host;
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 const MAX_TEAM_BLOB_SIZE: usize = 10 * 1024 * 1024; // 10 MB
@@ -33,7 +34,11 @@ async fn is_team_member(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<b
 }
 
 /// Returns Ok if the vault owner has a Teams or Business subscription.
+/// In self-hosted mode this is a no-op — every tier is unlocked.
 async fn require_teams_tier_for_vault(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
+    if self_host::is_self_hosted() {
+        return Ok(());
+    }
     let tier = sqlx::query_scalar::<_, String>(
         "SELECT u.subscription_tier FROM teams t \
          JOIN users u ON u.id = t.owner_id \

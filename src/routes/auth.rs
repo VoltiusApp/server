@@ -11,6 +11,7 @@ use crate::auth::{
     AuthUser,
 };
 use crate::email::send_verification_email;
+use crate::self_host;
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
 
@@ -111,8 +112,12 @@ pub async fn register(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Check if this machine already used a trial
-    let trial_blocked = if let Some(ref fp) = body.machine_fingerprint {
+    let self_hosted = self_host::is_self_hosted();
+
+    // Check if this machine already used a trial (skipped in self-hosted mode)
+    let trial_blocked = if self_hosted {
+        false
+    } else if let Some(ref fp) = body.machine_fingerprint {
         sqlx::query_as::<_, (bool,)>(
             "SELECT EXISTS(SELECT 1 FROM trial_fingerprints WHERE fingerprint = $1)",
         )
@@ -125,7 +130,10 @@ pub async fn register(
         false
     };
 
-    let (initial_tier, trial_ends_at) = if trial_blocked {
+    // Self-hosted: everyone gets business tier with no trial countdown.
+    let (initial_tier, trial_ends_at) = if self_hosted {
+        ("business", None)
+    } else if trial_blocked {
         warn!(fingerprint = ?body.machine_fingerprint, "Trial blocked: machine fingerprint already used");
         ("free", None)
     } else {

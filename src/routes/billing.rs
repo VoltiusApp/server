@@ -10,6 +10,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::self_host;
 
 #[derive(Serialize)]
 pub struct SubscriptionInfoResponse {
@@ -246,6 +247,9 @@ pub async fn create_checkout(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutResponse>, Response> {
+    if self_host::is_self_hosted() {
+        return Err(status_response(StatusCode::SERVICE_UNAVAILABLE));
+    }
     let (email, email_verified) = fetch_checkout_user(&pool, auth.0)
         .await
         .map_err(status_response)?;
@@ -351,6 +355,9 @@ pub async fn get_portal(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<PortalResponse>, StatusCode> {
+    if self_host::is_self_hosted() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let subscription_id = fetch_current_subscription_id(&pool, auth.0).await?;
     let api_key = std::env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
@@ -397,6 +404,9 @@ pub async fn update_seats(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<UpdateSeatsRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    if self_host::is_self_hosted() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if body.seats < 3 {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -458,6 +468,9 @@ pub async fn cancel_subscription(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<SubscriptionInfoResponse>, StatusCode> {
+    if self_host::is_self_hosted() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let subscription_id = fetch_current_subscription_id(&pool, auth.0).await?;
     let state = mutate_ls_subscription(&subscription_id, reqwest::Method::DELETE).await?;
     persist_subscription_state(&pool, auth.0, &state).await?;
@@ -468,6 +481,9 @@ pub async fn resume_subscription(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<SubscriptionInfoResponse>, StatusCode> {
+    if self_host::is_self_hosted() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let subscription_id = fetch_current_subscription_id(&pool, auth.0).await?;
     let state = mutate_ls_subscription(&subscription_id, reqwest::Method::PATCH).await?;
     persist_subscription_state(&pool, auth.0, &state).await?;

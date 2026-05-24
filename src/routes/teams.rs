@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
 use crate::routes::audit::write_audit_event;
+use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
@@ -36,6 +37,9 @@ pub(crate) async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNo
 // ─── Plan tier helper ─────────────────────────────────────────────────────────
 
 async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
+    if self_host::is_self_hosted() {
+        return Ok(());
+    }
     let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
         .bind(team_id)
         .fetch_one(pool)
