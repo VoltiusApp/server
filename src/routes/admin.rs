@@ -910,7 +910,7 @@ pub async fn extend_trial(
 #[derive(Serialize, sqlx::FromRow)]
 pub struct DeviceRow {
     device_id: String,
-    size_bytes: i64,
+    size_bytes: i32,
     updated_at: DateTime<Utc>,
     metadata: Option<Value>,
 }
