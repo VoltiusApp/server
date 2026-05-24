@@ -129,7 +129,7 @@ const PRICE_BUSINESS_PER_SEAT: i64 = 49;
 
 pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewResponse>, StatusCode> {
     // ── Headline counts ──────────────────────────────────────────────────────
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, Option<f64>)>(
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, i64, Option<f64>)>(
         r#"
         SELECT
             COUNT(*) FILTER (WHERE deleted_at IS NULL),
@@ -140,6 +140,7 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now()),
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now() AND trial_ends_at < now() + interval '7 days'),
             COUNT(*) FILTER (WHERE deleted_at IS NOT NULL),
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro' AND (trial_ends_at IS NULL OR trial_ends_at <= now())),
             NULL::float8
         FROM users
         "#,
@@ -159,6 +160,7 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
     let trials_active = row.5;
     let trials_expiring_7d = row.6;
     let deleted_pending = row.7;
+    let paid_pro_users = row.8;
 
     // ── MRR (seat-aware for teams/business) ──────────────────────────────────
     let seat_row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
@@ -183,7 +185,7 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
     let mrr_teams = teams_seats * PRICE_TEAMS_PER_SEAT;
     let mrr_business = business_seats * PRICE_BUSINESS_PER_SEAT;
     let mrr_total = mrr_pro + mrr_teams + mrr_business;
-    let paying_subscribers = pro_users + teams_users + business_users;
+    let paying_subscribers = paid_pro_users + teams_users + business_users;
 
     // ── Recent windows ───────────────────────────────────────────────────────
     let (signups_7d, signups_30d): (i64, i64) = sqlx::query_as(
