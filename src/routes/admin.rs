@@ -65,6 +65,7 @@ pub async fn get_lemonsqueezy_summary(
 pub struct TierBreakdown {
     free: i64,
     pro: i64,
+    pro_trial: i64,
     teams: i64,
     business: i64,
 }
@@ -331,7 +332,8 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         conversion_pct,
         tier_breakdown: TierBreakdown {
             free: free_users,
-            pro: pro_users,
+            pro: paid_pro_users,
+            pro_trial: pro_users - paid_pro_users,
             teams: teams_users,
             business: business_users,
         },
