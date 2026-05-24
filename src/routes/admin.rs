@@ -397,19 +397,28 @@ pub async fn list_users(
             u.is_admin,
             u.created_at,
             u.ls_customer_id,
-            COALESCE(SUM(sb.size_bytes), 0)::bigint AS total_blob_bytes,
-            COUNT(DISTINCT sb.device_id)::bigint AS device_count,
-            MAX(ce.created_at) AS last_churn_at,
+            COALESCE(sb.total_blob_bytes, 0)::bigint AS total_blob_bytes,
+            COALESCE(sb.device_count, 0)::bigint AS device_count,
+            ce.last_churn_at,
             u.deleted_at
         FROM users u
-        LEFT JOIN sync_blobs sb ON sb.user_id = u.id
-        LEFT JOIN churn_events ce ON ce.user_id = u.id
+        LEFT JOIN (
+            SELECT user_id,
+                   SUM(size_bytes)::bigint AS total_blob_bytes,
+                   COUNT(DISTINCT device_id)::bigint AS device_count
+            FROM sync_blobs
+            GROUP BY user_id
+        ) sb ON sb.user_id = u.id
+        LEFT JOIN (
+            SELECT user_id, MAX(created_at) AS last_churn_at
+            FROM churn_events
+            GROUP BY user_id
+        ) ce ON ce.user_id = u.id
         WHERE
             ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%')
             AND ($2::text IS NULL OR u.subscription_tier = $2)
             AND ($3::boolean IS NULL OR u.is_banned = $3)
             {deleted_clause}
-        GROUP BY u.id
         ORDER BY u.created_at DESC
         LIMIT $4 OFFSET $5
         "#
