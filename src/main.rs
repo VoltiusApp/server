@@ -16,7 +16,9 @@ use axum::{
     Extension, Router,
 };
 use dashmap::{DashMap, DashSet};
-use rate_limit::{InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter};
+use rate_limit::{
+    InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter, WaitlistRateLimiter,
+};
 use routes::audit::AuditClientRateLimiter;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -85,6 +87,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    let waitlist_per_hour: usize = std::env::var("WAITLIST_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
     let auth_limiter = RateLimiter::<std::net::IpAddr>::new(10, Duration::from_secs(60));
     let register_limiter = RegisterRateLimiter(RateLimiter::new(
         register_per_day,
@@ -92,6 +98,10 @@ async fn main() {
     ));
     let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(
         invite_per_hour,
+        Duration::from_secs(3600),
+    ));
+    let waitlist_limiter = WaitlistRateLimiter(RateLimiter::new(
+        waitlist_per_hour,
         Duration::from_secs(3600),
     ));
     let sync_limiter = SyncRateLimiter(RateLimiter::<uuid::Uuid>::new(
@@ -108,6 +118,7 @@ async fn main() {
         auth_per_minute = 10,
         register_per_day,
         invite_per_hour,
+        waitlist_per_hour,
         sync_per_hour = sync_rate,
         "Configured rate limits"
     );
@@ -132,6 +143,14 @@ async fn main() {
         )
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
         .layer(Extension(auth_limiter));
+
+    let waitlist = Router::new()
+        .route(
+            "/v1/mobile-waitlist",
+            post(routes::waitlist::join_mobile_waitlist),
+        )
+        .layer(middleware::from_fn(rate_limit::waitlist_rate_limit))
+        .layer(Extension(waitlist_limiter));
 
     // Webhook — public, signature-verified internally. Disabled in self-hosted mode.
     let webhooks = Router::new()
@@ -434,6 +453,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(public)
+        .merge(waitlist)
         .merge(register_route)
         .merge(webhooks)
         .merge(invite_route)

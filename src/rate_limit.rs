@@ -91,6 +91,9 @@ pub struct InviteRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct SyncRateLimiter(pub RateLimiter<Uuid>);
 
+#[derive(Clone)]
+pub struct WaitlistRateLimiter(pub RateLimiter<IpAddr>);
+
 /// Register endpoint: N registrations/day per IP.
 pub async fn register_rate_limit(
     axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,
@@ -144,6 +147,20 @@ pub async fn auth_rate_limit(
     let path = req.uri().path().to_owned();
     if !limiter.check(ip).await {
         warn!(%ip, method = %method, path = %path, "Auth rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Public waitlist endpoint: N submissions/hour per IP.
+pub async fn waitlist_rate_limit(
+    axum::Extension(WaitlistRateLimiter(limiter)): axum::Extension<WaitlistRateLimiter>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let ip = extract_ip(&req);
+    if !limiter.check(ip).await {
+        warn!(%ip, "Waitlist rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(next.run(req).await)

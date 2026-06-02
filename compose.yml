@@ -33,6 +33,7 @@ services:
       SYNC_RATE_LIMIT: ${SYNC_RATE_LIMIT:-}
       REGISTER_RATE_LIMIT: ${REGISTER_RATE_LIMIT:-}
       INVITE_RATE_LIMIT: ${INVITE_RATE_LIMIT:-}
+      WAITLIST_RATE_LIMIT: ${WAITLIST_RATE_LIMIT:-}
       # Only needed if you also run the admin dashboard.
       ADMIN_SECRET: ${ADMIN_SECRET:-}
     healthcheck:

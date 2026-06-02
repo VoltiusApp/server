@@ -11,4 +11,5 @@ pub mod team_objects;
 pub mod team_object_prefs;
 pub mod teams;
 pub mod terminal;
+pub mod waitlist;
 pub mod webhooks;
