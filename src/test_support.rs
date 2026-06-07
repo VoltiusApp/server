@@ -9,7 +9,18 @@
 //!   TEST_DATABASE_URL=postgres://voltius:voltius@localhost:5432/voltius_test cargo test
 
 use sqlx::PgPool;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
+
+/// Serializes tests that mutate process-global env vars (e.g. `LS_VARIANT_*`).
+/// Without this, parallel tests race on shared env and fail intermittently.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the global env lock for the duration of a test. Tolerates poisoning
+/// (a prior test panicking while holding it) so one failure doesn't cascade.
+pub fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Connect to `TEST_DATABASE_URL` and apply migrations, or return `None` to skip.
 pub async fn test_pool() -> Option<PgPool> {

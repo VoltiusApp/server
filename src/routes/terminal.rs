@@ -685,7 +685,7 @@ async fn handle_socket(
     };
 
     if ws_sender
-        .send(Message::Text(participant_list_json.clone().into()))
+        .send(Message::Text(participant_list_json.clone()))
         .await
         .is_err()
     {
@@ -695,7 +695,7 @@ async fn handle_socket(
 
     // Replay terminal history so the new joiner sees what happened before they joined.
     for msg in history_snapshot {
-        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+        if ws_sender.send(Message::Text(msg)).await.is_err() {
             cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
             return;
         }
@@ -712,13 +712,11 @@ async fn handle_socket(
     info!(session_id = %session_id, user_id = %user_id, "WS participant joined");
 
     let send_task = {
-        let session_id = session_id;
-        let user_id = user_id;
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                        if ws_sender.send(Message::Text(msg)).await.is_err() {
                             break;
                         }
                     }

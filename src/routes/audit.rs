@@ -23,6 +23,9 @@ pub struct AuditClientRateLimiter(pub RateLimiter<Uuid>);
 
 // ─── Write helper (called from other route modules) ───────────────────────────
 
+// Positional args mirror the audit_logs columns; a params struct is deferred
+// to avoid churning the ~10 spawn call sites in this low-risk pass.
+#[allow(clippy::too_many_arguments)]
 pub async fn write_audit_event(
     pool: PgPool,
     team_id: Uuid,

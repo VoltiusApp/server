@@ -218,7 +218,7 @@ impl LsCache {
         )
         .await?;
         orders.sort_by_key(|o| {
-            std::cmp::Reverse(parse_iso(o["attributes"]["created_at"].as_str()))
+            std::cmp::Reverse(parse_ls_datetime(o["attributes"]["created_at"].as_str()))
         });
 
         let month_start = start_of_current_month();
@@ -231,7 +231,7 @@ impl LsCache {
 
         for order in &orders {
             let attrs = &order["attributes"];
-            let created_at = parse_iso(attrs["created_at"].as_str()).unwrap_or_else(Utc::now);
+            let created_at = parse_ls_datetime(attrs["created_at"].as_str()).unwrap_or_else(Utc::now);
             let status = attrs["status"].as_str().unwrap_or("").to_string();
             let total = attrs["total"].as_i64().unwrap_or(0);
             let refunded = attrs["refunded"].as_bool().unwrap_or(false);
@@ -246,7 +246,7 @@ impl LsCache {
             // Refunds in last 30d.
             if refunded {
                 let refunded_at =
-                    parse_iso(attrs["refunded_at"].as_str()).unwrap_or(created_at);
+                    parse_ls_datetime(attrs["refunded_at"].as_str()).unwrap_or(created_at);
                 if refunded_at >= cutoff_30d {
                     refunds_30d_cents += total;
                 }
@@ -278,7 +278,7 @@ impl LsCache {
         let mut failed_payments_30d: i64 = 0;
         for inv in &invoices {
             let attrs = &inv["attributes"];
-            let created_at = parse_iso(attrs["created_at"].as_str()).unwrap_or_else(Utc::now);
+            let created_at = parse_ls_datetime(attrs["created_at"].as_str()).unwrap_or_else(Utc::now);
             if created_at < cutoff_30d {
                 continue;
             }
@@ -377,11 +377,32 @@ fn variant_id(sub: &Value) -> Option<String> {
         .or_else(|| sub["attributes"]["variant_id"].as_str().map(String::from))
 }
 
-fn parse_iso(s: Option<&str>) -> Option<DateTime<Utc>> {
+/// Parse an RFC 3339 / ISO-8601 timestamp into UTC. Shared by the metrics
+/// cache and by billing/webhook subscription parsing.
+pub fn parse_ls_datetime(s: Option<&str>) -> Option<DateTime<Utc>> {
     let s = s?;
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.with_timezone(&Utc))
+}
+
+/// Map a Lemon Squeezy variant id to our internal tier, reading the configured
+/// `LS_VARIANT_*` env vars. Returns `None` for unconfigured/unknown variants.
+pub fn tier_from_variant_id(variant_id: &str) -> Option<&'static str> {
+    let pro_monthly = std::env::var("LS_VARIANT_PRO_MONTHLY").ok();
+    let pro_yearly = std::env::var("LS_VARIANT_PRO_YEARLY").ok();
+    let teams_monthly = std::env::var("LS_VARIANT_TEAMS_MONTHLY").ok();
+    let teams_yearly = std::env::var("LS_VARIANT_TEAMS_YEARLY").ok();
+
+    if pro_monthly.as_deref() == Some(variant_id) || pro_yearly.as_deref() == Some(variant_id) {
+        Some("pro")
+    } else if teams_monthly.as_deref() == Some(variant_id)
+        || teams_yearly.as_deref() == Some(variant_id)
+    {
+        Some("teams")
+    } else {
+        None
+    }
 }
 
 fn start_of_current_month() -> DateTime<Utc> {

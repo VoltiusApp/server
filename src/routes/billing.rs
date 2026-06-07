@@ -10,6 +10,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::lemonsqueezy::{parse_ls_datetime, tier_from_variant_id};
 use crate::self_host;
 
 #[derive(Serialize)]
@@ -72,29 +73,6 @@ struct LemonSubscriptionState {
     renews_at: Option<chrono::DateTime<chrono::Utc>>,
     ends_at: Option<chrono::DateTime<chrono::Utc>>,
     seat_count: Option<i32>,
-}
-
-fn tier_from_variant_id(variant_id: &str) -> Option<&'static str> {
-    let pro_monthly = std::env::var("LS_VARIANT_PRO_MONTHLY").ok();
-    let pro_yearly = std::env::var("LS_VARIANT_PRO_YEARLY").ok();
-    let teams_monthly = std::env::var("LS_VARIANT_TEAMS_MONTHLY").ok();
-    let teams_yearly = std::env::var("LS_VARIANT_TEAMS_YEARLY").ok();
-
-    if pro_monthly.as_deref() == Some(variant_id) || pro_yearly.as_deref() == Some(variant_id) {
-        Some("pro")
-    } else if teams_monthly.as_deref() == Some(variant_id)
-        || teams_yearly.as_deref() == Some(variant_id)
-    {
-        Some("teams")
-    } else {
-        None
-    }
-}
-
-fn parse_ls_datetime(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
-    value
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 fn parse_ls_subscription(body: &serde_json::Value) -> Option<LemonSubscriptionState> {
@@ -577,30 +555,34 @@ mod tests {
 
     use super::*;
 
-    fn set_variant_env() {
+    /// Set the variant env vars and return the held env lock; keep the guard
+    /// alive (`let _env = set_variant_env();`) so the test runs serially.
+    fn set_variant_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::test_support::env_lock();
         std::env::set_var("LS_VARIANT_PRO_MONTHLY", "101");
         std::env::set_var("LS_VARIANT_PRO_YEARLY", "102");
         std::env::set_var("LS_VARIANT_TEAMS_MONTHLY", "201");
         std::env::set_var("LS_VARIANT_TEAMS_YEARLY", "202");
+        guard
     }
 
     #[test]
     fn tier_from_variant_id_maps_configured_pro_variants() {
-        set_variant_env();
+        let _env = set_variant_env();
         assert_eq!(tier_from_variant_id("101"), Some("pro"));
         assert_eq!(tier_from_variant_id("102"), Some("pro"));
     }
 
     #[test]
     fn tier_from_variant_id_maps_configured_teams_variants() {
-        set_variant_env();
+        let _env = set_variant_env();
         assert_eq!(tier_from_variant_id("201"), Some("teams"));
         assert_eq!(tier_from_variant_id("202"), Some("teams"));
     }
 
     #[test]
     fn tier_from_variant_id_rejects_unknown_variant() {
-        set_variant_env();
+        let _env = set_variant_env();
         assert_eq!(tier_from_variant_id("999"), None);
     }
 
@@ -616,7 +598,7 @@ mod tests {
 
     #[test]
     fn parse_ls_subscription_extracts_lifecycle_fields() {
-        set_variant_env();
+        let _env = set_variant_env();
         let body = serde_json::json!({
             "data": {
                 "id": "sub_123",
@@ -643,7 +625,7 @@ mod tests {
         assert_eq!(parsed.subscription_id, "sub_123");
         assert_eq!(parsed.customer_id.as_deref(), Some("cus_123"));
         assert_eq!(parsed.variant_id.as_deref(), Some("101"));
-        assert_eq!(parsed.tier.as_deref(), Some("pro"));
+        assert_eq!(parsed.tier, Some("pro"));
         assert_eq!(parsed.status.as_deref(), Some("cancelled"));
         assert!(parsed.cancelled);
         assert_eq!(parsed.renews_at.unwrap().timestamp(), 1_780_272_000);

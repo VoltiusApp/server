@@ -1,3 +1,4 @@
+use crate::lemonsqueezy::{parse_ls_datetime, tier_from_variant_id};
 use crate::sync_notifier::SyncNotifier;
 use axum::{
     body::Bytes,
@@ -41,29 +42,6 @@ struct WebhookSubscriptionState {
     renews_at: Option<chrono::DateTime<chrono::Utc>>,
     ends_at: Option<chrono::DateTime<chrono::Utc>>,
     seat_count: Option<i32>,
-}
-
-fn tier_from_variant_id(variant_id: &str) -> Option<&'static str> {
-    let pro_monthly = std::env::var("LS_VARIANT_PRO_MONTHLY").ok();
-    let pro_yearly = std::env::var("LS_VARIANT_PRO_YEARLY").ok();
-    let teams_monthly = std::env::var("LS_VARIANT_TEAMS_MONTHLY").ok();
-    let teams_yearly = std::env::var("LS_VARIANT_TEAMS_YEARLY").ok();
-
-    if pro_monthly.as_deref() == Some(variant_id) || pro_yearly.as_deref() == Some(variant_id) {
-        Some("pro")
-    } else if teams_monthly.as_deref() == Some(variant_id)
-        || teams_yearly.as_deref() == Some(variant_id)
-    {
-        Some("teams")
-    } else {
-        None
-    }
-}
-
-fn parse_ls_datetime(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
-    value
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 fn parse_webhook_subscription(payload: &serde_json::Value) -> Option<WebhookSubscriptionState> {
@@ -501,6 +479,7 @@ mod tests {
 
     #[test]
     fn parse_webhook_subscription_maps_variant_and_lifecycle_fields() {
+        let _env = crate::test_support::env_lock();
         std::env::set_var("LS_VARIANT_PRO_MONTHLY", "101");
         std::env::set_var("LS_VARIANT_PRO_YEARLY", "102");
         std::env::set_var("LS_VARIANT_TEAMS_MONTHLY", "201");
@@ -543,6 +522,7 @@ mod tests {
 
     #[test]
     fn configured_tier_for_subscription_returns_none_for_unknown_variant() {
+        let _env = crate::test_support::env_lock();
         std::env::set_var("LS_VARIANT_PRO_MONTHLY", "101");
         std::env::set_var("LS_VARIANT_TEAMS_MONTHLY", "201");
 
@@ -570,6 +550,7 @@ mod tests {
 
     #[test]
     fn tier_for_subscription_update_fails_closed_for_unknown_variant() {
+        let _env = crate::test_support::env_lock();
         std::env::set_var("LS_VARIANT_PRO_MONTHLY", "101");
 
         let payload = json!({
