@@ -49,8 +49,14 @@ async fn main() {
 
     let pool = db::create_pool().await;
 
-    // Audit log retention: delete entries older than each team's retention window (runs every 24h)
+    // Daily retention cleanup (runs every 24h): audit logs + redundant sync blobs.
     let retention_pool = pool.clone();
+    // Prune device blobs idle longer than this, but never a user's most recent one
+    // (it's their only backup) — only redundant older copies are reclaimed.
+    let sync_blob_retention_days: i64 = std::env::var("SYNC_BLOB_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(86_400));
         interval.tick().await; // skip first immediate tick
@@ -67,6 +73,23 @@ async fn main() {
             {
                 Ok(r) => tracing::info!(deleted = r.rows_affected(), "Audit log retention cleanup completed"),
                 Err(e) => tracing::error!(error = %e, "Audit log retention cleanup failed"),
+            }
+
+            match sqlx::query(
+                r#"DELETE FROM sync_blobs s
+                   WHERE s.updated_at < NOW() - ($1 * INTERVAL '1 day')
+                     AND EXISTS (
+                       SELECT 1 FROM sync_blobs n
+                       WHERE n.user_id = s.user_id
+                         AND n.updated_at > s.updated_at
+                     )"#,
+            )
+            .bind(sync_blob_retention_days)
+            .execute(&retention_pool)
+            .await
+            {
+                Ok(r) => tracing::info!(deleted = r.rows_affected(), retention_days = sync_blob_retention_days, "Stale sync blob cleanup completed"),
+                Err(e) => tracing::error!(error = %e, "Stale sync blob cleanup failed"),
             }
         }
     });
