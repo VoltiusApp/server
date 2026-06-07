@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: voltius
+          POSTGRES_PASSWORD: voltius
+          POSTGRES_DB: voltius_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U voltius -d voltius_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Pure-function unit tests need this; DB-backed tests need TEST_DATABASE_URL.
+      JWT_SECRET: ci-test-secret
+      TEST_DATABASE_URL: postgres://voltius:voltius@localhost:5432/voltius_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Hard gate: all tests (pure-function + DB-backed) must pass.
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # Informational for now — not yet `-D warnings` (6 pre-existing lints are
+      # cleaned up in a later phase before this is made blocking).
+      - name: cargo clippy
+        run: cargo clippy --all-targets

@@ -162,3 +162,135 @@ pub async fn has_any_team_permission(
 
     Ok((effective & permission) != 0)
 }
+
+#[cfg(test)]
+mod db_tests {
+    //! Behavioral lock-in for the team authz helpers. These pin the exact
+    //! semantics (bit-or union across roles, member checks, multi-team checks)
+    //! so the planned dedup of the repeated `bit_or` query is provably safe.
+    //!
+    //! Requires `TEST_DATABASE_URL`; otherwise each test skips.
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, assign_role, seed_role, seed_team, seed_user};
+
+    #[tokio::test]
+    async fn has_team_permission_reflects_granted_bit() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team = seed_team(&pool, user).await;
+        let role = seed_role(&pool, team, "r", PERM_VIEW_SECRETS | PERM_CONNECT).await;
+        add_member(&pool, team, user).await;
+        assign_role(&pool, team, user, role).await;
+
+        assert!(has_team_permission(&pool, team, user, PERM_VIEW_SECRETS)
+            .await
+            .unwrap());
+        assert!(!has_team_permission(&pool, team, user, PERM_MANAGE_ROLES)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_team_permission_unions_multiple_roles() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team = seed_team(&pool, user).await;
+        let role_a = seed_role(&pool, team, "a", PERM_VIEW_SECRETS).await;
+        let role_b = seed_role(&pool, team, "b", PERM_MANAGE_ROLES).await;
+        add_member(&pool, team, user).await;
+        assign_role(&pool, team, user, role_a).await;
+        assign_role(&pool, team, user, role_b).await;
+
+        // Bits from either role are effective (bit_or).
+        assert!(has_team_permission(&pool, team, user, PERM_VIEW_SECRETS)
+            .await
+            .unwrap());
+        assert!(has_team_permission(&pool, team, user, PERM_MANAGE_ROLES)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_team_permission_false_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let outsider = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        assert!(!has_team_permission(&pool, team, outsider, PERM_VIEW_SECRETS)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn require_all_team_permissions_needs_every_bit() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team = seed_team(&pool, user).await;
+        let role = seed_role(&pool, team, "r", PERM_VIEW_SECRETS | PERM_CONNECT).await;
+        add_member(&pool, team, user).await;
+        assign_role(&pool, team, user, role).await;
+
+        assert!(
+            require_all_team_permissions(&pool, team, user, &[PERM_VIEW_SECRETS, PERM_CONNECT])
+                .await
+                .is_ok()
+        );
+        // Missing one of the required bits → FORBIDDEN.
+        assert_eq!(
+            require_all_team_permissions(
+                &pool,
+                team,
+                user,
+                &[PERM_VIEW_SECRETS, PERM_MANAGE_ROLES]
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn require_team_member_distinguishes_members() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let member = seed_user(&pool).await;
+        let outsider = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, member).await;
+
+        assert!(require_team_member(&pool, team, member).await.is_ok());
+        assert_eq!(
+            require_team_member(&pool, team, outsider).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn has_any_team_permission_checks_across_teams() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team_a = seed_team(&pool, user).await;
+        let team_b = seed_team(&pool, user).await;
+        let role = seed_role(&pool, team_b, "r", PERM_VIEW_AUDIT_LOG).await;
+        add_member(&pool, team_b, user).await;
+        assign_role(&pool, team_b, user, role).await;
+
+        // Empty slice short-circuits to false.
+        assert!(!has_any_team_permission(&pool, &[], user, PERM_VIEW_AUDIT_LOG)
+            .await
+            .unwrap());
+        // Granted in team_b even though team_a grants nothing.
+        assert!(
+            has_any_team_permission(&pool, &[team_a, team_b], user, PERM_VIEW_AUDIT_LOG)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_any_team_permission(&pool, &[team_a, team_b], user, PERM_MANAGE_VAULT)
+                .await
+                .unwrap()
+        );
+    }
+}

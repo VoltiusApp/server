@@ -9,6 +9,8 @@ mod routes;
 mod self_host;
 mod sync_notifier;
 mod terminal_manager;
+#[cfg(test)]
+mod test_support;
 
 use axum::{
     middleware,
