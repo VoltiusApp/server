@@ -51,15 +51,14 @@ pub const BUILTIN_ROLES: &[(&str, i64, i32)] = &[
     ("connect-only", 28676,                       4), // no edit perms today
 ];
 
-/// Returns the union of all role permission bits for (team_id, user_id).
-/// Returns false if user has no roles in the team (or is not a member).
-pub async fn has_team_permission(
+/// Union of all role permission bits granted to (team_id, user_id).
+/// Returns 0 if the user has no roles in the team (or is not a member).
+async fn effective_permissions(
     pool: &PgPool,
     team_id: Uuid,
     user_id: Uuid,
-    permission: i64,
-) -> Result<bool, StatusCode> {
-    let effective = sqlx::query_scalar::<_, i64>(
+) -> Result<i64, StatusCode> {
+    sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COALESCE(bit_or(tr.permissions), 0)
         FROM team_member_roles tmr
@@ -74,9 +73,17 @@ pub async fn has_team_permission(
     .map_err(|e| {
         error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permission");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })
+}
 
-    Ok((effective & permission) != 0)
+/// Returns true if any of (team_id, user_id)'s roles grant `permission`.
+pub async fn has_team_permission(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+    permission: i64,
+) -> Result<bool, StatusCode> {
+    Ok((effective_permissions(pool, team_id, user_id).await? & permission) != 0)
 }
 
 pub async fn require_all_team_permissions(
@@ -85,23 +92,7 @@ pub async fn require_all_team_permissions(
     user_id: Uuid,
     permissions: &[i64],
 ) -> Result<(), StatusCode> {
-    let effective = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COALESCE(bit_or(tr.permissions), 0)
-        FROM team_member_roles tmr
-        JOIN team_roles tr ON tr.id = tmr.role_id
-        WHERE tmr.team_id = $1 AND tmr.user_id = $2
-        "#,
-    )
-    .bind(team_id)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permissions");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
+    let effective = effective_permissions(pool, team_id, user_id).await?;
     if permissions.iter().all(|p| (effective & *p) != 0) {
         Ok(())
     } else {
@@ -109,12 +100,13 @@ pub async fn require_all_team_permissions(
     }
 }
 
-pub async fn require_team_member(
+/// Returns true if the user is a member of the team.
+pub async fn is_team_member(
     pool: &PgPool,
     team_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
-    let is_member = sqlx::query_scalar::<_, bool>(
+) -> Result<bool, StatusCode> {
+    sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
     )
     .bind(team_id)
@@ -124,9 +116,15 @@ pub async fn require_team_member(
     .map_err(|e| {
         error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team membership");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })
+}
 
-    if is_member {
+pub async fn require_team_member(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), StatusCode> {
+    if is_team_member(pool, team_id, user_id).await? {
         Ok(())
     } else {
         Err(StatusCode::FORBIDDEN)

@@ -11,27 +11,13 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::permissions::is_team_member;
 use crate::self_host;
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 const MAX_TEAM_BLOB_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Returns true if the given user is a member of the given team.
-async fn is_team_member(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<bool, StatusCode> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
-    )
-    .bind(team_id)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team membership");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
-}
 
 /// Returns Ok if the vault owner has a Teams or Business subscription.
 /// In self-hosted mode this is a no-op — every tier is unlocked.
