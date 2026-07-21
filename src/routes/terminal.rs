@@ -17,6 +17,30 @@ use uuid::Uuid;
 use crate::auth::{jwt::validate_token, AuthClaims, AuthUser};
 use crate::terminal_manager::{Participant, TerminalManager, BROADCAST_CAPACITY};
 
+/// Tier the given account is entitled to right now, with expired trials counted
+/// as `free`. Falls back to `free` if the row can't be read.
+async fn owner_effective_tier(pool: &PgPool, user_id: Uuid) -> String {
+    match sqlx::query_as::<_, (String, Option<chrono::DateTime<Utc>>, bool, Option<String>)>(
+        "SELECT subscription_tier, trial_ends_at, admin_override, ls_subscription_id FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok((tier, trial_ends_at, admin_override, ls_subscription_id)) => {
+            crate::entitlement::effective_tier(
+                &tier,
+                trial_ends_at,
+                ls_subscription_id.is_some(),
+                admin_override,
+                Utc::now(),
+            )
+            .to_string()
+        }
+        Err(_) => "free".to_string(),
+    }
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -612,19 +636,8 @@ async fn handle_socket(
 
     // Participant cap: guests only (host is always allowed)
     if user_id != host_user_id {
-        let effective_tier = if let Some(owner_id) = vault_owner_id {
-            sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
-                .bind(owner_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or_else(|_| "free".to_string())
-        } else {
-            sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
-                .bind(host_user_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or_else(|_| "free".to_string())
-        };
+        let tier_owner = vault_owner_id.unwrap_or(host_user_id);
+        let effective_tier = owner_effective_tier(&pool, tier_owner).await;
 
         let guest_cap: usize = match effective_tier.as_str() {
             "business" => 50,

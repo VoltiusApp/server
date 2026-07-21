@@ -25,8 +25,8 @@ struct TierInfo {
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool)>(
-        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>)>(
+        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -36,13 +36,25 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id) =
+        row;
+    let effective = crate::entitlement::effective_tier(
+        &stored_tier,
+        trial_ends_at,
+        ls_subscription_id.is_some(),
+        admin_override,
+        Utc::now(),
+    );
+    // An expired trial has been consumed and no longer has a live countdown.
+    let downgraded = effective != stored_tier;
+
     Ok(TierInfo {
-        tier: row.0,
-        trial_ends_at: row.1.map(|t| t.timestamp()),
-        trial_used: row.2,
-        is_admin: row.3,
-        is_banned: row.4,
-        email_verified: row.5,
+        tier: effective.to_string(),
+        trial_ends_at: if downgraded { None } else { trial_ends_at.map(|t| t.timestamp()) },
+        trial_used: trial_used || downgraded,
+        is_admin,
+        is_banned,
+        email_verified,
     })
 }
 

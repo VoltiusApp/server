@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod email;
+mod entitlement;
 mod lemonsqueezy;
 mod models;
 mod permissions;
@@ -39,6 +40,30 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, Tr
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
+/// Downgrade lapsed trials to `free`: a non-free tier whose `trial_ends_at` has
+/// passed, with no paid subscription and no admin override, has consumed its
+/// trial and reverts. Paid accounts carry `trial_ends_at = NULL` and are never
+/// matched. Keeps `subscription_tier` (and thus admin metrics) truthful.
+async fn expire_lapsed_trials(pool: &sqlx::PgPool) {
+    match sqlx::query(
+        r#"UPDATE users SET
+               subscription_tier = 'free',
+               trial_used = TRUE,
+               trial_ends_at = NULL
+           WHERE subscription_tier <> 'free'
+             AND trial_ends_at IS NOT NULL
+             AND trial_ends_at <= now()
+             AND ls_subscription_id IS NULL
+             AND admin_override = FALSE"#,
+    )
+    .execute(pool)
+    .await
+    {
+        Ok(r) => tracing::info!(downgraded = r.rows_affected(), "Lapsed trial downgrade completed"),
+        Err(e) => tracing::error!(error = %e, "Lapsed trial downgrade failed"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -57,11 +82,15 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
+    // Expire lapsed trials immediately on boot so the DB and admin metrics are
+    // truthful right after deploy, then keep them so via the daily sweep below.
+    expire_lapsed_trials(&retention_pool).await;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(86_400));
         interval.tick().await; // skip first immediate tick
         loop {
             interval.tick().await;
+            expire_lapsed_trials(&retention_pool).await;
             match sqlx::query(
                 r#"DELETE FROM audit_logs
                    USING teams
