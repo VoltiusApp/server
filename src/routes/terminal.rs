@@ -905,3 +905,120 @@ async fn cleanup_participant(
         let _ = tx.send(left_msg);
     }
 }
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+    use crate::auth::jwt::Claims;
+    use crate::auth::{AuthClaims, AuthUser};
+    use crate::permissions::PERM_CONNECT;
+    use crate::terminal_manager::TerminalManager;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use axum::extract::State;
+    use axum::{Extension, Json};
+
+    fn claims_for(user: uuid::Uuid) -> AuthClaims {
+        AuthClaims(Claims {
+            sub: user,
+            exp: 0,
+            iat: 0,
+            kind: "access".to_string(),
+            tier: "business".to_string(),
+            trial_ends_at: None,
+            trial_used: false,
+            is_admin: false,
+            is_banned: false,
+            email_verified: true,
+        })
+    }
+
+    // `CreateSessionRequest` derives only `Deserialize` — no `Default` — so every
+    // field is enumerated explicitly here.
+    fn vault_session_request(vault_ids: Vec<uuid::Uuid>) -> CreateSessionRequest {
+        CreateSessionRequest {
+            vault_ids,
+            connection_name: "box".to_string(),
+            visibility: Some("vault".to_string()),
+            participant_keys: Vec::new(),
+            session_key_bytes: None,
+            allowed_roles: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_forbidden_for_non_member_of_vault() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await; // not a member of `team`
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(claims_for(outsider)),
+            Extension(TerminalManager::new()),
+            Json(vault_session_request(vec![team])),
+        )
+        .await;
+
+        // `Ok` is `(StatusCode, Json<CreateSessionResponse>)`, which isn't `Debug`
+        // (`CreateSessionResponse` derives only `Serialize`) — `unwrap_err()`
+        // doesn't compile here, so match on the `Err` variant directly.
+        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+    }
+
+    #[tokio::test]
+    async fn create_session_forbidden_without_start_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Member of the vault but only CONNECT — not START_TERMINAL_SESSION.
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(claims_for(caller)),
+            Extension(TerminalManager::new()),
+            Json(vault_session_request(vec![team])),
+        )
+        .await;
+
+        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+    }
+
+    #[tokio::test]
+    async fn end_session_forbidden_for_non_host() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        // Seed a live terminal session hosted by `host`. `terminal_sessions` has
+        // no `vault_ids` column (that lives in `terminal_session_vaults`); the
+        // only NOT-NULL columns without a default are `host_user_id` and
+        // `connection_name` — `visibility`/`allowed_roles`/`created_at` all
+        // default. `end_session` only reads `host_user_id`, so no vault
+        // association is needed for this test.
+        let session_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO terminal_sessions (id, host_user_id, connection_name)
+             VALUES ($1, $2, 'box')",
+        )
+        .bind(session_id)
+        .bind(host)
+        .execute(&pool)
+        .await
+        .expect("seed terminal session");
+
+        let attacker = seed_user(&pool).await;
+
+        let res = end_session(
+            State(pool.clone()),
+            Extension(AuthUser(attacker)),
+            Extension(TerminalManager::new()),
+            axum::extract::Path(session_id),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+}
