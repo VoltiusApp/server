@@ -566,6 +566,17 @@ mod tests {
         guard
     }
 
+    /// Unset every `LS_VARIANT_*` var and return the held env lock, so the mapping
+    /// is exercised with no variants configured. Keep the guard alive.
+    fn clear_variant_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::test_support::env_lock();
+        std::env::remove_var("LS_VARIANT_PRO_MONTHLY");
+        std::env::remove_var("LS_VARIANT_PRO_YEARLY");
+        std::env::remove_var("LS_VARIANT_TEAMS_MONTHLY");
+        std::env::remove_var("LS_VARIANT_TEAMS_YEARLY");
+        guard
+    }
+
     #[test]
     fn tier_from_variant_id_maps_configured_pro_variants() {
         let _env = set_variant_env();
@@ -584,6 +595,46 @@ mod tests {
     fn tier_from_variant_id_rejects_unknown_variant() {
         let _env = set_variant_env();
         assert_eq!(tier_from_variant_id("999"), None);
+    }
+
+    #[test]
+    fn tier_from_variant_id_returns_none_when_env_unconfigured() {
+        // Fail closed: with no LS_VARIANT_* configured, no id — not even the empty
+        // string that an unset var would `Some(variant_id) == None`-compare against —
+        // resolves to a paid tier. Guards the gate that keeps team features locked
+        // until subscriptions are wired up.
+        let _env = clear_variant_env();
+        assert_eq!(tier_from_variant_id("101"), None);
+        assert_eq!(tier_from_variant_id("201"), None);
+        assert_eq!(tier_from_variant_id(""), None);
+    }
+
+    #[test]
+    fn tier_from_variant_id_never_grants_business_tier() {
+        // "teams" is the ceiling this map can grant: there is no LS_VARIANT_BUSINESS_*,
+        // so a Business plan is never provisioned by variant mapping. Locks that
+        // invariant against a future variant being wired to "business" here by mistake.
+        let _env = set_variant_env();
+        for id in ["101", "102", "201", "202", "999", ""] {
+            assert_ne!(
+                tier_from_variant_id(id),
+                Some("business"),
+                "variant {id} must not map to business",
+            );
+        }
+    }
+
+    #[test]
+    fn tier_from_variant_id_prefers_pro_when_variant_is_both_pro_and_teams() {
+        // Pro is checked before teams, so a misconfiguration mapping one id to both a
+        // pro and a teams variant resolves deterministically to pro (never teams).
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("LS_VARIANT_PRO_MONTHLY", "777");
+        std::env::set_var("LS_VARIANT_PRO_YEARLY", "888");
+        std::env::set_var("LS_VARIANT_TEAMS_MONTHLY", "777");
+        std::env::set_var("LS_VARIANT_TEAMS_YEARLY", "888");
+        assert_eq!(tier_from_variant_id("777"), Some("pro"));
+        assert_eq!(tier_from_variant_id("888"), Some("pro"));
     }
 
     #[tokio::test]
