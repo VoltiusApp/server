@@ -1380,3 +1380,131 @@ pub async fn revoke_pending_invitation(
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod authz_tests {
+    //! Handler-level enforcement locks: each test seeds a member WITHOUT the
+    //! required permission bit and asserts the handler rejects with FORBIDDEN,
+    //! plus a positive case with the bit granted. Requires TEST_DATABASE_URL.
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::permissions::{PERM_INVITE_MEMBERS, PERM_VIEW_SECRETS};
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{member_with_role, seed_role, seed_team, seed_user};
+    use axum::extract::{Path, State};
+    use axum::{Extension, Json};
+
+    #[tokio::test]
+    async fn add_member_forbidden_without_invite_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Caller is a member but has only VIEW_SECRETS, not INVITE_MEMBERS.
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+        let invitee = seed_user(&pool).await;
+
+        let res = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest {
+                user_id: Some(invitee),
+                email: None,
+                role: None,
+            }),
+        )
+        .await;
+
+        // `InviteMemberResponse` (the Ok payload) has no `Debug` impl, so
+        // `unwrap_err()` doesn't typecheck here — match instead.
+        match res {
+            Err(status) => assert_eq!(status, axum::http::StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected FORBIDDEN, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_member_allowed_with_invite_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let invitee = seed_user(&pool).await;
+
+        let res = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest {
+                user_id: Some(invitee),
+                email: None,
+                role: None,
+            }),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn remove_member_forbidden_without_manage_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+        let victim = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, victim)),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn remove_member_allows_self_removal_without_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Caller has NO management perm but removes themselves — allowed.
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, caller)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn assign_member_role_forbidden_without_manage_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+        let target = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+        let new_role = seed_role(&pool, team, "assignable", PERM_VIEW_SECRETS).await;
+
+        let res = assign_member_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(AssignRoleRequest { role_id: new_role }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+}

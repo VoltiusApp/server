@@ -119,3 +119,19 @@ pub async fn assign_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) {
         .await
         .expect("assign role");
 }
+
+/// Seed a user, grant them a single role with exactly `perms`, add them to
+/// `team`, and assign the role. Returns the new member's id. The common setup
+/// for handler authorization tests.
+///
+/// The role name is suffixed with a fresh UUID: `team_roles` has a unique
+/// `(team_id, name)` constraint, and callers routinely seed more than one
+/// member (e.g. caller + victim) on the same team.
+pub async fn member_with_role(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
+    let user = seed_user(pool).await;
+    let role_name = format!("authz-test-role-{}", Uuid::new_v4());
+    let role = seed_role(pool, team, &role_name, perms).await;
+    add_member(pool, team, user).await;
+    assign_role(pool, team, user, role).await;
+    user
+}
