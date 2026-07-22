@@ -344,3 +344,253 @@ pub async fn decline_my_pending_invitation(
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod authz_tests {
+    //! Per-user boundary enforcement for the invitation handlers. These handlers
+    //! don't gate on team permission bits — they enforce that you can only accept an
+    //! invite addressed to *your* email, and only accept/decline/list invitations
+    //! bound to *your* user_id. Requires `TEST_DATABASE_URL`; otherwise each skips.
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{
+        add_member, seed_invitation, seed_team, seed_user, test_user_email,
+    };
+    use axum::extract::{Path, State};
+    use axum::Extension;
+
+    async fn is_member(pool: &PgPool, team: Uuid, user: Uuid) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
+        )
+        .bind(team)
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_forbidden_on_email_mismatch() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = seed_user(&pool).await;
+        // Invitation addressed to a different email than the caller owns.
+        let (_id, token) =
+            seed_invitation(&pool, team, "someone-else@test.local", "member", None).await;
+
+        let res = accept_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(token),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+        assert!(!is_member(&pool, team, caller).await);
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_not_found_for_bad_token() {
+        let pool = test_pool_or_skip!();
+        let caller = seed_user(&pool).await;
+
+        let res = accept_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path("no-such-token".to_string()),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_ok_on_email_match() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = seed_user(&pool).await;
+        let (_id, token) =
+            seed_invitation(&pool, team, &test_user_email(caller), "member", None).await;
+
+        let res = accept_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(token),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert!(is_member(&pool, team, caller).await);
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_email_match_is_case_insensitive() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = seed_user(&pool).await;
+        // Invite addressed to the caller's email but in a different case — the
+        // handler lowercases both sides, so acceptance must still succeed.
+        let (_id, token) =
+            seed_invitation(&pool, team, &test_user_email(caller).to_uppercase(), "member", None)
+                .await;
+
+        let res = accept_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(token),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert!(is_member(&pool, team, caller).await);
+    }
+
+    #[tokio::test]
+    async fn accept_my_pending_invitation_not_found_for_other_user() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let recipient = seed_user(&pool).await;
+        let intruder = seed_user(&pool).await;
+        // Invitation bound to `recipient`; `intruder` must not be able to accept it.
+        let (invitation_id, _token) =
+            seed_invitation(&pool, team, &test_user_email(recipient), "member", Some(recipient))
+                .await;
+
+        let res = accept_my_pending_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(intruder)),
+            Extension(SyncNotifier::new()),
+            Path(invitation_id),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+        assert!(!is_member(&pool, team, intruder).await);
+    }
+
+    #[tokio::test]
+    async fn accept_my_pending_invitation_ok_for_owner() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let recipient = seed_user(&pool).await;
+        let (invitation_id, _token) =
+            seed_invitation(&pool, team, &test_user_email(recipient), "member", Some(recipient))
+                .await;
+
+        let res = accept_my_pending_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(recipient)),
+            Extension(SyncNotifier::new()),
+            Path(invitation_id),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert!(is_member(&pool, team, recipient).await);
+    }
+
+    #[tokio::test]
+    async fn decline_my_pending_invitation_not_found_for_other_user() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let recipient = seed_user(&pool).await;
+        let intruder = seed_user(&pool).await;
+        let (invitation_id, _token) =
+            seed_invitation(&pool, team, &test_user_email(recipient), "member", Some(recipient))
+                .await;
+
+        let res = decline_my_pending_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(intruder)),
+            Extension(SyncNotifier::new()),
+            Path(invitation_id),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+        // Still present — not deleted by a stranger.
+        let still_there = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pending_invitations WHERE id = $1)",
+        )
+        .bind(invitation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(still_there);
+    }
+
+    #[tokio::test]
+    async fn decline_my_pending_invitation_ok_for_owner() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let recipient = seed_user(&pool).await;
+        let (invitation_id, _token) =
+            seed_invitation(&pool, team, &test_user_email(recipient), "member", Some(recipient))
+                .await;
+
+        let res = decline_my_pending_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(recipient)),
+            Extension(SyncNotifier::new()),
+            Path(invitation_id),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let gone = sqlx::query_scalar::<_, bool>(
+            "SELECT NOT EXISTS(SELECT 1 FROM pending_invitations WHERE id = $1)",
+        )
+        .bind(invitation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(gone);
+    }
+
+    #[tokio::test]
+    async fn list_my_pending_invitations_scoped_to_caller() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let mine = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        add_member(&pool, team, mine).await;
+        add_member(&pool, team, other).await;
+        let (my_invitation, _t1) =
+            seed_invitation(&pool, team, &test_user_email(mine), "member", Some(mine)).await;
+        let (_their_invitation, _t2) =
+            seed_invitation(&pool, team, &test_user_email(other), "member", Some(other)).await;
+
+        let res = list_my_pending_invitations(State(pool.clone()), Extension(AuthUser(mine)))
+            .await
+            .unwrap();
+
+        let ids: Vec<Uuid> = res.0.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![my_invitation]);
+    }
+
+    #[tokio::test]
+    async fn get_invitation_not_found_for_bad_token() {
+        let pool = test_pool_or_skip!();
+        let res = get_invitation(State(pool.clone()), Path("no-such-token".to_string())).await;
+        // `Json<InvitationDetails>` (the Ok payload) has no Debug impl, so match.
+        match res {
+            Err(status) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected NOT_FOUND, got Ok"),
+        }
+    }
+}

@@ -1394,7 +1394,8 @@ mod authz_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        env_lock, member_with_role, seed_role, seed_team, seed_user, set_user_seats, set_user_tier,
+        env_lock, member_with_role, seed_role, seed_team, seed_user, set_user_seats,
+        set_user_tier, set_user_trial,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -1758,5 +1759,107 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    /// Fill `team` with `n` distinct members (one holding INVITE_MEMBERS). Returns
+    /// the inviter. Owner is not a member (seed_team doesn't add them), so the used
+    /// seat count equals `n`.
+    async fn fill_seats(pool: &sqlx::PgPool, team: Uuid, n: usize) -> Uuid {
+        let inviter = member_with_role(pool, team, PERM_INVITE_MEMBERS).await;
+        for _ in 1..n {
+            member_with_role(pool, team, 0).await;
+        }
+        inviter
+    }
+
+    #[tokio::test]
+    async fn add_member_trial_clamps_effective_seats_to_ten() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        // Big nominal cap, but an active trial clamps the effective cap to 10.
+        set_user_seats(&pool, owner, 50).await;
+        set_user_trial(&pool, owner, 7).await;
+        let team = seed_team(&pool, owner).await;
+
+        // 10 members already fill the clamped cap.
+        let inviter = fill_seats(&pool, team, 10).await;
+        let invitee = seed_user(&pool).await;
+
+        let res = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(inviter)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest {
+                user_id: Some(invitee),
+                email: None,
+                role: None,
+            }),
+        )
+        .await;
+
+        match res {
+            Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
+            Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_member_without_trial_uses_full_seat_count() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        // Same 50 seats and same 10 members, but no trial → cap stays 50, so the
+        // 11th member is admitted. Isolates the trial-only clamp from the base cap.
+        set_user_seats(&pool, owner, 50).await;
+        let team = seed_team(&pool, owner).await;
+
+        let inviter = fill_seats(&pool, team, 10).await;
+        let invitee = seed_user(&pool).await;
+
+        let res = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(inviter)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest {
+                user_id: Some(invitee),
+                email: None,
+                role: None,
+            }),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn invite_member_trial_clamps_effective_seats_to_ten() {
+        // `invite_member` (email-based) carries its own copy of the seat clamp,
+        // separate from `add_member`; lock in the trial branch here too.
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_seats(&pool, owner, 50).await;
+        set_user_trial(&pool, owner, 7).await;
+        let team = seed_team(&pool, owner).await;
+
+        // 10 members fill the clamped cap; the inviter holds INVITE_MEMBERS.
+        let inviter = fill_seats(&pool, team, 10).await;
+
+        let res = invite_member(
+            State(pool.clone()),
+            Extension(AuthUser(inviter)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(InviteMemberRequest {
+                email: "newcomer@test.local".to_string(),
+                role: None,
+            }),
+        )
+        .await;
+
+        match res {
+            Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
+            Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
+        }
     }
 }

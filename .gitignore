@@ -2,3 +2,4 @@ target/
 .worktrees/
 .env
 graphify-out/
+.cargo-home/

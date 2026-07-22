@@ -122,6 +122,9 @@ mod tests {
 
     #[test]
     fn access_token_includes_email_verified_claim() {
+        // Serialize JWT_SECRET mutation against other env-touching tests (e.g. the
+        // auth middleware tests set a different secret); the lock has no async here.
+        let _guard = crate::test_support::env_lock();
         std::env::set_var("JWT_SECRET", "test-secret");
         let user_id = Uuid::new_v4();
 
@@ -134,6 +137,7 @@ mod tests {
 
     #[test]
     fn legacy_token_without_email_verified_decodes_as_unverified() {
+        let _guard = crate::test_support::env_lock();
         std::env::set_var("JWT_SECRET", "test-secret");
         let now = Utc::now();
         let user_id = Uuid::new_v4();

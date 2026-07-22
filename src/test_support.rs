@@ -157,3 +157,50 @@ pub async fn set_user_seats(pool: &PgPool, user: Uuid, seats: i32) {
         .await
         .expect("set user seats");
 }
+
+/// Put a user on an active trial ending `days` from now. Seat-limit tests use this
+/// to exercise the trial branch that clamps the effective seat cap to 10. Note the
+/// clamp keys on `trial_ends_at IS NOT NULL`, so any non-null value triggers it
+/// regardless of `days` — the magnitude only matters if a caller later checks it.
+pub async fn set_user_trial(pool: &PgPool, user: Uuid, days: i64) {
+    sqlx::query("UPDATE users SET trial_ends_at = now() + ($1 * interval '1 day') WHERE id = $2")
+        .bind(days)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("set user trial");
+}
+
+/// The deterministic email `seed_user` assigns, so invitation tests can target a
+/// seeded user by the exact address their acceptance handler will compare against.
+pub fn test_user_email(id: Uuid) -> String {
+    format!("{id}@test.local")
+}
+
+/// Insert a pending invitation and return `(invitation_id, token)`. `user_id` is the
+/// in-app recipient binding (NULL for link-only invites). The token is a fresh UUID
+/// hex string so tests can look the invitation up by token.
+pub async fn seed_invitation(
+    pool: &PgPool,
+    team: Uuid,
+    email: &str,
+    role: &str,
+    user_id: Option<Uuid>,
+) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let token = Uuid::new_v4().simple().to_string();
+    sqlx::query(
+        "INSERT INTO pending_invitations (id, team_id, email, role, token, user_id)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(team)
+    .bind(email)
+    .bind(role)
+    .bind(&token)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("seed invitation");
+    (id, token)
+}

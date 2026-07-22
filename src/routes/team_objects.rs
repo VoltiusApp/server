@@ -423,4 +423,112 @@ mod authz_tests {
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
+
+    // ── upsert_secret gates on the *object's* edit permission, not VIEW_SECRETS ──
+
+    /// Create a connection object owned by an EDIT_CONNECTIONS member so secret
+    /// writes have a target. Returns the object_id.
+    async fn seed_connection_object(pool: &PgPool, team: Uuid) -> String {
+        let editor = member_with_role(pool, team, PERM_EDIT_CONNECTIONS).await;
+        let object_id = format!("conn-{}", Uuid::new_v4());
+        upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(editor)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: object_id.clone(),
+                object_type: TeamObjectType::Connection,
+                name: Some("box".to_string()),
+                folder_id: None,
+                metadata: serde_json::json!({}),
+            }),
+        )
+        .await
+        .expect("seed connection object");
+        object_id
+    }
+
+    fn secret_body(object_id: &str) -> UpsertSecretRequest {
+        UpsertSecretRequest {
+            secret_id: format!("sec-{}", Uuid::new_v4()),
+            object_id: object_id.to_string(),
+            secret_type: "connection_password".to_string(),
+            ciphertext: "cipher".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_forbidden_with_only_view_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        // Caller can VIEW secrets but cannot EDIT connections — the object's gate.
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(secret_body(&object_id)),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_ok_with_object_edit_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let body = secret_body(&object_id);
+        let secret_id = body.secret_id.clone();
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(body),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        // Confirm the write actually landed (not merely a non-error status).
+        let persisted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2 AND updated_by = $3)",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .bind(caller)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(persisted);
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_not_found_for_missing_object() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Even a fully-privileged caller gets 404 when the object doesn't exist.
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(secret_body("does-not-exist")),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+    }
 }

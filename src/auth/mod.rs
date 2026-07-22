@@ -130,3 +130,327 @@ pub async fn require_teams(
         None => Err(StatusCode::UNAUTHORIZED),
     }
 }
+
+#[cfg(test)]
+mod authz_tests {
+    //! Enforcement tests for the request-gating middlewares. `require_admin_key`
+    //! is the *entire* authorization surface for `routes::admin` (those handlers
+    //! carry no inline checks), and `require_pro` / `require_teams` / the banned
+    //! branch of `auth_middleware` gate large swaths of the API. Each is driven
+    //! through a throwaway `Router` via `oneshot`. These are pure (no DB), so they
+    //! run without `TEST_DATABASE_URL`.
+    use super::*;
+    use crate::test_support::env_lock;
+    use axum::{body::Body, http::Request, middleware::from_fn, routing::get, Extension, Router};
+    use tower::ServiceExt;
+
+    /// Newtype wrapper so the env-lock guard survives the test's `.await` points
+    /// without tripping clippy's `await_holding_lock` (mirrors the teams.rs tests).
+    #[allow(dead_code)]
+    struct EnvLockGuard(std::sync::MutexGuard<'static, ()>);
+
+    async fn ok_handler() -> StatusCode {
+        StatusCode::OK
+    }
+
+    async fn echo_admin(Extension(AdminEmail(email)): Extension<AdminEmail>) -> String {
+        email
+    }
+
+    // A far-future expiry; the tier middlewares don't check exp, they read `tier`.
+    fn claims(tier: &str, is_banned: bool) -> Claims {
+        Claims {
+            sub: Uuid::new_v4(),
+            exp: 4_102_444_800,
+            iat: 0,
+            kind: "access".to_string(),
+            tier: tier.to_string(),
+            trial_ends_at: None,
+            trial_used: false,
+            is_admin: false,
+            is_banned,
+            email_verified: true,
+        }
+    }
+
+    // ── require_admin_key (the admin.rs gate) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn require_admin_key_rejects_missing_key() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("ADMIN_SECRET", "sekret");
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_admin_key));
+
+        let resp = app
+            .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_admin_key_rejects_wrong_key() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("ADMIN_SECRET", "sekret");
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_admin_key));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("x-admin-key", "wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_admin_key_service_unavailable_without_secret() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::remove_var("ADMIN_SECRET");
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_admin_key));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("x-admin-key", "anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn require_admin_key_allows_correct_key_and_injects_email() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("ADMIN_SECRET", "sekret");
+        let app = Router::new()
+            .route("/x", get(echo_admin))
+            .layer(from_fn(require_admin_key));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("x-admin-key", "sekret")
+                    .header("x-admin-email", "admin@voltius.app")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"admin@voltius.app");
+    }
+
+    // ── require_pro ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn require_pro_payment_required_for_free() {
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_pro));
+
+        let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AuthClaims(claims("free", false)));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn require_pro_allows_pro() {
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_pro));
+
+        let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AuthClaims(claims("pro", false)));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_pro_unauthorized_without_claims() {
+        // No auth_middleware upstream → no AuthClaims in extensions → 401, not 402.
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_pro));
+
+        let resp = app
+            .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── require_teams ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn require_teams_payment_required_for_pro() {
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_teams));
+
+        let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        // pro is above free but below teams — must still be rejected.
+        req.extensions_mut().insert(AuthClaims(claims("pro", false)));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn require_teams_allows_business() {
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_teams));
+
+        let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AuthClaims(claims("business", false)));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_teams_allows_teams_tier() {
+        // Guards against a regression that drops the literal "teams" from the
+        // is_teams_active match and 402s real Teams (non-business) subscribers.
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(require_teams));
+
+        let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AuthClaims(claims("teams", false)));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── auth_middleware (banned gate) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_header() {
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(auth_middleware));
+
+        let resp = app
+            .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_non_bearer_header() {
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(auth_middleware));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("authorization", "Token abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_invalid_token() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(auth_middleware));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("authorization", "Bearer not.a.jwt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_forbids_banned_user() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let token =
+            jwt::create_access_token(Uuid::new_v4(), "pro", None, false, false, true, true).unwrap();
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(auth_middleware));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_allows_valid_user() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let token =
+            jwt::create_access_token(Uuid::new_v4(), "pro", None, false, false, false, true)
+                .unwrap();
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn(auth_middleware));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
