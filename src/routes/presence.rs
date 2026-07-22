@@ -184,3 +184,131 @@ pub async fn post_connection_usage(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_team_object, seed_user};
+    use crate::UsageMap;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+    use dashmap::DashMap;
+    use std::sync::Arc;
+
+    fn empty_usage() -> UsageMap {
+        Arc::new(DashMap::new())
+    }
+
+    #[tokio::test]
+    async fn post_usage_not_found_for_unknown_connection() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = post_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(empty_usage()),
+            Extension(SyncNotifier::new()),
+            Json(ConnectionUsageRequest { connection_id: "ghost".into(), in_use: true }),
+        ).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn post_usage_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        seed_team_object(&pool, team, owner, "conn-1", "connection").await;
+        let outsider = seed_user(&pool).await; // not a member of `team`
+
+        let res = post_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(empty_usage()),
+            Extension(SyncNotifier::new()),
+            Json(ConnectionUsageRequest { connection_id: "conn-1".into(), in_use: true }),
+        ).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_usage_member_sets_and_clears_usage_map() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        seed_team_object(&pool, team, owner, "conn-2", "connection").await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        let usage = empty_usage();
+
+        let set = post_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(member)),
+            Extension(usage.clone()),
+            Extension(SyncNotifier::new()),
+            Json(ConnectionUsageRequest { connection_id: "conn-2".into(), in_use: true }),
+        ).await.unwrap();
+        assert_eq!(set, StatusCode::NO_CONTENT);
+        assert!(usage.get(&member).map(|e| e.value().contains("conn-2")).unwrap_or(false));
+
+        // in_use=false removes the entry (and drops the now-empty set).
+        post_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(member)),
+            Extension(usage.clone()),
+            Extension(SyncNotifier::new()),
+            Json(ConnectionUsageRequest { connection_id: "conn-2".into(), in_use: false }),
+        ).await.unwrap();
+        assert!(usage.get(&member).is_none());
+    }
+
+    #[tokio::test]
+    async fn get_usage_empty_when_no_accessible_connections() {
+        let pool = test_pool_or_skip!();
+        let lonely = seed_user(&pool).await; // in no team
+
+        let res = get_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(lonely)),
+            Extension(empty_usage()),
+        ).await.unwrap().0;
+
+        assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_usage_reports_teammate_on_accessible_connection() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        seed_team_object(&pool, team, owner, "conn-3", "connection").await;
+        let me = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        add_member(&pool, team, me).await;
+        add_member(&pool, team, mate).await;
+
+        // Teammate is broadcasting conn-3; I am NOT (self must be excluded).
+        let usage: UsageMap = Arc::new(DashMap::new());
+        usage.entry(mate).or_default().insert("conn-3".to_string());
+        usage.entry(me).or_default().insert("conn-3".to_string());
+        // An inaccessible connection the teammate also broadcasts must be filtered out.
+        usage.entry(mate).or_default().insert("conn-not-mine".to_string());
+
+        let res = get_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(me)),
+            Extension(usage),
+        ).await.unwrap().0;
+
+        assert_eq!(res.len(), 1, "only conn-3 is accessible");
+        assert_eq!(res[0].connection_id, "conn-3");
+        assert_eq!(res[0].user_ids, vec![mate], "self excluded, only teammate listed");
+    }
+}
