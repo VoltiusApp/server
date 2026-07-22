@@ -1177,3 +1177,556 @@ pub async fn export_users_csv(State(pool): State<PgPool>) -> Result<Response<Bod
         .body(Body::from(csv))
         .unwrap())
 }
+
+// ─── Handler-body characterization tests ──────────────────────────────────────
+
+#[cfg(test)]
+mod admin_handler_tests {
+    //! DB-backed characterization of the admin handler bodies. These handlers
+    //! carry no inline authz — the admin surface is gated by the `require_admin_key`
+    //! middleware (covered separately). Here we invoke each handler directly and
+    //! assert (a) the DB row mutation and (b) the returned StatusCode, including
+    //! not-found / conflict paths. Requires `TEST_DATABASE_URL`; otherwise skips.
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{seed_team, seed_user, set_user_tier, set_user_trial};
+
+    fn admin() -> Extension<AdminEmail> {
+        Extension(AdminEmail("admin@test.local".to_string()))
+    }
+
+    fn notifier() -> Extension<SyncNotifier> {
+        Extension(SyncNotifier::new())
+    }
+
+    async fn banned_row(pool: &PgPool, id: Uuid) -> (bool, Option<String>, Option<DateTime<Utc>>) {
+        sqlx::query_as::<_, (bool, Option<String>, Option<DateTime<Utc>>)>(
+            "SELECT is_banned, ban_reason, banned_at FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn tier_of(pool: &PgPool, id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn seats_of(pool: &PgPool, id: Uuid) -> Option<i32> {
+        sqlx::query_scalar::<_, Option<i32>>("SELECT seat_count FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn trial_of(pool: &PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT trial_ends_at FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn deleted_at_of(pool: &PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>("SELECT deleted_at FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn user_exists(pool: &PgPool, id: Uuid) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn churn_rows(pool: &PgPool, id: Uuid) -> Vec<(String, String, Option<String>)> {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT from_tier, to_tier, reason FROM churn_events WHERE user_id = $1",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn patch_defaults() -> PatchUserRequest {
+        PatchUserRequest {
+            tier: None,
+            trial_ends_at: None,
+            clear_trial: None,
+            trial_used: None,
+            discount_pct: None,
+            admin_notes: None,
+            admin_override: None,
+            seat_count: None,
+        }
+    }
+
+    // ── Ban / unban ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ban_user_sets_banned_flag_reason_and_timestamp() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = ban_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(BanRequest {
+                reason: "spam".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let (is_banned, reason, banned_at) = banned_row(&pool, user).await;
+        assert!(is_banned);
+        assert_eq!(reason.as_deref(), Some("spam"));
+        assert!(banned_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn ban_user_not_found_for_unknown_user() {
+        let pool = test_pool_or_skip!();
+
+        let res = ban_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(Uuid::new_v4()),
+            Json(BanRequest {
+                reason: "spam".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unban_user_clears_banned_flag_reason_and_timestamp() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        ban_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(BanRequest {
+                reason: "spam".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let res = unban_user(State(pool.clone()), admin(), notifier(), Path(user)).await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let (is_banned, reason, banned_at) = banned_row(&pool, user).await;
+        assert!(!is_banned);
+        assert!(reason.is_none());
+        assert!(banned_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn unban_user_not_found_for_unknown_user() {
+        let pool = test_pool_or_skip!();
+
+        let res = unban_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(Uuid::new_v4()),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Tier override / seat grants (patch_user) ─────────────────────────────
+
+    #[tokio::test]
+    async fn patch_user_updates_tier_and_defaults_seats_for_teams() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await; // seeds tier 'free', seat_count NULL
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                tier: Some("teams".to_string()),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(tier_of(&pool, user).await, "teams");
+        // NULL seat_count with a teams/business tier defaults to 3.
+        assert_eq!(seats_of(&pool, user).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn patch_user_sets_explicit_seat_count() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                seat_count: Some(7),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(seats_of(&pool, user).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn patch_user_downgrade_records_churn_event() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        set_user_tier(&pool, user, "business").await;
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                tier: Some("free".to_string()),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(tier_of(&pool, user).await, "free");
+        let churn = churn_rows(&pool, user).await;
+        assert_eq!(churn.len(), 1);
+        assert_eq!(churn[0].0, "business");
+        assert_eq!(churn[0].1, "free");
+        assert_eq!(churn[0].2.as_deref(), Some("admin"));
+    }
+
+    #[tokio::test]
+    async fn patch_user_upgrade_records_no_churn_event() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await; // 'free'
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                tier: Some("pro".to_string()),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(tier_of(&pool, user).await, "pro");
+        assert!(churn_rows(&pool, user).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn patch_user_clear_trial_nulls_trial_ends_at() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        set_user_trial(&pool, user, 30).await;
+        assert!(trial_of(&pool, user).await.is_some());
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                clear_trial: Some(true),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert!(trial_of(&pool, user).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_user_not_found_for_unknown_user() {
+        let pool = test_pool_or_skip!();
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(Uuid::new_v4()),
+            Json(PatchUserRequest {
+                tier: Some("pro".to_string()),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Extend trial ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn extend_trial_sets_future_trial_ends_at_and_clears_used() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = extend_trial(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(ExtendTrialRequest { days: 14 }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let ends = trial_of(&pool, user).await.expect("trial set");
+        let delta = ends - Utc::now();
+        assert!(
+            delta > Duration::days(13) && delta < Duration::days(15),
+            "trial should end ~14 days out, got {delta}"
+        );
+        let used = sqlx::query_scalar::<_, bool>("SELECT trial_used FROM users WHERE id = $1")
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!used);
+    }
+
+    #[tokio::test]
+    async fn extend_trial_not_found_for_unknown_user() {
+        let pool = test_pool_or_skip!();
+
+        let res = extend_trial(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(Uuid::new_v4()),
+            Json(ExtendTrialRequest { days: 14 }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Feature flags ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_flag_inserts_then_upserts() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = set_flag(
+            State(pool.clone()),
+            admin(),
+            Path((user, "beta".to_string())),
+            Json(SetFlagRequest { enabled: true }),
+        )
+        .await;
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let enabled = sqlx::query_scalar::<_, bool>(
+            "SELECT enabled FROM user_feature_flags WHERE user_id = $1 AND flag = 'beta'",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(enabled);
+
+        let res = set_flag(
+            State(pool.clone()),
+            admin(),
+            Path((user, "beta".to_string())),
+            Json(SetFlagRequest { enabled: false }),
+        )
+        .await;
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let (enabled, count) = sqlx::query_as::<_, (bool, i64)>(
+            "SELECT bool_or(enabled), COUNT(*) FROM user_feature_flags WHERE user_id = $1 AND flag = 'beta'",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!enabled);
+        assert_eq!(count, 1); // upsert, not a second row
+    }
+
+    // ── Delete / restore ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_user_soft_marks_deleted_at() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Query(DeleteQuery { force: None }),
+            Json(DeleteBody {
+                reason: Some("cleanup".to_string()),
+            }),
+        )
+        .await;
+
+        let (status, _) = res.expect("soft delete ok");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(deleted_at_of(&pool, user).await.is_some());
+        assert!(user_exists(&pool, user).await); // soft, row still present
+    }
+
+    #[tokio::test]
+    async fn delete_user_soft_conflict_when_already_deleted() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let (_, _body) = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Query(DeleteQuery { force: None }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await
+        .expect("first soft delete ok");
+
+        let res = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Query(DeleteQuery { force: None }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await;
+
+        let (status, _) = res.expect_err("second delete should conflict");
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn delete_user_not_found_for_unknown_user() {
+        let pool = test_pool_or_skip!();
+
+        let res = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(Uuid::new_v4()),
+            Query(DeleteQuery { force: None }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await;
+
+        let (status, _) = res.expect_err("unknown user should 404");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_user_force_hard_deletes_row() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Query(DeleteQuery { force: Some(true) }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await;
+
+        let (status, _) = res.expect("hard delete ok");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!user_exists(&pool, user).await); // row gone
+    }
+
+    #[tokio::test]
+    async fn delete_user_force_conflict_when_referenced_by_fk() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        seed_team(&pool, owner).await; // teams.owner_id FK RESTRICT blocks the purge
+
+        let res = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(owner),
+            Query(DeleteQuery { force: Some(true) }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await;
+
+        let (status, _) = res.expect_err("fk should block hard delete");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(user_exists(&pool, owner).await); // still present
+    }
+
+    #[tokio::test]
+    async fn restore_user_clears_deleted_at() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let (_, _body) = delete_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Query(DeleteQuery { force: None }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await
+        .expect("soft delete ok");
+        assert!(deleted_at_of(&pool, user).await.is_some());
+
+        let res = restore_user(State(pool.clone()), admin(), Path(user)).await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert!(deleted_at_of(&pool, user).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_user_not_found_when_not_deleted() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await; // never deleted
+
+        let res = restore_user(State(pool.clone()), admin(), Path(user)).await;
+
+        // No matching row (WHERE deleted_at IS NOT NULL) → rows_affected 0 → 404.
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+}
