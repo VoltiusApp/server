@@ -139,3 +139,151 @@ pub async fn delete_object_pref(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_team_object, seed_user};
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+
+    #[tokio::test]
+    async fn list_prefs_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = list_object_prefs(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn list_prefs_is_user_scoped() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let alice = seed_user(&pool).await;
+        let bob = seed_user(&pool).await;
+        add_member(&pool, team, alice).await;
+        add_member(&pool, team, bob).await;
+        seed_team_object(&pool, team, owner, "obj-a", "connection").await;
+        seed_team_object(&pool, team, owner, "obj-b", "connection").await;
+
+        // Alice pins obj-a; Bob pins obj-b.
+        upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(alice)),
+            Path((team, "obj-a".to_string())), Json(UpsertPrefRequest { pinned: Some(true) }),
+        ).await.unwrap();
+        upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(bob)),
+            Path((team, "obj-b".to_string())), Json(UpsertPrefRequest { pinned: Some(true) }),
+        ).await.unwrap();
+
+        let alice_prefs = list_object_prefs(State(pool.clone()), Extension(AuthUser(alice)), Path(team)).await.unwrap().0;
+        assert_eq!(alice_prefs.len(), 1);
+        assert_eq!(alice_prefs[0].object_id, "obj-a");
+    }
+
+    #[tokio::test]
+    async fn upsert_pref_forbidden_for_non_member_even_if_object_missing() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        // 403 (membership) must win over 404 (object existence): outsider + no object.
+        let res = upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(outsider)),
+            Path((team, "nope".to_string())), Json(UpsertPrefRequest { pinned: Some(true) }),
+        ).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn upsert_pref_not_found_for_missing_object() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+
+        let res = upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(member)),
+            Path((team, "ghost".to_string())), Json(UpsertPrefRequest { pinned: Some(true) }),
+        ).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upsert_pref_sets_and_clears() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        seed_team_object(&pool, team, owner, "obj-1", "connection").await;
+
+        // Set pinned=true → NO_CONTENT, and it shows up in the list read-back.
+        let set = upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(member)),
+            Path((team, "obj-1".to_string())), Json(UpsertPrefRequest { pinned: Some(true) }),
+        ).await.unwrap();
+        assert_eq!(set, StatusCode::NO_CONTENT);
+        let prefs = list_object_prefs(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await.unwrap().0;
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].pinned, Some(true));
+
+        // pinned=None clears the row.
+        upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(member)),
+            Path((team, "obj-1".to_string())), Json(UpsertPrefRequest { pinned: None }),
+        ).await.unwrap();
+        let after = list_object_prefs(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await.unwrap().0;
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_pref_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = delete_object_pref(
+            State(pool.clone()), Extension(AuthUser(outsider)),
+            Path((team, "whatever".to_string())),
+        ).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn delete_pref_removes_row() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        seed_team_object(&pool, team, owner, "obj-2", "connection").await;
+        upsert_object_pref(
+            State(pool.clone()), Extension(AuthUser(member)),
+            Path((team, "obj-2".to_string())), Json(UpsertPrefRequest { pinned: Some(true) }),
+        ).await.unwrap();
+
+        let del = delete_object_pref(
+            State(pool.clone()), Extension(AuthUser(member)),
+            Path((team, "obj-2".to_string())),
+        ).await.unwrap();
+        assert_eq!(del, StatusCode::NO_CONTENT);
+
+        let prefs = list_object_prefs(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await.unwrap().0;
+        assert!(prefs.is_empty());
+    }
+}

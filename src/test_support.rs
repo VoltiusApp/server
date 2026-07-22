@@ -204,3 +204,29 @@ pub async fn seed_invitation(
     .expect("seed invitation");
     (id, token)
 }
+
+/// Insert a team-vault object row directly (bypassing the write handler) so
+/// presence/prefs tests have a real object to reference. `object_type` must be
+/// one of the CHECK-constrained values (e.g. "connection"). `updated_by` is set
+/// to the team owner for FK validity.
+pub async fn seed_team_object(
+    pool: &PgPool,
+    team: Uuid,
+    owner: Uuid,
+    object_id: &str,
+    object_type: &str,
+) {
+    sqlx::query(
+        "INSERT INTO team_vault_objects
+           (team_id, object_id, object_type, vault_id, updated_by)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(team)
+    .bind(object_id)
+    .bind(object_type)
+    .bind(Uuid::new_v4())
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("seed team object");
+}
