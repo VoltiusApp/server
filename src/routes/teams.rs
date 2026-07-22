@@ -1616,4 +1616,87 @@ mod authz_tests {
 
         assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
     }
+
+    #[tokio::test]
+    async fn update_role_forbidden_without_manage_roles() {
+        // Same shape as create_role: no LEMONSQUEEZY_API_KEY → business gate
+        // bypassed, so PERM_MANAGE_ROLES is what rejects. Both gates fire
+        // before the role lookup, so a random role_id is fine. Hold the env
+        // lock (without mutating anything) so this can't race a concurrently
+        // running BillingEnv-holding test that sets LEMONSQUEEZY_API_KEY.
+        let _env = EnvLockGuard(env_lock());
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_MANAGE_MEMBERS).await;
+
+        let res = update_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, Uuid::new_v4())),
+            Json(UpdateRoleBody {
+                name: Some("renamed".to_string()),
+                color: None,
+                permissions: None,
+                position: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn update_role_payment_required_when_owner_not_business() {
+        let _env = BillingEnv::on();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await; // default tier 'free'
+        let team = seed_team(&pool, owner).await;
+        // Caller HAS manage-roles, so only the business gate can reject.
+        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+
+        let res = update_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, Uuid::new_v4())),
+            Json(UpdateRoleBody {
+                name: Some("renamed".to_string()),
+                color: None,
+                permissions: None,
+                position: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn update_role_ok_when_business_and_manage_roles() {
+        let _env = BillingEnv::on();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        let role = seed_role(&pool, team, "editable", PERM_VIEW_SECRETS).await; // non-builtin
+
+        let res = update_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, role)),
+            Json(UpdateRoleBody {
+                name: Some("renamed".to_string()),
+                color: None,
+                permissions: None,
+                position: None,
+            }),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
 }
