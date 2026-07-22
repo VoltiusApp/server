@@ -345,7 +345,6 @@ mod authz_tests {
     use axum::extract::{Query, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
-    use base64::Engine as _;
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -372,7 +371,7 @@ mod authz_tests {
         let bob = seed_user(&pool).await;
 
         // Bob stores a blob under device "shared-name".
-        put_blob(
+        let _ = put_blob(
             State(pool.clone()),
             Extension(AuthUser(bob)),
             Extension(SyncNotifier::new()),
@@ -437,7 +436,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
 
-        put_blob(
+        let _ = put_blob(
             State(pool.clone()),
             Extension(AuthUser(user)),
             Extension(SyncNotifier::new()),
