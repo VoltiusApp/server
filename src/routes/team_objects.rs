@@ -332,3 +332,95 @@ pub async fn upsert_secret(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::permissions::{PERM_EDIT_CONNECTIONS, PERM_VIEW_SECRETS};
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use axum::extract::{Path, State};
+    use axum::{Extension, Json};
+
+    #[tokio::test]
+    async fn list_objects_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await; // never added to team
+
+        let res = list_objects(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Path(team),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn upsert_object_forbidden_without_edit_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Member can VIEW secrets but cannot EDIT connections.
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: Some("box".to_string()),
+                folder_id: None,
+                metadata: serde_json::json!({}),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn upsert_object_ok_with_edit_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-2".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: Some("box".to_string()),
+                folder_id: None,
+                metadata: serde_json::json!({}),
+            }),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn list_secrets_forbidden_without_view_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await; // no VIEW_SECRETS
+
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+}
