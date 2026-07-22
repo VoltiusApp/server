@@ -70,6 +70,26 @@ pub async fn seed_user(pool: &PgPool) -> Uuid {
     id
 }
 
+/// Seed a user with a real Argon2 `auth_hash` for `auth_key` and the given
+/// `account_id`, so `login` handler tests can present verifiable credentials
+/// (the default `seed_user` stores a non-verifiable placeholder hash).
+pub async fn seed_user_with_credentials(pool: &PgPool, account_id: Uuid, auth_key: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash = crate::auth::password::hash_auth_key(auth_key).expect("hash auth key");
+    sqlx::query(
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name)
+         VALUES ($1, $2, $3, $4, 'test-pubkey', 'Test User')",
+    )
+    .bind(id)
+    .bind(format!("{id}@test.local"))
+    .bind(account_id)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .expect("seed user with credentials");
+    id
+}
+
 /// Insert a team owned by `owner` and return its id.
 pub async fn seed_team(pool: &PgPool, owner: Uuid) -> Uuid {
     let id = Uuid::new_v4();

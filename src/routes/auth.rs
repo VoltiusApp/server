@@ -827,3 +827,344 @@ pub async fn delete_account(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod handler_tests {
+    //! DB-backed characterization of the `register` / `login` handler bodies,
+    //! focused on the effective tier baked into the issued session (response +
+    //! decoded JWT claim). Registration tier depends on self-hosted mode; login
+    //! reflects `entitlement::effective_tier` (the shipped expired-trial fix).
+    //! Requires TEST_DATABASE_URL.
+    use super::*;
+    use crate::auth::jwt::validate_token;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{
+        env_lock, seed_user_with_credentials, set_user_tier, set_user_trial,
+    };
+    use axum::extract::State;
+
+    /// Holds the env lock, pins JWT_SECRET so issued tokens decode, and toggles
+    /// LEMONSQUEEZY_API_KEY (the self-hosted signal), restoring it on drop.
+    /// Wrapping the guard in a struct field keeps clippy's `await_holding_lock`
+    /// quiet while the lock is held across the handler's `.await` points.
+    #[allow(dead_code)]
+    struct EnvGuard {
+        lock: std::sync::MutexGuard<'static, ()>,
+        prev_ls: Option<String>,
+    }
+    impl EnvGuard {
+        fn new(self_hosted: bool) -> Self {
+            let lock = env_lock();
+            std::env::set_var("JWT_SECRET", "ci-test-secret");
+            let prev_ls = std::env::var("LEMONSQUEEZY_API_KEY").ok();
+            if self_hosted {
+                std::env::remove_var("LEMONSQUEEZY_API_KEY");
+            } else {
+                std::env::set_var("LEMONSQUEEZY_API_KEY", "test-key");
+            }
+            EnvGuard { lock, prev_ls }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev_ls {
+                Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
+                None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
+            }
+        }
+    }
+
+    fn register_req(email: &str, account_id: Uuid, fp: Option<&str>) -> RegisterRequest {
+        RegisterRequest {
+            email: email.to_string(),
+            account_id,
+            auth_key: "auth-key-secret".to_string(),
+            public_key: None,
+            wrapped_user_secrets: None,
+            machine_fingerprint: fp.map(str::to_string),
+        }
+    }
+
+    async fn stored_tier(pool: &PgPool, id: Uuid) -> (String, Option<DateTime<Utc>>) {
+        sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
+            "SELECT subscription_tier, trial_ends_at FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("fetch stored tier")
+    }
+
+    // ── register ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_self_hosted_grants_business_no_trial() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+
+        let (status, Json(resp)) = register(State(pool.clone()), Json(register_req(&email, account_id, None)))
+            .await
+            .expect("register ok");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.tier, "business");
+        assert_eq!(resp.trial_ends_at, None);
+
+        let (db_tier, db_trial) = stored_tier(&pool, resp.user_id).await;
+        assert_eq!(db_tier, "business");
+        assert_eq!(db_trial, None);
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "business");
+        assert_eq!(claims.trial_ends_at, None);
+    }
+
+    #[tokio::test]
+    async fn register_saas_grants_pro_with_trial() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        let before = Utc::now().timestamp();
+
+        let (status, Json(resp)) = register(State(pool.clone()), Json(register_req(&email, account_id, None)))
+            .await
+            .expect("register ok");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.tier, "pro");
+        let ends = resp.trial_ends_at.expect("trial should be set");
+        // ~14 days out, allowing generous slack.
+        assert!(ends > before + 13 * 86_400, "trial ends too soon: {ends}");
+        assert!(ends < before + 15 * 86_400, "trial ends too late: {ends}");
+
+        let (db_tier, db_trial) = stored_tier(&pool, resp.user_id).await;
+        assert_eq!(db_tier, "pro");
+        assert!(db_trial.is_some());
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "pro");
+        assert_eq!(claims.trial_ends_at, Some(ends));
+    }
+
+    #[tokio::test]
+    async fn register_saas_trial_blocked_grants_free() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let fp = format!("fp-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO trial_fingerprints (fingerprint) VALUES ($1)")
+            .bind(&fp)
+            .execute(&pool)
+            .await
+            .expect("seed fingerprint");
+        let account_id = Uuid::new_v4();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+
+        let (status, Json(resp)) =
+            register(State(pool.clone()), Json(register_req(&email, account_id, Some(&fp))))
+                .await
+                .expect("register ok");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.tier, "free");
+        assert_eq!(resp.trial_ends_at, None);
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "free");
+    }
+
+    #[tokio::test]
+    async fn register_duplicate_email_conflicts() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+
+        let (status, _) = register(
+            State(pool.clone()),
+            Json(register_req(&email, Uuid::new_v4(), None)),
+        )
+        .await
+        .expect("first register ok");
+        assert_eq!(status, StatusCode::CREATED);
+
+        match register(
+            State(pool.clone()),
+            Json(register_req(&email, Uuid::new_v4(), None)),
+        )
+        .await
+        {
+            Err(s) => assert_eq!(s, StatusCode::CONFLICT),
+            Ok(_) => panic!("expected CONFLICT on duplicate email"),
+        }
+    }
+
+    // ── login: effective tier in the issued session ───────────────────────────
+
+    async fn login_of(pool: &PgPool, account_id: Uuid) -> Result<AuthResponse, StatusCode> {
+        login(
+            State(pool.clone()),
+            Json(LoginRequest {
+                account_id,
+                auth_key: "auth-key-secret".to_string(),
+            }),
+        )
+        .await
+        .map(|Json(r)| r)
+    }
+
+    #[tokio::test]
+    async fn login_active_trial_pro_issues_pro() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        set_user_tier(&pool, uid, "pro").await;
+        set_user_trial(&pool, uid, 30).await;
+
+        let resp = login_of(&pool, account_id).await.expect("login ok");
+        assert_eq!(resp.tier, "pro");
+        assert!(resp.trial_ends_at.is_some());
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "pro");
+        assert!(claims.trial_ends_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn login_expired_trial_pro_downgrades_to_free() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        set_user_tier(&pool, uid, "pro").await;
+        set_user_trial(&pool, uid, -1).await; // trial already ended
+
+        let resp = login_of(&pool, account_id).await.expect("login ok");
+        // Session reflects EFFECTIVE tier, not the stored "pro".
+        assert_eq!(resp.tier, "free");
+        assert_eq!(resp.trial_ends_at, None);
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "free");
+        assert_eq!(claims.trial_ends_at, None);
+        assert!(claims.trial_used, "expired trial should be marked consumed");
+
+        // The stored tier is untouched — only the issued session is downgraded.
+        let (db_tier, _) = stored_tier(&pool, uid).await;
+        assert_eq!(db_tier, "pro");
+    }
+
+    #[tokio::test]
+    async fn login_expired_business_trial_downgrades_to_free() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        set_user_tier(&pool, uid, "business").await;
+        set_user_trial(&pool, uid, -1).await;
+
+        let resp = login_of(&pool, account_id).await.expect("login ok");
+        assert_eq!(resp.tier, "free");
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "free");
+    }
+
+    #[tokio::test]
+    async fn login_paid_pro_survives_stale_trial() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        set_user_tier(&pool, uid, "pro").await;
+        set_user_trial(&pool, uid, -30).await; // stale trial timestamp
+        sqlx::query("UPDATE users SET ls_subscription_id = 'sub_paid' WHERE id = $1")
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("set paid sub");
+
+        let resp = login_of(&pool, account_id).await.expect("login ok");
+        // Paid subscription keeps the tier despite the past trial timestamp.
+        assert_eq!(resp.tier, "pro");
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "pro");
+    }
+
+    #[tokio::test]
+    async fn login_admin_override_survives_expired_trial() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        set_user_tier(&pool, uid, "pro").await;
+        set_user_trial(&pool, uid, -30).await;
+        sqlx::query("UPDATE users SET admin_override = TRUE WHERE id = $1")
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("set admin override");
+
+        let resp = login_of(&pool, account_id).await.expect("login ok");
+        assert_eq!(resp.tier, "pro");
+
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "pro");
+    }
+
+    // ── login: auth gates ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn login_banned_user_forbidden() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        sqlx::query("UPDATE users SET is_banned = TRUE WHERE id = $1")
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("ban user");
+
+        match login_of(&pool, account_id).await {
+            Err(s) => assert_eq!(s, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected FORBIDDEN for banned user"),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_wrong_auth_key_unauthorized() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+
+        let res = login(
+            State(pool.clone()),
+            Json(LoginRequest {
+                account_id,
+                auth_key: "wrong-key".to_string(),
+            }),
+        )
+        .await;
+
+        match res {
+            Err(s) => assert_eq!(s, StatusCode::UNAUTHORIZED),
+            Ok(_) => panic!("expected UNAUTHORIZED for wrong auth key"),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_unknown_account_unauthorized() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+
+        match login_of(&pool, Uuid::new_v4()).await {
+            Err(s) => assert_eq!(s, StatusCode::UNAUTHORIZED),
+            Ok(_) => panic!("expected UNAUTHORIZED for unknown account"),
+        }
+    }
+}
