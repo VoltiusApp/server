@@ -404,3 +404,88 @@ pub async fn report_client_event(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::permissions::{PERM_CONNECT, PERM_VIEW_AUDIT_LOG};
+    use crate::test_pool_or_skip;
+    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use axum::extract::{Path, Query, State};
+    use axum::Extension;
+
+    fn empty_audit_query() -> AuditQuery {
+        AuditQuery {
+            page: None,
+            per_page: None,
+            vault_id: None,
+            action: None,
+            actor_id: None,
+            from: None,
+            to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_audit_logs_forbidden_without_view_audit_log() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await; // no VIEW_AUDIT_LOG
+
+        let res = list_audit_logs(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Path(team),
+            Query(empty_audit_query()),
+        )
+        .await;
+
+        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+    }
+
+    #[tokio::test]
+    async fn list_audit_logs_ok_with_view_audit_log() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_VIEW_AUDIT_LOG).await;
+
+        let res = list_audit_logs(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Path(team),
+            Query(empty_audit_query()),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn export_audit_logs_forbidden_without_view_audit_log() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        let res = export_audit_logs(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Path(team),
+            Query(ExportQuery {
+                format: None,
+                vault_id: None,
+                action: None,
+                actor_id: None,
+                from: None,
+                to: None,
+            }),
+        )
+        .await;
+
+        // export returns `Result<impl IntoResponse, StatusCode>`; the Err arm is the gate.
+        assert_eq!(res.err(), Some(axum::http::StatusCode::FORBIDDEN));
+    }
+}
