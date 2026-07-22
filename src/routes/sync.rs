@@ -334,3 +334,145 @@ pub async fn sync_stream(
             .text("heartbeat"),
     )
 }
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::seed_user;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+    use base64::Engine as _;
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn get_blob_not_found_when_absent() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = get_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Query(GetBlobQuery { device_id: None }),
+        ).await;
+
+        assert!(matches!(res, Err(StatusCode::NOT_FOUND)));
+    }
+
+    #[tokio::test]
+    async fn get_blob_is_isolated_across_users() {
+        let pool = test_pool_or_skip!();
+        let alice = seed_user(&pool).await;
+        let bob = seed_user(&pool).await;
+
+        // Bob stores a blob under device "shared-name".
+        put_blob(
+            State(pool.clone()),
+            Extension(AuthUser(bob)),
+            Extension(SyncNotifier::new()),
+            Json(PutBlobRequest {
+                device_id: "shared-name".into(),
+                blob: b64(b"bob-secret"),
+                metadata: serde_json::json!({}),
+            }),
+        ).await.unwrap();
+
+        // Alice asks for the SAME device_id → must not see Bob's blob.
+        let res = get_blob(
+            State(pool.clone()),
+            Extension(AuthUser(alice)),
+            Query(GetBlobQuery { device_id: Some("shared-name".into()) }),
+        ).await;
+
+        assert!(matches!(res, Err(StatusCode::NOT_FOUND)), "cross-user blob must not leak");
+    }
+
+    #[tokio::test]
+    async fn put_blob_rejects_invalid_base64() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        let res = put_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(SyncNotifier::new()),
+            Json(PutBlobRequest {
+                device_id: "d1".into(),
+                blob: "!!!not-base64!!!".into(),
+                metadata: serde_json::json!({}),
+            }),
+        ).await;
+
+        assert!(matches!(res, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn put_blob_rejects_oversize_payload() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let too_big = vec![0u8; 5 * 1024 * 1024 + 1]; // MAX_BLOB_SIZE + 1
+
+        let res = put_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(SyncNotifier::new()),
+            Json(PutBlobRequest {
+                device_id: "d1".into(),
+                blob: b64(&too_big),
+                metadata: serde_json::json!({}),
+            }),
+        ).await;
+
+        assert!(matches!(res, Err(StatusCode::PAYLOAD_TOO_LARGE)));
+    }
+
+    #[tokio::test]
+    async fn put_get_list_delete_roundtrip() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        put_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(SyncNotifier::new()),
+            Json(PutBlobRequest {
+                device_id: "dev-x".into(),
+                blob: b64(b"payload"),
+                metadata: serde_json::json!({"os": "linux"}),
+            }),
+        ).await.unwrap();
+
+        // get returns the stored bytes (re-encoded base64).
+        let Json(got) = get_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Query(GetBlobQuery { device_id: Some("dev-x".into()) }),
+        ).await.unwrap();
+        assert_eq!(got.blob, b64(b"payload"));
+
+        // list_devices shows the one device.
+        let Json(devices) = list_devices(State(pool.clone()), Extension(AuthUser(user))).await.unwrap();
+        assert_eq!(devices.devices.len(), 1);
+        assert_eq!(devices.devices[0].device_id, "dev-x");
+
+        // delete removes it → subsequent get is 404.
+        let del = delete_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            axum::extract::Path("dev-x".to_string()),
+        ).await.unwrap();
+        assert_eq!(del, StatusCode::NO_CONTENT);
+        let after = get_blob(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Query(GetBlobQuery { device_id: Some("dev-x".into()) }),
+        ).await;
+        assert!(matches!(after, Err(StatusCode::NOT_FOUND)));
+    }
+}
