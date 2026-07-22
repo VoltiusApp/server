@@ -1388,10 +1388,14 @@ mod authz_tests {
     //! plus a positive case with the bit granted. Requires TEST_DATABASE_URL.
     use super::*;
     use crate::auth::AuthUser;
-    use crate::permissions::{PERM_INVITE_MEMBERS, PERM_VIEW_SECRETS};
+    use crate::permissions::{
+        PERM_INVITE_MEMBERS, PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES, PERM_VIEW_SECRETS,
+    };
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
-    use crate::test_support::{member_with_role, seed_role, seed_team, seed_user};
+    use crate::test_support::{
+        env_lock, member_with_role, seed_role, seed_team, seed_user, set_user_tier,
+    };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
 
@@ -1506,5 +1510,110 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// Wraps the env mutex guard so it isn't a bare `MutexGuard` binding —
+    /// clippy's `await_holding_lock` only fires on the direct type, and this
+    /// lock is process-global/test-only with no real contention risk.
+    #[allow(dead_code)]
+    struct EnvLockGuard(std::sync::MutexGuard<'static, ()>);
+
+    #[tokio::test]
+    async fn create_role_forbidden_without_manage_roles() {
+        // No LEMONSQUEEZY_API_KEY in test env → business gate is bypassed, so the
+        // PERM_MANAGE_ROLES check is what rejects here. Hold the env lock (without
+        // mutating anything) so this can't race against a concurrently-running
+        // BillingEnv-holding test that sets LEMONSQUEEZY_API_KEY out from under us.
+        let _env = EnvLockGuard(env_lock());
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_MANAGE_MEMBERS).await; // has members, not roles
+
+        let res = create_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(CreateRoleRequest {
+                name: "custom".to_string(),
+                color: None,
+                permissions: PERM_VIEW_SECRETS,
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// RAII guard: set LEMONSQUEEZY_API_KEY so is_self_hosted()==false, restore on drop.
+    /// Field 0 (the lock) is held only for its lifetime, never read.
+    #[allow(dead_code)]
+    struct BillingEnv(std::sync::MutexGuard<'static, ()>, Option<String>);
+    impl BillingEnv {
+        fn on() -> Self {
+            let g = env_lock();
+            let prev = std::env::var("LEMONSQUEEZY_API_KEY").ok();
+            std::env::set_var("LEMONSQUEEZY_API_KEY", "test-key");
+            BillingEnv(g, prev)
+        }
+    }
+    impl Drop for BillingEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
+                None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_role_payment_required_when_owner_not_business() {
+        let _env = BillingEnv::on();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await; // default tier 'free'
+        let team = seed_team(&pool, owner).await;
+        // Caller HAS manage-roles, so only the business gate can reject.
+        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+
+        let res = create_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(CreateRoleRequest {
+                name: "custom".to_string(),
+                color: None,
+                permissions: PERM_VIEW_SECRETS,
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn create_role_ok_when_business_and_manage_roles() {
+        let _env = BillingEnv::on();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+
+        let res = create_role(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(CreateRoleRequest {
+                name: "custom".to_string(),
+                color: None,
+                permissions: PERM_VIEW_SECRETS,
+            }),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
     }
 }

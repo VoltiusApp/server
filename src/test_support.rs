@@ -135,3 +135,14 @@ pub async fn member_with_role(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
     assign_role(pool, team, user, role).await;
     user
 }
+
+/// Set a user's `subscription_tier` (e.g. "business"). Used by tier-gated
+/// handler tests; the seed default is 'free'.
+pub async fn set_user_tier(pool: &PgPool, user: Uuid, tier: &str) {
+    sqlx::query("UPDATE users SET subscription_tier = $1 WHERE id = $2")
+        .bind(tier)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("set user tier");
+}
