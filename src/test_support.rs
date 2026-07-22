@@ -146,3 +146,14 @@ pub async fn set_user_tier(pool: &PgPool, user: Uuid, tier: &str) {
         .await
         .expect("set user tier");
 }
+
+/// Set a user's seat cap (`users.seat_count`). NULL means unlimited; this sets a
+/// concrete cap for seat-limit tests.
+pub async fn set_user_seats(pool: &PgPool, user: Uuid, seats: i32) {
+    sqlx::query("UPDATE users SET seat_count = $1 WHERE id = $2")
+        .bind(seats)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("set user seats");
+}

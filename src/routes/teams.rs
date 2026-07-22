@@ -1394,7 +1394,7 @@ mod authz_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        env_lock, member_with_role, seed_role, seed_team, seed_user, set_user_tier,
+        env_lock, member_with_role, seed_role, seed_team, seed_user, set_user_seats, set_user_tier,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -1693,6 +1693,66 @@ mod authz_tests {
                 color: None,
                 permissions: None,
                 position: None,
+            }),
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn add_member_payment_required_when_seats_exhausted() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        // No trial_ends_at (default NULL) → effective cap == seat_count.
+        set_user_seats(&pool, owner, 1).await;
+        let team = seed_team(&pool, owner).await;
+
+        // A caller that CAN invite, so only the seat cap can reject.
+        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        // `member_with_role` adds `inviter` to `team_members`; `seed_team` does
+        // NOT add the owner, so `inviter` alone already fills the single seat.
+        let invitee = seed_user(&pool).await;
+
+        let res = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(inviter)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest {
+                user_id: Some(invitee),
+                email: None,
+                role: None,
+            }),
+        )
+        .await;
+
+        // `InviteMemberResponse` (the Ok payload) has no `Debug` impl, so
+        // `unwrap_err()` doesn't typecheck here — match instead.
+        match res {
+            Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
+            Ok(_) => panic!("expected PAYMENT_REQUIRED, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_member_ok_when_seats_available() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_seats(&pool, owner, 50).await;
+        let team = seed_team(&pool, owner).await;
+        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let invitee = seed_user(&pool).await;
+
+        let res = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(inviter)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest {
+                user_id: Some(invitee),
+                email: None,
+                role: None,
             }),
         )
         .await;
