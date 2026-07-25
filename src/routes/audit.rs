@@ -339,6 +339,15 @@ const CLIENT_WHITELIST: &[&str] = &[
     "port_forward.created",
     "port_forward.updated",
     "port_forward.deleted",
+    // AI agent (#56). Command text is deliberately NOT part of any payload the
+    // client sends for these — see reportAgentAuditEvent on the client side.
+    "agent.grant_created",
+    "agent.grant_revoked",
+    "agent.mode_changed",
+    "agent.session_opened",
+    "agent.session_closed",
+    "agent.command_run",
+    "agent.action_denied",
 ];
 
 #[derive(Deserialize)]
@@ -414,6 +423,29 @@ mod authz_tests {
     use crate::test_support::{member_with_role, seed_team, seed_user};
     use axum::extract::{Path, Query, State};
     use axum::Extension;
+
+    #[test]
+    fn accepts_agent_actions() {
+        for action in [
+            "agent.grant_created",
+            "agent.grant_revoked",
+            "agent.mode_changed",
+            "agent.session_opened",
+            "agent.session_closed",
+            "agent.command_run",
+            "agent.action_denied",
+        ] {
+            assert!(
+                CLIENT_WHITELIST.contains(&action),
+                "{action} must be accepted or the client's team audit trail is silently empty"
+            );
+        }
+    }
+
+    #[test]
+    fn still_rejects_an_unlisted_action() {
+        assert!(!CLIENT_WHITELIST.contains(&"agent.exfiltrate"));
+    }
 
     fn empty_audit_query() -> AuditQuery {
         AuditQuery {
