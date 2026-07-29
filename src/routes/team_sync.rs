@@ -93,6 +93,46 @@ pub async fn get_my_vault_key(
     }))
 }
 
+// ─── GET /v1/teams/:team_id/vault-key/holders ────────────────────────────────
+
+/// List the user_ids that already hold a wrapped copy of the team vault key.
+///
+/// A key-holder client uses this to reconcile distribution: members present in
+/// `team_members` but absent from this list are missing their key and need one
+/// wrapped for them (issue #41). Returns only user_ids — no key material — so
+/// the response is safe for any member who can view the vault to read.
+pub async fn get_vault_key_holders(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Path(team_id): Path<Uuid>,
+) -> Result<Json<Vec<Uuid>>, StatusCode> {
+    if !is_team_member(&pool, team_id, auth.0).await? {
+        warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to list vault key holders");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_teams_tier_for_vault(&pool, team_id).await?;
+    crate::permissions::require_all_team_permissions(
+        &pool,
+        team_id,
+        auth.0,
+        &[crate::permissions::PERM_VIEW_SECRETS],
+    )
+    .await?;
+
+    let holders = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM team_vault_keys WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to list vault key holders");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(holders))
+}
+
 // ─── PUT /v1/teams/:team_id/vault-key ────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -350,5 +390,82 @@ mod tests {
         );
 
         assert_eq!(targets, vec![target]);
+    }
+
+    // ─── GET /v1/teams/:team_id/vault-key/holders (issue #41) ────────────────
+
+    use crate::auth::AuthUser;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, assign_role, seed_role, seed_team, seed_user};
+    use axum::extract::{Path, State};
+    use axum::Extension;
+
+    /// Give `user` a role granting PERM_VIEW_SECRETS in `team`.
+    async fn grant_view_secrets(pool: &PgPool, team: Uuid, user: Uuid) {
+        let role = seed_role(pool, team, "viewer", crate::permissions::PERM_VIEW_SECRETS).await;
+        assign_role(pool, team, user, role).await;
+    }
+
+    async fn insert_vault_key(pool: &PgPool, team: Uuid, user: Uuid, wrapped_by: Uuid) {
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by) \
+             VALUES ($1, $2, 'wrapped', $3)",
+        )
+        .bind(team)
+        .bind(user)
+        .bind(wrapped_by)
+        .execute(pool)
+        .await
+        .expect("insert vault key");
+    }
+
+    #[tokio::test]
+    async fn holders_lists_only_members_with_a_key() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        // A second member has joined but no key has been distributed to them yet.
+        let keyless = seed_user(&pool).await;
+        add_member(&pool, team, keyless).await;
+
+        // Only the owner holds a key.
+        insert_vault_key(&pool, team, owner, owner).await;
+
+        let holders = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("holders ok")
+            .0;
+
+        assert_eq!(holders, vec![owner]);
+        assert!(!holders.contains(&keyless), "keyless member must be absent");
+    }
+
+    #[tokio::test]
+    async fn holders_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn holders_forbidden_without_view_secrets_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Member of the team but granted no roles → no PERM_VIEW_SECRETS.
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+
+        let res = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }
