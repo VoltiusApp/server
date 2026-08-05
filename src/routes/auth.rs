@@ -406,6 +406,9 @@ pub async fn refresh(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // A refreshed session means the account is still live. Fire-and-forget.
+    crate::last_seen::touch(&pool, claims.sub);
+
     info!(user_id = %claims.sub, tier = %tier.tier, "Access token refreshed");
 
     Ok(Json(RefreshResponse { jwt_token }))

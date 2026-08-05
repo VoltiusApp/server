@@ -286,6 +286,10 @@ pub async fn sync_stream(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let user_id = auth.0;
 
+    // Opening the stream is the app starting up or reconnecting — the coarsest
+    // honest "this account is still in use" signal we have. Fire-and-forget.
+    crate::last_seen::touch(&pool, user_id);
+
     // Register as online and fan-out to teammates.
     presence.insert(user_id, ());
     let teammates: Vec<Uuid> = sqlx::query_scalar(TEAMMATES_SQL)

@@ -2,6 +2,7 @@ mod auth;
 mod db;
 mod email;
 mod entitlement;
+mod last_seen;
 mod lemonsqueezy;
 mod models;
 mod permissions;
