@@ -34,8 +34,14 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Prepare platform slug
-        run: echo "PLATFORM_SLUG=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+      # IMAGE must be lowercased by hand: the owner is `VoltiusApp`, and a Docker
+      # ref with uppercase in the repository name is rejected. metadata-action
+      # lowercases its own tag output, but the digest push and the manifest
+      # merge below build refs from these variables directly.
+      - name: Prepare image ref and platform slug
+        run: |
+          echo "IMAGE=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+          echo "PLATFORM_SLUG=${PLATFORM//\//-}" >> "$GITHUB_ENV"
         env:
           PLATFORM: ${{ matrix.platform }}
 
@@ -65,7 +71,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.PLATFORM_SLUG }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_SLUG }}
 
@@ -90,6 +96,9 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Prepare image ref
+        run: echo "IMAGE=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -124,9 +133,9 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
           docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
