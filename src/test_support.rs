@@ -22,6 +22,17 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Serializes tests that read or write `users.last_seen_on`. Activity counts are
+/// whole-table aggregates, so a concurrent test stamping a user would shift the
+/// totals mid-assertion. Any test touching that column must hold this lock.
+static LAST_SEEN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the `last_seen_on` lock for the duration of a test. See [`env_lock`]
+/// for the poisoning behaviour.
+pub fn last_seen_lock() -> MutexGuard<'static, ()> {
+    LAST_SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Connect to `TEST_DATABASE_URL` and apply migrations, or return `None` to skip.
 pub async fn test_pool() -> Option<PgPool> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;

@@ -85,6 +85,9 @@ pub struct OverviewResponse {
     deleted_pending: i64,
     total_blob_gb: f64,
     conversion_pct: f64,
+    active_7d: i64,
+    active_30d: i64,
+    never_seen: i64,
     tier_breakdown: TierBreakdown,
     signups_series: Vec<DayBucket>,
     churn_series: Vec<DayBucket>,
@@ -306,6 +309,12 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // ── Activity (coarse, from users.last_seen_on) ───────────────────────────
+    let activity = crate::last_seen::activity_counts(&pool).await.map_err(|e| {
+        error!(error = %e, "overview: activity counts failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let conversion_pct = if total_users > 0 {
         (paying_subscribers as f64 / total_users as f64) * 100.0
     } else {
@@ -330,6 +339,9 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         deleted_pending,
         total_blob_gb: blob_row.0.unwrap_or(0.0),
         conversion_pct,
+        active_7d: activity.active_7d,
+        active_30d: activity.active_30d,
+        never_seen: activity.never_seen,
         tier_breakdown: TierBreakdown {
             free: free_users,
             pro: paid_pro_users,
