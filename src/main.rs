@@ -402,6 +402,10 @@ async fn main() {
             "/v1/teams/:team_id/secrets",
             put(routes::team_objects::upsert_secret),
         )
+        .route(
+            "/v1/teams/:team_id/secrets/:secret_id",
+            delete(routes::team_objects::delete_secret),
+        )
         // Terminal sessions (REST) — Pro-gated at handler level via claims
         .route(
             "/v1/terminal-sessions",
