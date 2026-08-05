@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AdminEmail;
@@ -367,6 +367,10 @@ pub struct UsersQuery {
     banned: Option<bool>,
     /// "exclude" (default), "only", "any".
     deleted: Option<String>,
+    /// Whitelisted sort column: "created_at" (default) or "last_seen_on".
+    sort: Option<String>,
+    /// "desc" (default) or "asc".
+    dir: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -404,6 +408,32 @@ pub async fn list_users(
         _ => "AND u.deleted_at IS NULL",
     };
 
+    // Sort column and direction are matched against a whitelist and never
+    // interpolated from user input — the query is built with format!.
+    let dir = match params.dir.as_deref() {
+        None | Some("desc") => "DESC",
+        Some("asc") => "ASC",
+        Some(other) => {
+            warn!(dir = %other, "Rejected unknown sort direction");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    // Every ordering ends in u.id: LIMIT/OFFSET paging over a non-unique key can
+    // repeat or skip rows between pages when values tie, and last_seen_on ties
+    // constantly (one date per day, plus every never-seen account sharing NULL).
+    let order_clause = match params.sort.as_deref() {
+        None | Some("created_at") => format!("u.created_at {dir}, u.id"),
+        // NULLS LAST in both directions: a never-seen account is unknown, not
+        // the oldest or the newest, and must not head either ordering.
+        Some("last_seen_on") => {
+            format!("u.last_seen_on {dir} NULLS LAST, u.created_at DESC, u.id")
+        }
+        Some(other) => {
+            warn!(sort = %other, "Rejected unknown sort column");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
     let list_sql = format!(
         r#"
         SELECT
@@ -439,7 +469,7 @@ pub async fn list_users(
             AND ($2::text IS NULL OR u.subscription_tier = $2)
             AND ($3::boolean IS NULL OR u.is_banned = $3)
             {deleted_clause}
-        ORDER BY u.created_at DESC
+        ORDER BY {order_clause}
         LIMIT $4 OFFSET $5
         "#
     );
@@ -1760,7 +1790,123 @@ mod admin_handler_tests {
             tier: None,
             banned: None,
             deleted: None,
+            sort: None,
+            dir: None,
         })
+    }
+
+    /// Seed a user whose email carries `tag`, so a test can select exactly its
+    /// own rows out of a shared database via the `search` filter.
+    async fn seed_tagged_user(pool: &PgPool, tag: &str, name: &str, seen_days_ago: Option<i32>) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, last_seen_on)
+             VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User',
+                     CASE WHEN $4::int IS NULL THEN NULL ELSE current_date - $4::int END)",
+        )
+        .bind(id)
+        .bind(format!("{name}-{tag}@test.local"))
+        .bind(Uuid::new_v4())
+        .bind(seen_days_ago)
+        .execute(pool)
+        .await
+        .expect("seed tagged user");
+        id
+    }
+
+    async fn listed_ids(pool: &PgPool, q: Query<UsersQuery>) -> Vec<String> {
+        let body = list_users(State(pool.clone()), q).await.expect("list users").0;
+        body["users"]
+            .as_array()
+            .expect("users array")
+            .iter()
+            .map(|u| u["id"].as_str().expect("id").to_string())
+            .collect()
+    }
+
+    fn sorted_query(search: &str, sort: &str, dir: &str) -> Query<UsersQuery> {
+        let mut q = users_query(search);
+        q.0.sort = Some(sort.to_string());
+        q.0.dir = Some(dir.to_string());
+        q
+    }
+
+    #[tokio::test]
+    async fn list_users_sorted_by_last_seen_desc_puts_recent_first_nulls_last() {
+        let _guard = crate::test_support::last_seen_lock().await;
+        let pool = test_pool_or_skip!();
+        let tag = Uuid::new_v4().to_string();
+        let recent = seed_tagged_user(&pool, &tag, "recent", Some(0)).await;
+        let older = seed_tagged_user(&pool, &tag, "older", Some(40)).await;
+        let never = seed_tagged_user(&pool, &tag, "never", None).await;
+
+        let ids = listed_ids(&pool, sorted_query(&tag, "last_seen_on", "desc")).await;
+
+        assert_eq!(
+            ids,
+            vec![recent.to_string(), older.to_string(), never.to_string()],
+            "never-seen sorts last, not as the most recent"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_users_sorted_by_last_seen_asc_puts_oldest_first_nulls_last() {
+        let _guard = crate::test_support::last_seen_lock().await;
+        let pool = test_pool_or_skip!();
+        let tag = Uuid::new_v4().to_string();
+        let recent = seed_tagged_user(&pool, &tag, "recent", Some(0)).await;
+        let older = seed_tagged_user(&pool, &tag, "older", Some(40)).await;
+        let never = seed_tagged_user(&pool, &tag, "never", None).await;
+
+        let ids = listed_ids(&pool, sorted_query(&tag, "last_seen_on", "asc")).await;
+
+        assert_eq!(
+            ids,
+            vec![older.to_string(), recent.to_string(), never.to_string()],
+            "oldest first for stale-hunting; unknown still sorts last, not first"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_users_rejects_unknown_sort_column() {
+        let pool = test_pool_or_skip!();
+
+        let res = list_users(State(pool.clone()), sorted_query("nobody", "email; DROP TABLE users", "desc")).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_users_rejects_unknown_sort_direction() {
+        let pool = test_pool_or_skip!();
+
+        let res = list_users(State(pool.clone()), sorted_query("nobody", "last_seen_on", "sideways")).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_users_paginates_deterministically_when_sort_key_ties() {
+        let _guard = crate::test_support::last_seen_lock().await;
+        let pool = test_pool_or_skip!();
+        let tag = Uuid::new_v4().to_string();
+        // Four users sharing one last_seen_on: without a unique tiebreak, LIMIT
+        // OFFSET paging over equal keys can repeat or skip rows between pages.
+        for n in 0..4 {
+            seed_tagged_user(&pool, &tag, &format!("tie{n}"), Some(5)).await;
+        }
+
+        let mut seen = Vec::new();
+        for page in 1..=2 {
+            let mut q = sorted_query(&tag, "last_seen_on", "desc");
+            q.0.limit = Some(2);
+            q.0.page = Some(page);
+            seen.extend(listed_ids(&pool, q).await);
+        }
+
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(seen.len(), 4, "both pages full");
+        assert_eq!(unique.len(), 4, "no row repeated across pages");
     }
 
     #[tokio::test]
