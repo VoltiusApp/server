@@ -52,6 +52,19 @@ impl TeamObjectType {
     }
 }
 
+/// A secret's own type already names the kind of object it belongs to, so the
+/// gate does not depend on an object row that may be soft-deleted or gone by the
+/// time the secret is withdrawn. Agrees with `edit_permission_for_str` for every
+/// object that can carry secrets.
+fn edit_permission_for_secret_type(secret_type: &str) -> Option<i64> {
+    match secret_type {
+        "connection_password" | "connection_key" => Some(PERM_EDIT_CONNECTIONS),
+        "identity_password" => Some(PERM_EDIT_IDENTITIES),
+        "key_private" | "key_public" | "key_passphrase" => Some(PERM_EDIT_KEYS),
+        _ => None,
+    }
+}
+
 fn edit_permission_for_str(object_type: &str) -> Option<i64> {
     match object_type {
         "connection" | "port_forwarding_rule" => Some(PERM_EDIT_CONNECTIONS),
@@ -242,6 +255,20 @@ pub async fn delete_object(
     .execute(&pool)
     .await;
 
+    // The object row is only soft-deleted, but its secrets are not: a password
+    // left behind stays readable by everyone in the vault, which is the whole
+    // point of removing the object. A member who pastes the object back in
+    // republishes them.
+    sqlx::query("DELETE FROM team_vault_secrets WHERE team_id = $1 AND object_id = $2")
+        .bind(team_id)
+        .bind(&object_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, object_id = %object_id, "Failed to delete team vault secrets for object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
     notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
 
     Ok(StatusCode::NO_CONTENT)
@@ -327,6 +354,46 @@ pub async fn upsert_secret(
         error!(error = %e, team_id = %team_id, secret_id = %body.secret_id, "Failed to upsert team vault secret");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Withdraws one secret from a team vault. Used when an object leaves the vault
+/// but survives elsewhere, where `delete_object`'s cascade never runs.
+pub async fn delete_secret(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
+    Path((team_id, secret_id)): Path<(Uuid, String)>,
+) -> Result<StatusCode, StatusCode> {
+    let secret_type = sqlx::query_scalar::<_, String>(
+        "SELECT secret_type FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
+    )
+    .bind(team_id)
+    .bind(&secret_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, secret_id = %secret_id, "Failed to fetch team vault secret");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let permission =
+        edit_permission_for_secret_type(&secret_type).ok_or(StatusCode::BAD_REQUEST)?;
+    require_all_team_permissions(&pool, team_id, auth.0, &[permission]).await?;
+
+    sqlx::query("DELETE FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2")
+        .bind(team_id)
+        .bind(&secret_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, secret_id = %secret_id, "Failed to delete team vault secret");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
 
@@ -530,5 +597,147 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // ── delete_secret ────────────────────────────────────────────────────────
+
+    async fn seed_secret(pool: &PgPool, team: Uuid, object_id: &str) -> String {
+        let editor = member_with_role(pool, team, PERM_EDIT_CONNECTIONS).await;
+        let body = secret_body(object_id);
+        let secret_id = body.secret_id.clone();
+        upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(editor)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(body),
+        )
+        .await
+        .expect("seed secret");
+        secret_id
+    }
+
+    async fn secret_exists(pool: &PgPool, team: Uuid, secret_id: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2)",
+        )
+        .bind(team)
+        .bind(secret_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_secret_forbidden_with_only_view_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let secret_id = seed_secret(&pool, team, &object_id).await;
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = delete_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, secret_id.clone())),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+        assert!(secret_exists(&pool, team, &secret_id).await);
+    }
+
+    #[tokio::test]
+    async fn delete_secret_ok_with_object_edit_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let secret_id = seed_secret(&pool, team, &object_id).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = delete_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, secret_id.clone())),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        assert!(!secret_exists(&pool, team, &secret_id).await);
+    }
+
+    /// The gate reads the secret's own type, so it still works once the object
+    /// has left the vault — which is exactly when this route is called.
+    #[tokio::test]
+    async fn delete_secret_ok_after_object_removed() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let secret_id = seed_secret(&pool, team, &object_id).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        sqlx::query("UPDATE team_vault_objects SET deleted_at = now() WHERE team_id = $1 AND object_id = $2")
+            .bind(team)
+            .bind(&object_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let res = delete_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, secret_id.clone())),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        assert!(!secret_exists(&pool, team, &secret_id).await);
+    }
+
+    #[tokio::test]
+    async fn delete_secret_not_found_for_missing_secret() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = delete_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, "does-not-exist".to_string())),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Deleting the object takes its secrets with it — otherwise a removed
+    /// password stays readable by every member with VIEW_SECRETS.
+    #[tokio::test]
+    async fn delete_object_cascades_to_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let secret_id = seed_secret(&pool, team, &object_id).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = delete_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, object_id.clone())),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        assert!(!secret_exists(&pool, team, &secret_id).await);
     }
 }
