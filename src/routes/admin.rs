@@ -383,6 +383,9 @@ pub struct UserListRow {
     total_blob_bytes: Option<i64>,
     device_count: Option<i64>,
     last_churn_at: Option<DateTime<Utc>>,
+    /// Coarse liveness date; NULL means the account has not been seen since
+    /// `last_seen_on` shipped, which is not the same as dormant.
+    last_seen_on: Option<chrono::NaiveDate>,
     deleted_at: Option<DateTime<Utc>>,
 }
 
@@ -416,6 +419,7 @@ pub async fn list_users(
             COALESCE(sb.total_blob_bytes, 0)::bigint AS total_blob_bytes,
             COALESCE(sb.device_count, 0)::bigint AS device_count,
             ce.last_churn_at,
+            u.last_seen_on,
             u.deleted_at
         FROM users u
         LEFT JOIN (
@@ -504,6 +508,8 @@ pub struct UserDetail {
     admin_override: bool,
     created_at: DateTime<Utc>,
     seat_count: Option<i32>,
+    /// See `UserListRow::last_seen_on`.
+    last_seen_on: Option<chrono::NaiveDate>,
     deleted_at: Option<DateTime<Utc>>,
     deletion_reason: Option<String>,
     deleted_by: Option<String>,
@@ -518,7 +524,7 @@ pub async fn get_user(
         SELECT id, email, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
                ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
-               deleted_at, deletion_reason, deleted_by
+               last_seen_on, deleted_at, deletion_reason, deleted_by
         FROM users WHERE id = $1
         "#,
     )
@@ -1740,5 +1746,84 @@ mod admin_handler_tests {
 
         // No matching row (WHERE deleted_at IS NOT NULL) → rows_affected 0 → 404.
         assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    // ── last_seen_on surfacing ───────────────────────────────────────────────
+    // These hold the last_seen lock: they write last_seen_on, and the activity
+    // count tests assert on before/after deltas of whole-table aggregates.
+
+    fn users_query(search: &str) -> Query<UsersQuery> {
+        Query(UsersQuery {
+            page: None,
+            limit: None,
+            search: Some(search.to_string()),
+            tier: None,
+            banned: None,
+            deleted: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn list_users_returns_last_seen_on() {
+        let _guard = crate::test_support::last_seen_lock().await;
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        sqlx::query("UPDATE users SET last_seen_on = current_date - 3 WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("set last_seen_on");
+
+        let body = list_users(State(pool.clone()), users_query(&format!("{user}@test.local")))
+            .await
+            .expect("list users")
+            .0;
+
+        let expected: chrono::NaiveDate = sqlx::query_scalar("SELECT current_date - 3")
+            .fetch_one(&pool)
+            .await
+            .expect("expected date");
+        assert_eq!(
+            body["users"][0]["last_seen_on"].as_str(),
+            Some(expected.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_users_reports_null_last_seen_on_for_never_seen_user() {
+        let _guard = crate::test_support::last_seen_lock().await;
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await; // never stamped
+
+        let body = list_users(State(pool.clone()), users_query(&format!("{user}@test.local")))
+            .await
+            .expect("list users")
+            .0;
+
+        assert!(
+            body["users"][0]["last_seen_on"].is_null(),
+            "never-seen user must be null, not a fabricated date"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_user_returns_last_seen_on() {
+        let _guard = crate::test_support::last_seen_lock().await;
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        sqlx::query("UPDATE users SET last_seen_on = current_date WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("set last_seen_on");
+
+        let detail = get_user(State(pool.clone()), Path(user)).await.expect("get user").0;
+        let body = serde_json::to_value(&detail).expect("serialize detail");
+
+        let today: chrono::NaiveDate = sqlx::query_scalar("SELECT current_date")
+            .fetch_one(&pool)
+            .await
+            .expect("current_date");
+        assert_eq!(body["last_seen_on"].as_str(), Some(today.to_string().as_str()));
     }
 }
