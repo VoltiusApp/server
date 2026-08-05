@@ -25,12 +25,14 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 /// Serializes tests that read or write `users.last_seen_on`. Activity counts are
 /// whole-table aggregates, so a concurrent test stamping a user would shift the
 /// totals mid-assertion. Any test touching that column must hold this lock.
-static LAST_SEEN_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Async-aware, unlike [`ENV_LOCK`]: these tests hold the guard across `.await`
+/// (they query the database while holding it), which a `std` guard forbids.
+static LAST_SEEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Acquire the `last_seen_on` lock for the duration of a test. See [`env_lock`]
-/// for the poisoning behaviour.
-pub fn last_seen_lock() -> MutexGuard<'static, ()> {
-    LAST_SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// Acquire the `last_seen_on` lock for the duration of a test.
+pub async fn last_seen_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    LAST_SEEN_LOCK.lock().await
 }
 
 /// Connect to `TEST_DATABASE_URL` and apply migrations, or return `None` to skip.

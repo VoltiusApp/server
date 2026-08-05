@@ -101,7 +101,7 @@ mod tests {
 
     #[tokio::test]
     async fn activity_counts_bucket_users_by_recency() {
-        let _guard = last_seen_lock();
+        let _guard = last_seen_lock().await;
         let pool = test_pool_or_skip!();
         let before = activity_counts(&pool).await.expect("baseline counts");
 
@@ -130,7 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn activity_counts_excludes_soft_deleted_users() {
-        let _guard = last_seen_lock();
+        let _guard = last_seen_lock().await;
         let pool = test_pool_or_skip!();
         let before = activity_counts(&pool).await.expect("baseline counts");
 
@@ -149,7 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn stamp_marks_a_never_seen_user_as_seen_today() {
-        let _guard = last_seen_lock();
+        let _guard = last_seen_lock().await;
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
         assert_eq!(last_seen_on(&pool, user).await, None, "fresh user starts unseen");
@@ -165,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn stamp_is_a_no_op_when_already_seen_today() {
-        let _guard = last_seen_lock();
+        let _guard = last_seen_lock().await;
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
 
@@ -179,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn stamp_advances_a_stale_date() {
-        let _guard = last_seen_lock();
+        let _guard = last_seen_lock().await;
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
         sqlx::query("UPDATE users SET last_seen_on = current_date - 400 WHERE id = $1")
