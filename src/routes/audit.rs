@@ -348,6 +348,15 @@ const CLIENT_WHITELIST: &[&str] = &[
     "agent.session_closed",
     "agent.command_run",
     "agent.action_denied",
+    // Agent file operations (#57 phase 2). Until these existed every file
+    // operation rode agent.command_run with the real tool in metadata.tool,
+    // so a team trail could not be filtered by what the agent actually did.
+    // Paths are carried on-device only, never in the payload sent here.
+    "agent.file_created",
+    "agent.file_written",
+    "agent.file_renamed",
+    "agent.file_deleted",
+    "agent.file_transferred",
 ];
 
 #[derive(Deserialize)]
@@ -434,6 +443,11 @@ mod authz_tests {
             "agent.session_closed",
             "agent.command_run",
             "agent.action_denied",
+            "agent.file_created",
+            "agent.file_written",
+            "agent.file_renamed",
+            "agent.file_deleted",
+            "agent.file_transferred",
         ] {
             assert!(
                 CLIENT_WHITELIST.contains(&action),
