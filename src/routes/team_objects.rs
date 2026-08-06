@@ -58,7 +58,9 @@ impl TeamObjectType {
 /// object that can carry secrets.
 fn edit_permission_for_secret_type(secret_type: &str) -> Option<i64> {
     match secret_type {
-        "connection_password" | "connection_key" => Some(PERM_EDIT_CONNECTIONS),
+        "connection_password" | "connection_key" | "connection_passphrase" => {
+            Some(PERM_EDIT_CONNECTIONS)
+        }
         "identity_password" => Some(PERM_EDIT_IDENTITIES),
         "key_private" | "key_public" | "key_passphrase" => Some(PERM_EDIT_KEYS),
         _ => None,
@@ -577,6 +579,58 @@ mod authz_tests {
         .await
         .unwrap();
         assert!(persisted);
+    }
+
+    /// A connection's inline key passphrase (`passphrase:<conn_id>`) had no
+    /// permitted `secret_type`, so this INSERT tripped the CHECK constraint and
+    /// members got the encrypted key without the passphrase to open it.
+    #[tokio::test]
+    async fn upsert_secret_accepts_connection_passphrase() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let body = UpsertSecretRequest {
+            secret_id: format!("passphrase:{object_id}"),
+            object_id: object_id.clone(),
+            secret_type: "connection_passphrase".to_string(),
+            ciphertext: "cipher".to_string(),
+        };
+        let secret_id = body.secret_id.clone();
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(body),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        let persisted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2)",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(persisted);
+
+        // The withdraw path gates on secret_type, not object_type: without the
+        // mapping it answers 400 and the material stays readable in the vault.
+        let res = delete_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path((team, secret_id.clone())),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        assert!(!secret_exists(&pool, team, &secret_id).await);
     }
 
     #[tokio::test]
