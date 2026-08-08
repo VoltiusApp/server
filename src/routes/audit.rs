@@ -357,6 +357,12 @@ const CLIENT_WHITELIST: &[&str] = &[
     "agent.file_renamed",
     "agent.file_deleted",
     "agent.file_transferred",
+    // Generic object lifecycle actions (#57 phase 3+). Object kind rides in
+    // metadata.objectType so keys, identities, connections, vaults, folders and
+    // snippets share these instead of costing a whitelist entry each.
+    "agent.object_created",
+    "agent.object_updated",
+    "agent.object_deleted",
 ];
 
 #[derive(Deserialize)]
@@ -448,6 +454,9 @@ mod authz_tests {
             "agent.file_renamed",
             "agent.file_deleted",
             "agent.file_transferred",
+            "agent.object_created",
+            "agent.object_updated",
+            "agent.object_deleted",
         ] {
             assert!(
                 CLIENT_WHITELIST.contains(&action),
