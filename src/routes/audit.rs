@@ -363,6 +363,11 @@ const CLIENT_WHITELIST: &[&str] = &[
     "agent.object_created",
     "agent.object_updated",
     "agent.object_deleted",
+    // A tool a plugin contributed through api.mcp, called by an external MCP
+    // client (MCP phase 2). Distinct from agent.command_run so the trail stays
+    // filterable by what actually reached the host; the plugin id and tool name
+    // ride in metadata.
+    "agent.plugin_tool_run",
 ];
 
 #[derive(Deserialize)]
@@ -457,6 +462,7 @@ mod authz_tests {
             "agent.object_created",
             "agent.object_updated",
             "agent.object_deleted",
+            "agent.plugin_tool_run",
         ] {
             assert!(
                 CLIENT_WHITELIST.contains(&action),
