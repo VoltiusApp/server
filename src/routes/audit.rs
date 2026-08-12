@@ -347,6 +347,10 @@ const CLIENT_WHITELIST: &[&str] = &[
     "agent.session_opened",
     "agent.session_closed",
     "agent.command_run",
+    // Real keystrokes sent to a session (send_keys). Distinct from
+    // agent.command_run so a trail can separate a TUI interaction from a shell
+    // command. The key tokens themselves are on-device only and never sent here.
+    "agent.keys_sent",
     "agent.action_denied",
     // Agent file operations (#57 phase 2). Until these existed every file
     // operation rode agent.command_run with the real tool in metadata.tool,
@@ -453,6 +457,7 @@ mod authz_tests {
             "agent.session_opened",
             "agent.session_closed",
             "agent.command_run",
+            "agent.keys_sent",
             "agent.action_denied",
             "agent.file_created",
             "agent.file_written",
