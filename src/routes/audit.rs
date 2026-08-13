@@ -372,6 +372,13 @@ const CLIENT_WHITELIST: &[&str] = &[
     // filterable by what actually reached the host; the plugin id and tool name
     // ride in metadata.
     "agent.plugin_tool_run",
+    // Team membership and terminal sharing driven through MCP (P7).
+    "agent.member_invited",
+    "agent.member_removed",
+    "agent.member_role_changed",
+    "agent.session_shared",
+    "agent.session_unshared",
+    "agent.control_granted",
 ];
 
 #[derive(Deserialize)]
