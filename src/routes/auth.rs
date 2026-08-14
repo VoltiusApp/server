@@ -25,8 +25,8 @@ struct TierInfo {
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>)>(
-        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>, Option<DateTime<Utc>>)>(
+        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -36,8 +36,16 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id) =
+    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at) =
         row;
+
+    // Soft-deleted accounts are locked: no session may be issued or renewed from one.
+    // Gating here covers every token-issuing path (login, refresh, password change) at once.
+    if deleted_at.is_some() {
+        warn!(user_id = %user_id, "Rejected request for soft-deleted account");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let effective = crate::entitlement::effective_tier(
         &stored_tier,
         trial_ends_at,
@@ -58,6 +66,18 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
     })
 }
 
+/// True when a write lost the race for an address already on file — either the
+/// plain unique key or the lower-case index added with the normalization migration.
+fn is_email_taken(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => matches!(
+            db_err.constraint(),
+            Some("users_email_key") | Some("users_email_lower_key")
+        ),
+        _ => false,
+    }
+}
+
 // ─── Challenge ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -74,18 +94,20 @@ pub async fn challenge(
     State(pool): State<PgPool>,
     axum::extract::Query(query): axum::extract::Query<ChallengeQuery>,
 ) -> Result<Json<ChallengeResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid,)>("SELECT account_id FROM users WHERE email = $1")
-        .bind(&query.email)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|err| {
-            error!(error = %err, "Failed to fetch challenge account");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or_else(|| {
-            warn!("Challenge requested for unknown account");
-            StatusCode::NOT_FOUND
-        })?;
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT account_id FROM users WHERE email = $1 AND deleted_at IS NULL",
+    )
+    .bind(crate::email::normalize(&query.email))
+    .fetch_optional(&pool)
+    .await
+    .map_err(|err| {
+        error!(error = %err, "Failed to fetch challenge account");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or_else(|| {
+        warn!("Challenge requested for unknown account");
+        StatusCode::NOT_FOUND
+    })?;
 
     Ok(Json(ChallengeResponse { account_id: row.0 }))
 }
@@ -119,6 +141,8 @@ pub async fn register(
     State(pool): State<PgPool>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+    let email = crate::email::normalize(&body.email);
+
     let auth_hash = hash_auth_key(&body.auth_key).map_err(|err| {
         error!(error = %err, "Failed to hash auth key during registration");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -156,7 +180,7 @@ pub async fn register(
         "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at)
          VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7) RETURNING id",
     )
-    .bind(&body.email)
+    .bind(&email)
     .bind(body.account_id)
     .bind(&auth_hash)
     .bind(body.public_key.as_deref())
@@ -166,11 +190,9 @@ pub async fn register(
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref db_err) = e {
-            if db_err.constraint() == Some("users_email_key") {
-                warn!("Registration conflict for existing account");
-                return StatusCode::CONFLICT;
-            }
+        if is_email_taken(&e) {
+            warn!("Registration conflict for existing account");
+            return StatusCode::CONFLICT;
         }
         error!(error = %e, "Failed to register user");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -221,7 +243,7 @@ pub async fn register(
 
         let app_url = std::env::var("VOLTIUS_APP_URL")
             .unwrap_or_else(|_| "https://app.voltius.app".to_string());
-        if let Err(e) = send_verification_email(&body.email, &token, &app_url).await {
+        if let Err(e) = send_verification_email(&email, &token, &app_url).await {
             error!(error = %e, user_id = %user_id, "Failed to send verification email");
         }
         false
@@ -232,7 +254,7 @@ pub async fn register(
         "SELECT team_id, role FROM pending_invitations
          WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
     )
-    .bind(&body.email)
+    .bind(&email)
     .fetch_all(&pool)
     .await
     .unwrap_or_default();
@@ -252,7 +274,7 @@ pub async fn register(
             "UPDATE pending_invitations SET accepted_at = now()
              WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
         )
-        .bind(&body.email)
+        .bind(&email)
         .execute(&pool)
         .await;
         info!(user_id = %user_id, count = pending.len(), "Auto-accepted pending invitations on registration");
@@ -641,6 +663,8 @@ pub async fn update_email(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    let new_email = crate::email::normalize(&body.new_email);
+
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin update_email transaction");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -649,15 +673,13 @@ pub async fn update_email(
     sqlx::query(
         "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, updated_at = now() WHERE id = $2",
     )
-    .bind(&body.new_email)
+    .bind(&new_email)
     .bind(auth.0)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref db_err) = e {
-            if db_err.constraint() == Some("users_email_key") {
-                return StatusCode::CONFLICT;
-            }
+        if is_email_taken(&e) {
+            return StatusCode::CONFLICT;
         }
         error!(error = %e, user_id = %auth.0, "Failed to update email");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -694,11 +716,11 @@ pub async fn update_email(
 
     let app_url =
         std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string());
-    if let Err(e) = send_verification_email(&body.new_email, &token, &app_url).await {
+    if let Err(e) = send_verification_email(&new_email, &token, &app_url).await {
         error!(error = %e, user_id = %auth.0, "Failed to send verification email after email update");
     }
 
-    info!(user_id = %auth.0, new_email = %body.new_email, "User email updated");
+    info!(user_id = %auth.0, new_email = %new_email, "User email updated");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1168,6 +1190,157 @@ mod handler_tests {
         match login_of(&pool, Uuid::new_v4()).await {
             Err(s) => assert_eq!(s, StatusCode::UNAUTHORIZED),
             Ok(_) => panic!("expected UNAUTHORIZED for unknown account"),
+        }
+    }
+
+    // ── email case: storage is canonical, lookup is case-insensitive ─────────
+
+    #[tokio::test]
+    async fn register_stores_email_lowercased() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let typed = format!("  MiXeD.{}@Ex.Test  ", Uuid::new_v4());
+
+        let (_, Json(resp)) = register(
+            State(pool.clone()),
+            Json(register_req(&typed, Uuid::new_v4(), None)),
+        )
+        .await
+        .expect("register ok");
+
+        let stored: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(resp.user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch stored email");
+        assert_eq!(stored, typed.trim().to_lowercase());
+    }
+
+    #[tokio::test]
+    async fn challenge_resolves_email_regardless_of_case() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let email = format!("case.{}@ex.test", Uuid::new_v4());
+        let _ = register(
+            State(pool.clone()),
+            Json(register_req(&email, account_id, None)),
+        )
+        .await
+        .expect("register ok");
+
+        let Json(resp) = challenge(
+            State(pool.clone()),
+            axum::extract::Query(ChallengeQuery {
+                email: email.to_uppercase(),
+            }),
+        )
+        .await
+        .expect("challenge should match an upper-cased address");
+
+        assert_eq!(resp.account_id, account_id);
+    }
+
+    #[tokio::test]
+    async fn register_conflicts_on_email_differing_only_in_case() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let email = format!("dup.{}@ex.test", Uuid::new_v4());
+
+        let _ = register(
+            State(pool.clone()),
+            Json(register_req(&email, Uuid::new_v4(), None)),
+        )
+        .await
+        .expect("first register ok");
+
+        match register(
+            State(pool.clone()),
+            Json(register_req(&email.to_uppercase(), Uuid::new_v4(), None)),
+        )
+        .await
+        {
+            Err(s) => assert_eq!(s, StatusCode::CONFLICT),
+            Ok(_) => panic!("expected CONFLICT for the same mailbox in a different case"),
+        }
+    }
+
+    // ── soft delete: a deleted account is locked out of every auth path ───────
+
+    async fn soft_delete(pool: &PgPool, user_id: Uuid) {
+        sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("soft-delete user");
+    }
+
+    #[tokio::test]
+    async fn login_soft_deleted_user_forbidden() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        soft_delete(&pool, uid).await;
+
+        match login_of(&pool, account_id).await {
+            Err(s) => assert_eq!(s, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected FORBIDDEN for soft-deleted user"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_soft_deleted_user_forbidden() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+
+        // Take a refresh token while the account is live, then delete underneath it.
+        let session = login_of(&pool, account_id).await.expect("login ok");
+        soft_delete(&pool, uid).await;
+
+        let res = refresh(
+            State(pool.clone()),
+            Json(RefreshRequest {
+                refresh_token: session.refresh_token,
+            }),
+        )
+        .await;
+
+        match res {
+            Err(s) => assert_eq!(s, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected FORBIDDEN when refreshing a soft-deleted account"),
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_soft_deleted_user_not_found() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let uid = seed_user_with_credentials(&pool, Uuid::new_v4(), "auth-key-secret").await;
+        let email = format!("{uid}@test.local");
+
+        let live = challenge(
+            State(pool.clone()),
+            axum::extract::Query(ChallengeQuery {
+                email: email.clone(),
+            }),
+        )
+        .await;
+        assert!(live.is_ok(), "challenge should resolve a live account");
+
+        soft_delete(&pool, uid).await;
+
+        let res = challenge(
+            State(pool.clone()),
+            axum::extract::Query(ChallengeQuery { email }),
+        )
+        .await;
+
+        match res {
+            Err(s) => assert_eq!(s, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected NOT_FOUND for soft-deleted account"),
         }
     }
 }

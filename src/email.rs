@@ -2,6 +2,16 @@ use std::time::Duration;
 
 use tracing::error;
 
+/// Canonical form of an address, for both storage and lookup.
+///
+/// Addresses are stored normalized, so every write path must run its input
+/// through this and every lookup must compare against it. A mixed-case row is
+/// unreachable to a client that lowercases (mobile keyboards autocapitalize),
+/// and it shadows invitations addressed to the same mailbox in lower case.
+pub fn normalize(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")

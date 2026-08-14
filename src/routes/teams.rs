@@ -342,7 +342,7 @@ pub async fn add_member(
         uid
     } else if let Some(email) = &body.email {
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
-            .bind(email)
+            .bind(crate::email::normalize(email))
             .fetch_optional(&pool)
             .await
             .map_err(|e| { error!(error = %e, "Failed to find user by email"); StatusCode::INTERNAL_SERVER_ERROR })?
@@ -1135,7 +1135,7 @@ pub async fn invite_member(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let email = body.email.trim().to_lowercase();
+    let email = crate::email::normalize(&body.email);
     if email.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
