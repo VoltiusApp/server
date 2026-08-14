@@ -729,6 +729,24 @@ async fn session_end_recipients(
     Ok(recipients.into_iter().collect())
 }
 
+/// Fan `session_ended` out to `session_end_recipients`. Callers with no
+/// `Result` channel of their own (host disconnect, not `end_session`'s HTTP
+/// response) can call this and just move on; the load failure is logged by
+/// `session_end_recipients` itself.
+async fn fan_out_session_ended(
+    pool: &PgPool,
+    notifier: &crate::sync_notifier::SyncNotifier,
+    session_id: Uuid,
+    host_user_id: Uuid,
+) {
+    let Ok(recipients) = session_end_recipients(pool, session_id, host_user_id).await else {
+        return;
+    };
+    for recipient in recipients {
+        notifier.notify_session_ended(recipient, session_id);
+    }
+}
+
 pub async fn end_session(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -754,10 +772,7 @@ pub async fn end_session(
         }
     }
 
-    let recipients = session_end_recipients(&pool, session_id, auth.0).await?;
-    for recipient in recipients {
-        notifier.notify_session_ended(recipient, session_id);
-    }
+    fan_out_session_ended(&pool, &notifier, session_id, auth.0).await;
 
     info!(session_id = %session_id, "Terminal session ended");
     Ok(StatusCode::NO_CONTENT)
@@ -810,6 +825,7 @@ pub async fn ws_handler(
     Query(query): Query<WsQuery>,
     State(pool): State<PgPool>,
     Extension(manager): Extension<TerminalManager>,
+    Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
 ) -> impl IntoResponse {
     let user_id = match validate_token(&query.token, "access") {
         Ok(claims) => claims.sub,
@@ -825,7 +841,16 @@ pub async fn ws_handler(
         .unwrap_or_else(|| user_id.to_string());
 
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, session_id, user_id, display_name, query.invite_token, pool, manager)
+        handle_socket(
+            socket,
+            session_id,
+            user_id,
+            display_name,
+            query.invite_token,
+            pool,
+            manager,
+            notifier,
+        )
     })
 }
 
@@ -892,6 +917,7 @@ async fn is_authorized_participant(
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     session_id: Uuid,
@@ -900,6 +926,7 @@ async fn handle_socket(
     invite_token: Option<String>,
     pool: PgPool,
     manager: TerminalManager,
+    notifier: crate::sync_notifier::SyncNotifier,
 ) {
     // Fetch session state from in-memory manager
     let session_info = {
@@ -1021,14 +1048,14 @@ async fn handle_socket(
         .await
         .is_err()
     {
-        cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
+        cleanup_participant(&manager, session_id, user_id, &tx, &pool, &notifier).await;
         return;
     }
 
     // Replay terminal history so the new joiner sees what happened before they joined.
     for msg in history_snapshot {
         if ws_sender.send(Message::Text(msg)).await.is_err() {
-            cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
+            cleanup_participant(&manager, session_id, user_id, &tx, &pool, &notifier).await;
             return;
         }
     }
@@ -1163,7 +1190,7 @@ async fn handle_socket(
     }
 
     send_task.abort();
-    cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
+    cleanup_participant(&manager, session_id, user_id, &tx, &pool, &notifier).await;
     info!(session_id = %session_id, user_id = %user_id, "WS participant left");
 }
 
@@ -1173,6 +1200,7 @@ async fn cleanup_participant(
     user_id: Uuid,
     tx: &tokio::sync::broadcast::Sender<String>,
     pool: &PgPool,
+    notifier: &crate::sync_notifier::SyncNotifier,
 ) {
     let is_host = {
         let mut sessions = manager.sessions.lock().await;
@@ -1213,6 +1241,9 @@ async fn cleanup_participant(
         if let Some(state) = sessions.remove(&session_id) {
             let _ = state.tx.send(r#"{"type":"session_ended"}"#.to_string());
         }
+        drop(sessions);
+
+        fan_out_session_ended(pool, notifier, session_id, user_id).await;
 
         info!(session_id = %session_id, "Session ended: host disconnected");
     } else {
@@ -1756,6 +1787,63 @@ mod tests {
 
         let recipients = session_end_recipients(&pool, session_id, host).await.unwrap();
         assert_eq!(recipients, vec![mate]);
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_on_a_vaultless_session_retracts_the_invitees_knock() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        // Subscribe after the grant so its `SessionShared` push isn't mistaken
+        // for the `SessionEnded` push under test.
+        let mut events = notifier.subscribe();
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        // Simulates the host's WebSocket closing (app quit) rather than a
+        // "Stop sharing" click — the path that used to leave `mate` knocking
+        // on a session that no longer exists.
+        cleanup_participant(&manager, session_id, host, &tx, &pool, &notifier).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("SessionEnded must be pushed within 1s of host disconnect")
+            .expect("notifier channel must not close");
+        match event {
+            crate::sync_notifier::SyncEvent::SessionEnded { recipient, session_id: ended } => {
+                assert_eq!(recipient, mate, "the invitee, not the host, is the recipient");
+                assert_eq!(ended, session_id);
+            }
+            other => panic!("expected SessionEnded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_marks_the_session_ended_in_the_db() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        cleanup_participant(&manager, session_id, host, &tx, &pool, &notifier).await;
+
+        let ended_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT ended_at FROM terminal_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_at.is_some(), "host disconnect must mark the session ended");
+        assert!(manager.sessions.lock().await.get(&session_id).is_none());
     }
 
     async fn test_notifier_and_manager(
