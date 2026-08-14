@@ -93,6 +93,9 @@ pub struct ActiveSession {
     /// Team IDs (= vault IDs on the client) this session is shared with.
     /// Empty for invite_link sessions.
     pub vault_ids: Vec<Uuid>,
+    /// Set when the caller reaches this session through an individual grant
+    /// (#66) rather than a vault share — names who invited them.
+    pub invited_by: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -418,16 +421,25 @@ pub async fn create_session(
 
 // ─── List active sessions (vault sessions the user is part of) ────────────────
 
-pub async fn list_active_sessions(
-    State(pool): State<PgPool>,
-    Extension(auth): Extension<AuthUser>,
-    Extension(manager): Extension<TerminalManager>,
-) -> Result<Json<Vec<ActiveSession>>, StatusCode> {
-    // Show vault sessions where user is a member of one of the session's vaults
-    // (respecting role filter if set).
-    // Invite-link sessions are NOT listed here — they're accessible only via the link.
-    // Host always sees their own sessions.
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<Utc>, Vec<Uuid>)>(
+type VisibleSessionRow = (
+    Uuid,
+    String,
+    Uuid,
+    String,
+    chrono::DateTime<Utc>,
+    Vec<Uuid>,
+    Option<Uuid>,
+);
+
+/// Sessions `user_id` may see: their own, ones they hold an individual grant
+/// (#66) on, and vault sessions shared with a team they belong to (respecting
+/// the role filter if set). Invite-link sessions are reachable only via the
+/// link, never listed here.
+async fn visible_sessions(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<VisibleSessionRow>, StatusCode> {
+    sqlx::query_as::<_, VisibleSessionRow>(
         r#"
         SELECT
             ts.id,
@@ -438,75 +450,92 @@ pub async fn list_active_sessions(
             COALESCE(
                 (SELECT array_agg(tsv.team_id) FROM terminal_session_vaults tsv WHERE tsv.session_id = ts.id),
                 ARRAY[]::uuid[]
-            ) AS vault_ids
+            ) AS vault_ids,
+            (SELECT tsi.invited_by FROM terminal_session_invitees tsi
+              WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by
         FROM terminal_sessions ts
         WHERE ts.ended_at IS NULL
-          AND ts.visibility = 'vault'
           AND (
             ts.host_user_id = $1
-            OR EXISTS (
-              SELECT 1
-              FROM terminal_session_vaults tsv
-              JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
-              WHERE tsv.session_id = ts.id
-                AND EXISTS (
-                  SELECT 1
-                  FROM team_member_roles tmr_perm
-                  JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
-                  WHERE tmr_perm.team_id = tsv.team_id
-                    AND tmr_perm.user_id = $1
-                    AND (tr_perm.permissions & $2) != 0
-                )
-                AND (
-                  array_length(ts.allowed_roles, 1) IS NULL
-                  OR cardinality(ts.allowed_roles) = 0
-                  OR EXISTS (
+            OR EXISTS (SELECT 1 FROM terminal_session_invitees tsi
+                        WHERE tsi.session_id = ts.id AND tsi.user_id = $1)
+            OR (
+              ts.visibility = 'vault'
+              AND EXISTS (
+                SELECT 1
+                FROM terminal_session_vaults tsv
+                JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
+                WHERE tsv.session_id = ts.id
+                  AND EXISTS (
                     SELECT 1
-                    FROM team_member_roles tmr
-                    JOIN team_roles tr ON tr.id = tmr.role_id
-                    WHERE tmr.team_id = tsv.team_id
-                      AND tmr.user_id = $1
-                      AND tr.name = ANY(ts.allowed_roles)
+                    FROM team_member_roles tmr_perm
+                    JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
+                    WHERE tmr_perm.team_id = tsv.team_id
+                      AND tmr_perm.user_id = $1
+                      AND (tr_perm.permissions & $2) != 0
                   )
-                )
+                  AND (
+                    array_length(ts.allowed_roles, 1) IS NULL
+                    OR cardinality(ts.allowed_roles) = 0
+                    OR EXISTS (
+                      SELECT 1
+                      FROM team_member_roles tmr
+                      JOIN team_roles tr ON tr.id = tmr.role_id
+                      WHERE tmr.team_id = tsv.team_id
+                        AND tmr.user_id = $1
+                        AND tr.name = ANY(ts.allowed_roles)
+                    )
+                  )
+              )
             )
           )
         ORDER BY ts.created_at DESC
         "#,
     )
-    .bind(auth.0)
+    .bind(user_id)
     .bind(crate::permissions::PERM_VIEW_TERMINAL_SESSIONS)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| {
         error!(error = %e, "Failed to list active sessions");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })
+}
+
+pub async fn list_active_sessions(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(manager): Extension<TerminalManager>,
+) -> Result<Json<Vec<ActiveSession>>, StatusCode> {
+    let rows = visible_sessions(&pool, auth.0).await?;
 
     let sessions_lock = manager.sessions.lock().await;
     let result = rows
         .into_iter()
         .filter(|(id, ..)| sessions_lock.contains_key(id))
-        .map(|(id, connection_name, host_user_id, visibility, created_at, vault_ids)| {
-            let (participant_count, participants, host_public_key) = sessions_lock
-                .get(&id)
-                .map(|s| {
-                    let ps: Vec<Participant> = s.participants.values().cloned().collect();
-                    (ps.len() as i64, ps, s.host_public_key.clone())
-                })
-                .unwrap_or_default();
-            ActiveSession {
-                id,
-                connection_name,
-                host_user_id,
-                host_public_key,
-                visibility,
-                created_at,
-                participant_count,
-                participants,
-                vault_ids,
-            }
-        })
+        .map(
+            |(id, connection_name, host_user_id, visibility, created_at, vault_ids, invited_by)| {
+                let (participant_count, participants, host_public_key) = sessions_lock
+                    .get(&id)
+                    .map(|s| {
+                        let ps: Vec<Participant> = s.participants.values().cloned().collect();
+                        (ps.len() as i64, ps, s.host_public_key.clone())
+                    })
+                    .unwrap_or_default();
+                ActiveSession {
+                    id,
+                    connection_name,
+                    host_user_id,
+                    host_public_key,
+                    visibility,
+                    created_at,
+                    participant_count,
+                    participants,
+                    vault_ids,
+                    invited_by,
+                }
+            },
+        )
         .collect();
 
     Ok(Json(result))
@@ -619,6 +648,44 @@ async fn require_active_session_host(
 
 // ─── End session ─────────────────────────────────────────────────────────────
 
+/// Everyone who should be told this session ended: team members of its vaults
+/// plus individually invited users, minus the host.
+async fn session_end_recipients(
+    pool: &PgPool,
+    session_id: Uuid,
+    host_user_id: Uuid,
+) -> Result<Vec<Uuid>, StatusCode> {
+    let team_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT team_id FROM terminal_session_vaults WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to load session vault teams");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let mut recipients = std::collections::HashSet::new();
+    crate::sync_notifier::notify_team_members(pool, &team_ids, host_user_id, |member_id| {
+        recipients.insert(member_id);
+    })
+    .await;
+
+    let invitee_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM terminal_session_invitees WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to load session invitees");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    recipients.extend(invitee_ids);
+    recipients.remove(&host_user_id);
+
+    Ok(recipients.into_iter().collect())
+}
+
 pub async fn end_session(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -644,19 +711,9 @@ pub async fn end_session(
         }
     }
 
-    let team_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT team_id FROM terminal_session_vaults WHERE session_id = $1",
-    )
-    .bind(session_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-
-    if !team_ids.is_empty() {
-        crate::sync_notifier::notify_team_members(&pool, &team_ids, auth.0, |recipient| {
-            notifier.notify_session_ended(recipient, session_id);
-        })
-        .await;
+    let recipients = session_end_recipients(&pool, session_id, auth.0).await?;
+    for recipient in recipients {
+        notifier.notify_session_ended(recipient, session_id);
     }
 
     info!(session_id = %session_id, "Terminal session ended");
@@ -1455,6 +1512,51 @@ mod tests {
         assert!(is_authorized_participant(&pool, mate, host, "direct", &[], &[], None, None, &invitees).await);
         let stranger = seed_user(&pool).await;
         assert!(!is_authorized_participant(&pool, stranger, host, "direct", &[], &[], None, None, &invitees).await);
+    }
+
+    #[tokio::test]
+    async fn list_query_returns_a_direct_session_only_for_host_and_invitee() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let for_mate = visible_sessions(&pool, mate).await.unwrap();
+        assert_eq!(for_mate.len(), 1);
+        assert_eq!(for_mate[0].0, session_id);
+        assert_eq!(for_mate[0].6, Some(host), "invited_by names the host");
+
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert_eq!(for_host.len(), 1);
+        assert_eq!(for_host[0].6, None, "the host is not their own invitee");
+
+        assert!(visible_sessions(&pool, stranger).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn end_session_recipients_include_invitees_of_a_vaultless_session() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let recipients = session_end_recipients(&pool, session_id, host).await.unwrap();
+        assert_eq!(recipients, vec![mate]);
     }
 
     async fn test_notifier_and_manager(
