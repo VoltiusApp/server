@@ -458,6 +458,7 @@ pub async fn remove_member(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::Extension(manager): axum::Extension<crate::terminal_manager::TerminalManager>,
     axum::extract::Path((team_id, user_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     if auth.0 != user_id {
@@ -515,20 +516,9 @@ pub async fn remove_member(
     })?;
 
     // Best effort, after commit: the membership row is already gone, so a
-    // failure here must not fail the request. Mirrors `grant_invitee`'s
-    // admission guard exactly — a grant survives only while inviter and
-    // invitee still share at least one team.
-    if let Err(e) = sqlx::query(
-        "DELETE FROM terminal_session_invitees tsi \
-          WHERE tsi.user_id = $1 \
-            AND NOT EXISTS ( \
-              SELECT 1 FROM team_members a \
-                JOIN team_members b ON a.team_id = b.team_id \
-               WHERE a.user_id = tsi.invited_by AND b.user_id = tsi.user_id)",
-    )
-    .bind(user_id)
-    .execute(&pool)
-    .await
+    // failure here must not fail the request.
+    if let Err(e) =
+        crate::routes::terminal::revoke_grants_for_departed_member(&pool, &manager, user_id).await
     {
         error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to revoke session invitee grants");
     }
@@ -1411,6 +1401,7 @@ mod authz_tests {
         PERM_INVITE_MEMBERS, PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES, PERM_VIEW_SECRETS,
     };
     use crate::sync_notifier::SyncNotifier;
+    use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
@@ -1443,6 +1434,64 @@ mod authz_tests {
         .execute(pool)
         .await
         .expect("insert invitee grant");
+    }
+
+    /// WebSocket admission for the live session, computed the way the socket
+    /// handler computes it — from the in-memory set, not the table.
+    async fn admits_over_ws(
+        pool: &PgPool,
+        manager: &TerminalManager,
+        session_id: Uuid,
+        host: Uuid,
+        user: Uuid,
+    ) -> bool {
+        let invitees = manager
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("live session")
+            .invitees
+            .clone();
+        crate::routes::terminal::is_authorized_participant(
+            pool, user, host, "direct", &[], &[], None, None, &invitees,
+        )
+        .await
+    }
+
+    /// Seeds a live session plus a real grant through `grant_invitee`, so the
+    /// in-memory admission set is populated exactly as a live session's is.
+    async fn seed_live_session_with_grant(
+        pool: &PgPool,
+        host: Uuid,
+        invitee: Uuid,
+    ) -> (Uuid, TerminalManager) {
+        let session_id = seed_direct_session(pool, host).await;
+        let manager = TerminalManager::new();
+        manager.insert_test_session(session_id, host).await;
+        crate::routes::terminal::grant_invitee(
+            pool,
+            &SyncNotifier::new(),
+            &manager,
+            session_id,
+            host,
+            invitee,
+            "wrapped",
+        )
+        .await
+        .expect("grant");
+        (session_id, manager)
+    }
+
+    async fn key_count(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     async fn grant_count(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> i64 {
@@ -1522,6 +1571,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
             Path((team, victim)),
         )
         .await;
@@ -1541,6 +1591,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
             Path((team, caller)),
         )
         .await;
@@ -1563,6 +1614,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(mate)),
             Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
             Path((team, mate)),
         )
         .await;
@@ -1593,6 +1645,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(mate)),
             Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
             Path((team_a, mate)),
         )
         .await;
@@ -1623,6 +1676,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(mate)),
             Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
             Path((team, mate)),
         )
         .await;
@@ -1632,6 +1686,73 @@ mod authz_tests {
             grant_count(&pool, session_id, stranger).await,
             1,
             "removing mate must not touch a grant belonging to a different invitee"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_closes_ws_admission_and_deletes_their_wrapped_key() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_team_member(&pool, team, host).await;
+        add_team_member(&pool, team, mate).await;
+        let (session_id, manager) = seed_live_session_with_grant(&pool, host, mate).await;
+        assert!(admits_over_ws(&pool, &manager, session_id, host, mate).await);
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(mate)),
+            Extension(SyncNotifier::new()),
+            Extension(manager.clone()),
+            Path((team, mate)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+        assert!(
+            !admits_over_ws(&pool, &manager, session_id, host, mate).await,
+            "a removed teammate must no longer be admitted to the still-live session"
+        );
+        assert_eq!(
+            key_count(&pool, session_id, mate).await,
+            0,
+            "the wrapped key GET .../key serves must go with the grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_inviter_revokes_the_grants_they_issued() {
+        let pool = test_pool_or_skip!();
+        // Owned by a third party: the owner cannot be removed from their team.
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        add_team_member(&pool, team, host).await;
+        add_team_member(&pool, team, guest).await;
+        let (session_id, manager) = seed_live_session_with_grant(&pool, host, guest).await;
+
+        // The *inviter* leaves the only team they share with their guest —
+        // `grant_invitee` would now refuse the invite, so the grant must go too.
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(SyncNotifier::new()),
+            Extension(manager.clone()),
+            Path((team, host)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+        assert_eq!(
+            grant_count(&pool, session_id, guest).await,
+            0,
+            "a grant dies when its inviter stops being a teammate, not only its holder"
+        );
+        assert!(
+            !admits_over_ws(&pool, &manager, session_id, host, guest).await,
+            "the guest must lose admission to the session too"
         );
     }
 

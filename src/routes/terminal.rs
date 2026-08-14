@@ -191,6 +191,57 @@ pub(crate) async fn grant_invitee(
     Ok(())
 }
 
+/// Undoes `grant_invitee` for every grant `user_id` is no longer qualified for
+/// after leaving a team — both grants they hold and grants they issued, since
+/// the admission guard tests the inviter/invitee *pair*. Clears the durable
+/// row, the wrapped key (`GET .../key` would otherwise still hand it out) and
+/// the in-memory set the WebSocket actually reads.
+///
+/// Scope: this closes admission to *new* connections. The relay protocol has no
+/// eviction message, so a participant already attached to the live socket stays
+/// until they disconnect — deliberate, not an oversight.
+pub(crate) async fn revoke_grants_for_departed_member(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let revoked: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "DELETE FROM terminal_session_invitees tsi \
+          WHERE (tsi.user_id = $1 OR tsi.invited_by = $1) \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM team_members a \
+                JOIN team_members b ON a.team_id = b.team_id \
+               WHERE a.user_id = tsi.invited_by AND b.user_id = tsi.user_id) \
+          RETURNING tsi.session_id, tsi.user_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    if revoked.is_empty() {
+        return Ok(());
+    }
+
+    let (session_ids, user_ids): (Vec<Uuid>, Vec<Uuid>) = revoked.iter().copied().unzip();
+    sqlx::query(
+        "DELETE FROM terminal_session_keys tsk \
+          USING UNNEST($1::uuid[], $2::uuid[]) AS revoked(session_id, user_id) \
+          WHERE tsk.session_id = revoked.session_id AND tsk.user_id = revoked.user_id",
+    )
+    .bind(&session_ids)
+    .bind(&user_ids)
+    .execute(pool)
+    .await?;
+
+    let mut sessions = manager.sessions.lock().await;
+    for (session_id, revoked_user) in revoked {
+        if let Some(state) = sessions.get_mut(&session_id) {
+            state.invitees.remove(&revoked_user);
+        }
+    }
+    Ok(())
+}
+
 /// Concurrent-session cap for a host billed on their own plan — `invite_link`
 /// and `direct` sessions, which have no vault owner to bill against.
 /// `None` means the tier may not host at all.
@@ -743,15 +794,20 @@ async fn fan_out_session_ended(
         return;
     };
 
-    // Recipients must be loaded above, before this delete: it clears the very
+    // Recipients must be loaded above, before these deletes: they clear the very
     // rows `session_end_recipients` reads invitees from, so deleting first
     // would fan the "session ended" push out to nobody.
-    if let Err(e) = sqlx::query("DELETE FROM terminal_session_invitees WHERE session_id = $1")
-        .bind(session_id)
-        .execute(pool)
-        .await
-    {
-        error!(error = %e, session_id = %session_id, "Failed to clear session invitees");
+    //
+    // Both tables hold per-invitee grant state whose `ON DELETE CASCADE` a soft
+    // end (`ended_at = now()`) never fires, so both must be cleared explicitly.
+    for table in ["terminal_session_invitees", "terminal_session_keys"] {
+        if let Err(e) = sqlx::query(&format!("DELETE FROM {table} WHERE session_id = $1"))
+            .bind(session_id)
+            .execute(pool)
+            .await
+        {
+            error!(error = %e, session_id = %session_id, table, "Failed to clear session grant rows");
+        }
     }
 
     for recipient in recipients {
@@ -867,7 +923,7 @@ pub async fn ws_handler(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn is_authorized_participant(
+pub(crate) async fn is_authorized_participant(
     pool: &PgPool,
     user_id: Uuid,
     host_user_id: Uuid,
@@ -1895,6 +1951,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining, 0, "ending the session must clear its invitee grants");
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(keys, 0, "the wrapped keys are grant state too and must go with them");
+    }
+
+    #[tokio::test]
+    async fn a_guest_leaving_does_not_end_the_session_for_everyone() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        add_member(&pool, team, other).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        // Two invitees: with only the leaver invited, a wrongly fanned-out end
+        // would have no recipient left to push to and the assertion below would
+        // pass vacuously.
+        for invitee in [mate, other] {
+            grant_invitee(&pool, &notifier, &manager, session_id, host, invitee, "wrapped")
+                .await
+                .unwrap();
+        }
+
+        let mut events = notifier.subscribe();
+        let (tx, _keep) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        // The guest's socket closes, not the host's.
+        cleanup_participant(&manager, session_id, mate, &tx, &pool, &notifier).await;
+
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, crate::sync_notifier::SyncEvent::SessionEnded { .. }),
+                "one guest closing a tab must not end the session for everyone"
+            );
+        }
+        let ended_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT ended_at FROM terminal_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_at.is_none(), "the session must still be live");
+        assert!(manager.sessions.lock().await.contains_key(&session_id));
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grants, 2, "nobody's grant is revoked by a guest disconnecting");
     }
 
     #[tokio::test]
@@ -1930,25 +2046,7 @@ mod tests {
     ) -> (crate::sync_notifier::SyncNotifier, TerminalManager) {
         let notifier = crate::sync_notifier::SyncNotifier::new();
         let manager = TerminalManager::new();
-        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
-        manager.sessions.lock().await.insert(
-            session_id,
-            crate::terminal_manager::SessionState {
-                vault_ids: vec![],
-                allowed_roles: vec![],
-                invite_token: None,
-                invitees: std::collections::HashSet::new(),
-                host_user_id: host,
-                host_public_key: String::new(),
-                visibility: "direct".to_string(),
-                vault_owner_id: None,
-                participants: std::collections::HashMap::new(),
-                control_holder: host,
-                pending_control_request: None,
-                tx,
-                output_history: std::collections::VecDeque::new(),
-            },
-        );
+        manager.insert_test_session(session_id, host).await;
         (notifier, manager)
     }
 }
