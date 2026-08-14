@@ -46,11 +46,11 @@ async fn owner_effective_tier(pool: &PgPool, user_id: Uuid) -> String {
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
     /// Vaults whose members can join (multi-vault support).
-    /// Required for visibility="vault"; unused for visibility="invite_link".
+    /// Required for visibility="vault"; unused for visibility="invite_link"/"direct".
     #[serde(default)]
     pub vault_ids: Vec<Uuid>,
     pub connection_name: String,
-    /// "vault" (default) | "invite_link"
+    /// "vault" (default) | "invite_link" | "direct"
     pub visibility: Option<String>,
     /// Per-user wrapped session keys (E2EE) — used for vault sessions.
     #[serde(default)]
@@ -61,6 +61,10 @@ pub struct CreateSessionRequest {
     /// Values: "owner" | "manager" | "editor" | "member". Empty = all roles.
     #[serde(default)]
     pub allowed_roles: Vec<String>,
+    /// Named teammates granted access individually (visibility "direct", or
+    /// alongside a vault share). Each entry carries that user's wrapped key.
+    #[serde(default)]
+    pub invitees: Vec<ParticipantKeyEntry>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -89,6 +93,12 @@ pub struct ActiveSession {
     /// Team IDs (= vault IDs on the client) this session is shared with.
     /// Empty for invite_link sessions.
     pub vault_ids: Vec<Uuid>,
+    /// Set when the caller reaches this session through an individual grant
+    /// (#66) rather than a vault share — names who invited them.
+    pub invited_by: Option<Uuid>,
+    /// Everyone the host has individually invited (#66). Populated only when
+    /// the caller is the host — a guest must not learn the guest list.
+    pub invitee_ids: Vec<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +108,95 @@ pub struct SessionKeyResponse {
     /// Set for invite_link sessions: raw key bytes (base64), no E2EE.
     pub raw_key: Option<String>,
     pub host_public_key: String,
+}
+
+/// True when the two users are members of at least one team in common.
+pub(crate) async fn shares_a_team(pool: &PgPool, a: Uuid, b: Uuid) -> Result<bool, StatusCode> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(\
+           SELECT 1 FROM team_members ma \
+           JOIN team_members mb ON mb.team_id = ma.team_id \
+           WHERE ma.user_id = $1 AND mb.user_id = $2)",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to check shared team membership");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Grants one named user access to a session: the durable row, the wrapped key,
+/// the in-memory authorization set, and the push. The single grant path — both
+/// `create_session` with visibility "direct" and the invitees endpoint call it.
+pub(crate) async fn grant_invitee(
+    pool: &PgPool,
+    notifier: &crate::sync_notifier::SyncNotifier,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    host_user_id: Uuid,
+    user_id: Uuid,
+    wrapped_key: &str,
+) -> Result<(), StatusCode> {
+    // A direct session has no vault, so none of the vault permission checks
+    // apply to it. Without this the host could grant an arbitrary user id.
+    if user_id != host_user_id && !shares_a_team(pool, host_user_id, user_id).await? {
+        warn!(host = %host_user_id, invitee = %user_id, "Invite rejected: not a teammate");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let invitee_insert = sqlx::query(
+        "INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(host_user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, session_id = %session_id, "Failed to insert session invitee");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(wrapped_key)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, session_id = %session_id, "Failed to insert invitee session key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Some(state) = manager.sessions.lock().await.get_mut(&session_id) {
+        state.invitees.insert(user_id);
+    }
+
+    // Only push on a genuinely new grant — the ON CONFLICT above means a repeat
+    // invite of someone already granted must not re-knock them.
+    if invitee_insert.rows_affected() > 0 {
+        notifier.notify_session_shared(user_id, session_id, host_user_id);
+    }
+    Ok(())
+}
+
+/// Concurrent-session cap for a host billed on their own plan — `invite_link`
+/// and `direct` sessions, which have no vault owner to bill against.
+/// `None` means the tier may not host at all.
+fn host_tier_session_limit(tier: &str) -> Option<i64> {
+    match tier {
+        "business" => Some(20),
+        "teams" => Some(5),
+        "pro" => Some(1),
+        _ => None,
+    }
 }
 
 // ─── Create terminal session ──────────────────────────────────────────────────
@@ -184,13 +283,13 @@ pub async fn create_session(
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     } else {
-        // invite_link visibility: gate on the host's own JWT tier
-        let session_limit: i64 = match auth_claims.0.tier.as_str() {
-            "business" => 20,
-            "teams"    => 5,
-            "pro"      => 1,
-            _          => return Err(StatusCode::PAYMENT_REQUIRED),
-        };
+        // invite_link and direct visibility: gate on the host's own JWT tier
+        if visibility == "direct" && body.invitees.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let session_limit = host_tier_session_limit(auth_claims.0.tier.as_str())
+            .ok_or(StatusCode::PAYMENT_REQUIRED)?;
 
         let active_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM terminal_sessions \
@@ -293,6 +392,7 @@ pub async fn create_session(
                 vault_ids: body.vault_ids.clone(),
                 allowed_roles: body.allowed_roles.clone(),
                 invite_token: invite_token.clone(),
+                invitees: std::collections::HashSet::new(),
                 host_user_id: auth.0,
                 host_public_key,
                 visibility: visibility.clone(),
@@ -306,22 +406,72 @@ pub async fn create_session(
         );
     }
 
+    // Named invitees: after the in-memory session state exists (grant_invitee
+    // fills its invitees set) and last, so a recipient acting on the push
+    // before their wrapped key row lands gets a 404 from get_my_session_key.
+    for entry in &body.invitees {
+        if let Err(e) = grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            session_id,
+            auth.0,
+            entry.user_id,
+            &entry.wrapped_key,
+        )
+        .await
+        {
+            // A partially-granted session must not linger as "active": it would
+            // count against the host's own concurrency limit forever, and the
+            // client never learned its id to end it itself. Only drop the
+            // in-memory entry once the row is confirmed ended — otherwise the
+            // session would be both still-counted AND unreachable.
+            match sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&pool)
+                .await
+            {
+                Ok(_) => {
+                    manager.sessions.lock().await.remove(&session_id);
+                }
+                Err(update_err) => {
+                    error!(
+                        error = %update_err,
+                        session_id = %session_id,
+                        "Failed to end orphaned session after a failed grant; it remains live and reachable"
+                    );
+                }
+            }
+            return Err(e);
+        }
+    }
+
     info!(session_id = %session_id, visibility = %visibility, vault_count = body.vault_ids.len(), "Terminal session created");
     Ok((StatusCode::CREATED, Json(CreateSessionResponse { session_id, invite_token })))
 }
 
 // ─── List active sessions (vault sessions the user is part of) ────────────────
 
-pub async fn list_active_sessions(
-    State(pool): State<PgPool>,
-    Extension(auth): Extension<AuthUser>,
-    Extension(manager): Extension<TerminalManager>,
-) -> Result<Json<Vec<ActiveSession>>, StatusCode> {
-    // Show vault sessions where user is a member of one of the session's vaults
-    // (respecting role filter if set).
-    // Invite-link sessions are NOT listed here — they're accessible only via the link.
-    // Host always sees their own sessions.
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<Utc>, Vec<Uuid>)>(
+type VisibleSessionRow = (
+    Uuid,
+    String,
+    Uuid,
+    String,
+    chrono::DateTime<Utc>,
+    Vec<Uuid>,
+    Option<Uuid>,
+    Vec<Uuid>,
+);
+
+/// Sessions `user_id` may see: their own, ones they hold an individual grant
+/// (#66) on, and vault sessions shared with a team they belong to (respecting
+/// the role filter if set). Invite-link sessions are reachable only via the
+/// link, never listed here.
+async fn visible_sessions(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<VisibleSessionRow>, StatusCode> {
+    sqlx::query_as::<_, VisibleSessionRow>(
         r#"
         SELECT
             ts.id,
@@ -332,75 +482,99 @@ pub async fn list_active_sessions(
             COALESCE(
                 (SELECT array_agg(tsv.team_id) FROM terminal_session_vaults tsv WHERE tsv.session_id = ts.id),
                 ARRAY[]::uuid[]
-            ) AS vault_ids
+            ) AS vault_ids,
+            (SELECT tsi.invited_by FROM terminal_session_invitees tsi
+              WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by,
+            CASE WHEN ts.host_user_id = $1 THEN
+              COALESCE(
+                (SELECT array_agg(tsi3.user_id) FROM terminal_session_invitees tsi3 WHERE tsi3.session_id = ts.id),
+                ARRAY[]::uuid[]
+              )
+            ELSE ARRAY[]::uuid[] END AS invitee_ids
         FROM terminal_sessions ts
         WHERE ts.ended_at IS NULL
-          AND ts.visibility = 'vault'
           AND (
-            ts.host_user_id = $1
-            OR EXISTS (
-              SELECT 1
-              FROM terminal_session_vaults tsv
-              JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
-              WHERE tsv.session_id = ts.id
-                AND EXISTS (
-                  SELECT 1
-                  FROM team_member_roles tmr_perm
-                  JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
-                  WHERE tmr_perm.team_id = tsv.team_id
-                    AND tmr_perm.user_id = $1
-                    AND (tr_perm.permissions & $2) != 0
-                )
-                AND (
-                  array_length(ts.allowed_roles, 1) IS NULL
-                  OR cardinality(ts.allowed_roles) = 0
-                  OR EXISTS (
+            (ts.host_user_id = $1 AND ts.visibility IN ('vault', 'direct'))
+            OR EXISTS (SELECT 1 FROM terminal_session_invitees tsi
+                        WHERE tsi.session_id = ts.id AND tsi.user_id = $1)
+            OR (
+              ts.visibility = 'vault'
+              AND EXISTS (
+                SELECT 1
+                FROM terminal_session_vaults tsv
+                JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
+                WHERE tsv.session_id = ts.id
+                  AND EXISTS (
                     SELECT 1
-                    FROM team_member_roles tmr
-                    JOIN team_roles tr ON tr.id = tmr.role_id
-                    WHERE tmr.team_id = tsv.team_id
-                      AND tmr.user_id = $1
-                      AND tr.name = ANY(ts.allowed_roles)
+                    FROM team_member_roles tmr_perm
+                    JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
+                    WHERE tmr_perm.team_id = tsv.team_id
+                      AND tmr_perm.user_id = $1
+                      AND (tr_perm.permissions & $2) != 0
                   )
-                )
+                  AND (
+                    array_length(ts.allowed_roles, 1) IS NULL
+                    OR cardinality(ts.allowed_roles) = 0
+                    OR EXISTS (
+                      SELECT 1
+                      FROM team_member_roles tmr
+                      JOIN team_roles tr ON tr.id = tmr.role_id
+                      WHERE tmr.team_id = tsv.team_id
+                        AND tmr.user_id = $1
+                        AND tr.name = ANY(ts.allowed_roles)
+                    )
+                  )
+              )
             )
           )
         ORDER BY ts.created_at DESC
         "#,
     )
-    .bind(auth.0)
+    .bind(user_id)
     .bind(crate::permissions::PERM_VIEW_TERMINAL_SESSIONS)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| {
         error!(error = %e, "Failed to list active sessions");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })
+}
+
+pub async fn list_active_sessions(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(manager): Extension<TerminalManager>,
+) -> Result<Json<Vec<ActiveSession>>, StatusCode> {
+    let rows = visible_sessions(&pool, auth.0).await?;
 
     let sessions_lock = manager.sessions.lock().await;
     let result = rows
         .into_iter()
         .filter(|(id, ..)| sessions_lock.contains_key(id))
-        .map(|(id, connection_name, host_user_id, visibility, created_at, vault_ids)| {
-            let (participant_count, participants, host_public_key) = sessions_lock
-                .get(&id)
-                .map(|s| {
-                    let ps: Vec<Participant> = s.participants.values().cloned().collect();
-                    (ps.len() as i64, ps, s.host_public_key.clone())
-                })
-                .unwrap_or_default();
-            ActiveSession {
-                id,
-                connection_name,
-                host_user_id,
-                host_public_key,
-                visibility,
-                created_at,
-                participant_count,
-                participants,
-                vault_ids,
-            }
-        })
+        .map(
+            |(id, connection_name, host_user_id, visibility, created_at, vault_ids, invited_by, invitee_ids)| {
+                let (participant_count, participants, host_public_key) = sessions_lock
+                    .get(&id)
+                    .map(|s| {
+                        let ps: Vec<Participant> = s.participants.values().cloned().collect();
+                        (ps.len() as i64, ps, s.host_public_key.clone())
+                    })
+                    .unwrap_or_default();
+                ActiveSession {
+                    id,
+                    connection_name,
+                    host_user_id,
+                    host_public_key,
+                    visibility,
+                    created_at,
+                    participant_count,
+                    participants,
+                    vault_ids,
+                    invited_by,
+                    invitee_ids,
+                }
+            },
+        )
         .collect();
 
     Ok(Json(result))
@@ -483,7 +657,73 @@ pub async fn get_my_session_key(
     Err(StatusCode::NOT_FOUND)
 }
 
+/// Confirms `caller` is the host of a still-active session, or fails with the
+/// status the caller should return: `NOT_FOUND` if the session doesn't exist
+/// or has already ended, `FORBIDDEN` if `caller` isn't its host. Shared by
+/// `end_session` and `invite_to_session` — both gate on exactly this check.
+async fn require_active_session_host(
+    pool: &PgPool,
+    session_id: Uuid,
+    caller: Uuid,
+) -> Result<(), StatusCode> {
+    let host_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT host_user_id FROM terminal_sessions WHERE id = $1 AND ended_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to get session host");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if host_id != caller {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(())
+}
+
 // ─── End session ─────────────────────────────────────────────────────────────
+
+/// Everyone who should be told this session ended: team members of its vaults
+/// plus individually invited users, minus the host.
+async fn session_end_recipients(
+    pool: &PgPool,
+    session_id: Uuid,
+    host_user_id: Uuid,
+) -> Result<Vec<Uuid>, StatusCode> {
+    let team_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT team_id FROM terminal_session_vaults WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to load session vault teams");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let mut recipients = std::collections::HashSet::new();
+    crate::sync_notifier::notify_team_members(pool, &team_ids, host_user_id, |member_id| {
+        recipients.insert(member_id);
+    })
+    .await;
+
+    let invitee_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM terminal_session_invitees WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to load session invitees");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    recipients.extend(invitee_ids);
+    recipients.remove(&host_user_id);
+
+    Ok(recipients.into_iter().collect())
+}
 
 pub async fn end_session(
     State(pool): State<PgPool>,
@@ -492,21 +732,7 @@ pub async fn end_session(
     Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
     Path(session_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let host_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT host_user_id FROM terminal_sessions WHERE id = $1 AND ended_at IS NULL",
-    )
-    .bind(session_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to get session host");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    if host_id != auth.0 {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_active_session_host(&pool, session_id, auth.0).await?;
 
     sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
         .bind(session_id)
@@ -524,22 +750,43 @@ pub async fn end_session(
         }
     }
 
-    let team_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT team_id FROM terminal_session_vaults WHERE session_id = $1",
-    )
-    .bind(session_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-
-    if !team_ids.is_empty() {
-        crate::sync_notifier::notify_team_members(&pool, &team_ids, auth.0, |recipient| {
-            notifier.notify_session_ended(recipient, session_id);
-        })
-        .await;
+    let recipients = session_end_recipients(&pool, session_id, auth.0).await?;
+    for recipient in recipients {
+        notifier.notify_session_ended(recipient, session_id);
     }
 
     info!(session_id = %session_id, "Terminal session ended");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Invite a teammate directly ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct InviteToSessionRequest {
+    pub user_id: Uuid,
+    pub wrapped_key: String,
+}
+
+pub async fn invite_to_session(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(manager): Extension<TerminalManager>,
+    Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<InviteToSessionRequest>,
+) -> Result<StatusCode, StatusCode> {
+    require_active_session_host(&pool, session_id, auth.0).await?;
+
+    grant_invitee(
+        &pool,
+        &notifier,
+        &manager,
+        session_id,
+        auth.0,
+        body.user_id,
+        &body.wrapped_key,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -578,6 +825,69 @@ pub async fn ws_handler(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn is_authorized_participant(
+    pool: &PgPool,
+    user_id: Uuid,
+    host_user_id: Uuid,
+    visibility: &str,
+    vault_ids: &[Uuid],
+    allowed_roles: &[String],
+    stored_token: Option<&str>,
+    presented_token: Option<&str>,
+    invitees: &std::collections::HashSet<Uuid>,
+) -> bool {
+    if user_id == host_user_id {
+        return true;
+    }
+    if invitees.contains(&user_id) {
+        return true;
+    }
+    if visibility == "invite_link" {
+        // Invite link: validate token
+        return presented_token.is_some() && presented_token == stored_token;
+    }
+    // Vault session: user must be a member of one of the session's vaults,
+    // satisfy the role filter (if any), and have JOIN_TERMINAL_SESSION permission.
+    if vault_ids.is_empty() {
+        return false;
+    }
+    let is_member = if allowed_roles.is_empty() {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = ANY($1) AND user_id = $2)",
+        )
+        .bind(vault_ids)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+    } else {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(\
+              SELECT 1 FROM team_members tm \
+              JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id \
+              JOIN team_roles tr ON tr.id = tmr.role_id \
+              WHERE tm.team_id = ANY($1) AND tm.user_id = $2 AND tr.name = ANY($3)\
+            )",
+        )
+        .bind(vault_ids)
+        .bind(user_id)
+        .bind(allowed_roles)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+    };
+    is_member
+        && crate::permissions::has_any_team_permission(
+            pool,
+            vault_ids,
+            user_id,
+            crate::permissions::PERM_JOIN_TERMINAL_SESSION,
+        )
+        .await
+        .unwrap_or(false)
+}
+
 async fn handle_socket(
     socket: WebSocket,
     session_id: Uuid,
@@ -590,17 +900,28 @@ async fn handle_socket(
     // Fetch session state from in-memory manager
     let session_info = {
         let sessions = manager.sessions.lock().await;
-        sessions.get(&session_id).map(|s| (
-            s.vault_ids.clone(),
-            s.visibility.clone(),
-            s.allowed_roles.clone(),
-            s.invite_token.clone(),
-            s.host_user_id,
-            s.vault_owner_id,
-        ))
+        sessions.get(&session_id).map(|s| {
+            (
+                s.vault_ids.clone(),
+                s.visibility.clone(),
+                s.allowed_roles.clone(),
+                s.invite_token.clone(),
+                s.host_user_id,
+                s.vault_owner_id,
+                s.invitees.clone(),
+            )
+        })
     };
 
-    let (vault_ids, visibility, allowed_roles, stored_token, host_user_id, vault_owner_id) = match session_info {
+    let (
+        vault_ids,
+        visibility,
+        allowed_roles,
+        stored_token,
+        host_user_id,
+        vault_owner_id,
+        invitees,
+    ) = match session_info {
         Some(info) => info,
         None => {
             warn!(session_id = %session_id, user_id = %user_id, "WS: session not found");
@@ -608,54 +929,22 @@ async fn handle_socket(
         }
     };
 
-    // Host is always allowed
-    if user_id != host_user_id {
-        let authorized = if visibility == "invite_link" {
-            // Invite link: validate token
-            invite_token.is_some() && invite_token.as_deref() == stored_token.as_deref()
-        } else {
-            // Vault session: user must be a member of one of the session's vaults,
-            // satisfy the role filter (if any), and have JOIN_TERMINAL_SESSION permission.
-            if vault_ids.is_empty() {
-                false
-            } else {
-                let is_member = if allowed_roles.is_empty() {
-                    sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = ANY($1) AND user_id = $2)",
-                    )
-                    .bind(&vault_ids)
-                    .bind(user_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(false)
-                } else {
-                    sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(\
-                          SELECT 1 FROM team_members tm \
-                          JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id \
-                          JOIN team_roles tr ON tr.id = tmr.role_id \
-                          WHERE tm.team_id = ANY($1) AND tm.user_id = $2 AND tr.name = ANY($3)\
-                        )",
-                    )
-                    .bind(&vault_ids)
-                    .bind(user_id)
-                    .bind(&allowed_roles)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(false)
-                };
-                is_member && crate::permissions::has_any_team_permission(
-                    &pool, &vault_ids, user_id, crate::permissions::PERM_JOIN_TERMINAL_SESSION,
-                )
-                .await
-                .unwrap_or(false)
-            }
-        };
+    let authorized = is_authorized_participant(
+        &pool,
+        user_id,
+        host_user_id,
+        &visibility,
+        &vault_ids,
+        &allowed_roles,
+        stored_token.as_deref(),
+        invite_token.as_deref(),
+        &invitees,
+    )
+    .await;
 
-        if !authorized {
-            warn!(session_id = %session_id, user_id = %user_id, "WS: unauthorized user rejected");
-            return;
-        }
+    if !authorized {
+        warn!(session_id = %session_id, user_id = %user_id, "WS: unauthorized user rejected");
+        return;
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -941,7 +1230,7 @@ mod authz_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
-    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use crate::test_support::{add_member, member_with_role, seed_team, seed_user};
     use axum::extract::State;
     use axum::{Extension, Json};
 
@@ -962,15 +1251,28 @@ mod authz_tests {
 
     // `CreateSessionRequest` derives only `Deserialize` — no `Default` — so every
     // field is enumerated explicitly here.
-    fn vault_session_request(vault_ids: Vec<uuid::Uuid>) -> CreateSessionRequest {
+    fn session_request(
+        vault_ids: Vec<uuid::Uuid>,
+        visibility: &str,
+        invitees: Vec<ParticipantKeyEntry>,
+    ) -> CreateSessionRequest {
         CreateSessionRequest {
             vault_ids,
             connection_name: "box".to_string(),
-            visibility: Some("vault".to_string()),
+            visibility: Some(visibility.to_string()),
             participant_keys: Vec::new(),
             session_key_bytes: None,
             allowed_roles: Vec::new(),
+            invitees,
         }
+    }
+
+    fn vault_session_request(vault_ids: Vec<uuid::Uuid>) -> CreateSessionRequest {
+        session_request(vault_ids, "vault", Vec::new())
+    }
+
+    fn direct_session_request(invitees: Vec<ParticipantKeyEntry>) -> CreateSessionRequest {
+        session_request(Vec::new(), "direct", invitees)
     }
 
     #[tokio::test]
@@ -1018,6 +1320,129 @@ mod authz_tests {
     }
 
     #[tokio::test]
+    async fn create_session_direct_grants_invitee_and_populates_in_memory_state() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+
+        let manager = TerminalManager::new();
+        let entry = ParticipantKeyEntry {
+            user_id: mate,
+            wrapped_key: "wrapped".to_string(),
+        };
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(manager.clone()),
+            Extension(SyncNotifier::new()),
+            Json(direct_session_request(vec![entry])),
+        )
+        .await;
+
+        let (status, Json(body)) = res.expect("direct session with an invitee must be created");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+
+        let sessions = manager.sessions.lock().await;
+        let state = sessions
+            .get(&body.session_id)
+            .expect("session must be in memory");
+        assert!(state.invitees.contains(&mate));
+        drop(sessions);
+
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(body.session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(body.session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((grants, keys), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn create_session_direct_rejects_empty_invitees() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
+            Json(direct_session_request(Vec::new())),
+        )
+        .await;
+
+        assert!(matches!(res, Err(axum::http::StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn create_session_direct_tears_down_the_session_when_a_grant_fails() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await; // no shared team with `host`
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+
+        let manager = TerminalManager::new();
+        let entries = vec![
+            ParticipantKeyEntry { user_id: mate, wrapped_key: "wrapped".to_string() },
+            ParticipantKeyEntry { user_id: stranger, wrapped_key: "wrapped".to_string() },
+        ];
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(manager.clone()),
+            Extension(SyncNotifier::new()),
+            Json(direct_session_request(entries)),
+        )
+        .await;
+
+        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+
+        // The session must not linger as "active": ended_at set, and gone from
+        // in-memory state (or `SELECT COUNT ... WHERE ended_at IS NULL` would
+        // keep counting it against the host's own concurrency limit forever).
+        let ended_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT ended_at FROM terminal_sessions WHERE host_user_id = $1",
+        )
+        .bind(host)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(ended_at.is_some(), "the orphaned session must be ended, not left live");
+
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_sessions WHERE host_user_id = $1 AND ended_at IS NULL",
+        )
+        .bind(host)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_count, 0);
+        assert!(manager.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn end_session_forbidden_for_non_host() {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
@@ -1050,5 +1475,263 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_user};
+
+    async fn seed_session(pool: &PgPool, host: Uuid, visibility: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO terminal_sessions (host_user_id, connection_name, visibility) \
+             VALUES ($1, 'web-prod', $2) RETURNING id",
+        )
+        .bind(host)
+        .bind(visibility)
+        .fetch_one(pool)
+        .await
+        .expect("insert session")
+    }
+
+    #[test]
+    fn host_tier_session_limits_match_the_shipped_gate() {
+        assert_eq!(host_tier_session_limit("business"), Some(20));
+        assert_eq!(host_tier_session_limit("teams"), Some(5));
+        assert_eq!(host_tier_session_limit("pro"), Some(1));
+        assert_eq!(host_tier_session_limit("free"), None);
+    }
+
+    #[tokio::test]
+    async fn shares_a_team_is_true_only_for_a_common_team() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+
+        assert!(shares_a_team(&pool, host, mate).await.unwrap());
+        assert!(!shares_a_team(&pool, host, stranger).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_is_idempotent_and_inserts_both_rows() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        for _ in 0..2 {
+            grant_invitee(
+                &pool, &notifier, &manager, session_id, host, mate, "wrapped",
+            )
+            .await
+            .expect("grant");
+        }
+
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((grants, keys), (1, 1));
+
+        let sessions = manager.sessions.lock().await;
+        assert!(sessions.get(&session_id).unwrap().invitees.contains(&mate));
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_pushes_only_on_the_first_grant() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        let mut events = notifier.subscribe();
+        for _ in 0..2 {
+            grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+                .await
+                .expect("grant");
+        }
+
+        let mut shared_count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, crate::sync_notifier::SyncEvent::SessionShared { recipient, .. } if recipient == mate) {
+                shared_count += 1;
+            }
+        }
+        assert_eq!(shared_count, 1, "a repeat grant of the same invitee must not re-push");
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_rejects_a_non_teammate() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        let err = grant_invitee(
+            &pool, &notifier, &manager, session_id, host, stranger, "wrapped",
+        )
+        .await
+        .expect_err("stranger must be rejected");
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grants, 0);
+    }
+
+    #[tokio::test]
+    async fn ws_authorizes_an_invitee_of_a_vaultless_session() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let invitees = manager.sessions.lock().await.get(&session_id).unwrap().invitees.clone();
+        assert!(is_authorized_participant(&pool, mate, host, "direct", &[], &[], None, None, &invitees).await);
+        let stranger = seed_user(&pool).await;
+        assert!(!is_authorized_participant(&pool, stranger, host, "direct", &[], &[], None, None, &invitees).await);
+    }
+
+    #[tokio::test]
+    async fn list_query_excludes_an_invite_link_session_for_its_own_host() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        seed_session(&pool, host, "invite_link").await;
+
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert!(for_host.is_empty(), "invite_link sessions are reachable only via the link, never listed");
+    }
+
+    #[tokio::test]
+    async fn list_query_returns_a_direct_session_only_for_host_and_invitee() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let for_mate = visible_sessions(&pool, mate).await.unwrap();
+        assert_eq!(for_mate.len(), 1);
+        assert_eq!(for_mate[0].0, session_id);
+        assert_eq!(for_mate[0].6, Some(host), "invited_by names the host");
+
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert_eq!(for_host.len(), 1);
+        assert_eq!(for_host[0].6, None, "the host is not their own invitee");
+
+        assert!(visible_sessions(&pool, stranger).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_query_reveals_invitee_ids_only_to_the_host() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert_eq!(for_host[0].7, vec![mate], "the host sees who they invited");
+
+        let for_mate = visible_sessions(&pool, mate).await.unwrap();
+        assert!(for_mate[0].7.is_empty(), "an invitee must not learn the guest list");
+    }
+
+    #[tokio::test]
+    async fn end_session_recipients_include_invitees_of_a_vaultless_session() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let recipients = session_end_recipients(&pool, session_id, host).await.unwrap();
+        assert_eq!(recipients, vec![mate]);
+    }
+
+    async fn test_notifier_and_manager(
+        session_id: Uuid,
+        host: Uuid,
+    ) -> (crate::sync_notifier::SyncNotifier, TerminalManager) {
+        let notifier = crate::sync_notifier::SyncNotifier::new();
+        let manager = TerminalManager::new();
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+        manager.sessions.lock().await.insert(
+            session_id,
+            crate::terminal_manager::SessionState {
+                vault_ids: vec![],
+                allowed_roles: vec![],
+                invite_token: None,
+                invitees: std::collections::HashSet::new(),
+                host_user_id: host,
+                host_public_key: String::new(),
+                visibility: "direct".to_string(),
+                vault_owner_id: None,
+                participants: std::collections::HashMap::new(),
+                control_holder: host,
+                pending_control_request: None,
+                tx,
+                output_history: std::collections::VecDeque::new(),
+            },
+        );
+        (notifier, manager)
     }
 }
