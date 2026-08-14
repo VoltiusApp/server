@@ -447,7 +447,7 @@ pub async fn add_member(
         Some(json!({ "role": role_name, "status": "pending" })),
     ));
     // Notify the invitee so their client refreshes pending invitations
-    notifier.notify(invitee_id, format!("pending_invitations_changed:{invitee_id}"));
+    notifier.notify_pending_invitations_changed(invitee_id);
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
 }
@@ -1234,7 +1234,7 @@ pub async fn invite_member(
             invite_display_name,
             Some(json!({ "role": role, "status": "pending" })),
         ));
-        notifier.notify(user_id, format!("pending_invitations_changed:{user_id}"));
+        notifier.notify_pending_invitations_changed(user_id);
         notify_team_members_changed(&pool, &notifier, team_id).await;
         return Ok(Json(InviteMemberResponse { status: "invited".to_string() }));
     }

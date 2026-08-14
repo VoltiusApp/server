@@ -344,7 +344,7 @@ pub async fn decline_my_pending_invitation(
     // invitation that no longer exists. Accept gets this via
     // notify_membership_changed; decline changes no membership, so it needs the
     // invitation-scoped event explicitly.
-    notifier.notify(auth.0, format!("pending_invitations_changed:{}", auth.0));
+    notifier.notify_pending_invitations_changed(auth.0);
     // Notify team so the inviter's pending list refreshes
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)

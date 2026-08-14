@@ -56,6 +56,17 @@ impl SyncNotifier {
         let _ = self.0.tx.send(SyncEvent::MembershipChanged { user_id });
     }
 
+    /// Tell this user's own devices to refetch `/my/pending-invitations`, after
+    /// an invitation addressed to them was created or declined.
+    ///
+    /// There is no dedicated `SyncEvent` for this: it rides the BlobPushed
+    /// channel with an invitation-scoped payload in the device-id slot, which
+    /// the client matches by the `pending_invitations_changed:` prefix. Keep
+    /// that string byte-identical or the match silently stops firing.
+    pub fn notify_pending_invitations_changed(&self, user_id: Uuid) {
+        self.notify(user_id, format!("pending_invitations_changed:{user_id}"));
+    }
+
     pub fn notify_presence_changed(&self, recipient: Uuid, subject: Uuid, online: bool) {
         let _ = self.0.tx.send(SyncEvent::PresenceChanged {
             recipient,
