@@ -22,9 +22,6 @@ pub struct SessionState {
     pub invite_token: Option<String>,
     /// Users granted access individually (issue #66). Authoritative for WS
     /// authorization; lost on restart along with the session itself.
-    // Read by the WS join check in a later task; unused by production code
-    // until then.
-    #[allow(dead_code)]
     pub invitees: std::collections::HashSet<Uuid>,
     pub host_user_id: Uuid,
     pub host_public_key: String,

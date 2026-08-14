@@ -424,6 +424,10 @@ async fn main() {
             "/v1/terminal-sessions/:id",
             delete(routes::terminal::end_session),
         )
+        .route(
+            "/v1/terminal-sessions/:id/invitees",
+            post(routes::terminal::invite_to_session),
+        )
         // Audit logs — read + export (VIEW_AUDIT_LOG enforced in handler)
         .route(
             "/v1/teams/:team_id/audit-logs",

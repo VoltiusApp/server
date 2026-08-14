@@ -101,9 +101,6 @@ pub struct SessionKeyResponse {
 }
 
 /// True when the two users are members of at least one team in common.
-// Wired into the direct-invitees endpoint in a later task; unused by production
-// code until then.
-#[allow(dead_code)]
 pub(crate) async fn shares_a_team(pool: &PgPool, a: Uuid, b: Uuid) -> Result<bool, StatusCode> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(\
@@ -124,7 +121,6 @@ pub(crate) async fn shares_a_team(pool: &PgPool, a: Uuid, b: Uuid) -> Result<boo
 /// Grants one named user access to a session: the durable row, the wrapped key,
 /// the in-memory authorization set, and the push. The single grant path — both
 /// `create_session` with visibility "direct" and the invitees endpoint call it.
-#[allow(dead_code)]
 pub(crate) async fn grant_invitee(
     pool: &PgPool,
     notifier: &crate::sync_notifier::SyncNotifier,
@@ -621,6 +617,48 @@ pub async fn end_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Invite a teammate directly ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct InviteToSessionRequest {
+    pub user_id: Uuid,
+    pub wrapped_key: String,
+}
+
+pub async fn invite_to_session(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(manager): Extension<TerminalManager>,
+    Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<InviteToSessionRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let host_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT host_user_id FROM terminal_sessions WHERE id = $1 AND ended_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if host_id != auth.0 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    grant_invitee(
+        &pool,
+        &notifier,
+        &manager,
+        session_id,
+        auth.0,
+        body.user_id,
+        &body.wrapped_key,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── WebSocket handler ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -656,6 +694,69 @@ pub async fn ws_handler(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn is_authorized_participant(
+    pool: &PgPool,
+    user_id: Uuid,
+    host_user_id: Uuid,
+    visibility: &str,
+    vault_ids: &[Uuid],
+    allowed_roles: &[String],
+    stored_token: Option<&str>,
+    presented_token: Option<&str>,
+    invitees: &std::collections::HashSet<Uuid>,
+) -> bool {
+    if user_id == host_user_id {
+        return true;
+    }
+    if invitees.contains(&user_id) {
+        return true;
+    }
+    if visibility == "invite_link" {
+        // Invite link: validate token
+        return presented_token.is_some() && presented_token == stored_token;
+    }
+    // Vault session: user must be a member of one of the session's vaults,
+    // satisfy the role filter (if any), and have JOIN_TERMINAL_SESSION permission.
+    if vault_ids.is_empty() {
+        return false;
+    }
+    let is_member = if allowed_roles.is_empty() {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = ANY($1) AND user_id = $2)",
+        )
+        .bind(vault_ids)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+    } else {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(\
+              SELECT 1 FROM team_members tm \
+              JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id \
+              JOIN team_roles tr ON tr.id = tmr.role_id \
+              WHERE tm.team_id = ANY($1) AND tm.user_id = $2 AND tr.name = ANY($3)\
+            )",
+        )
+        .bind(vault_ids)
+        .bind(user_id)
+        .bind(allowed_roles)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+    };
+    is_member
+        && crate::permissions::has_any_team_permission(
+            pool,
+            vault_ids,
+            user_id,
+            crate::permissions::PERM_JOIN_TERMINAL_SESSION,
+        )
+        .await
+        .unwrap_or(false)
+}
+
 async fn handle_socket(
     socket: WebSocket,
     session_id: Uuid,
@@ -668,17 +769,28 @@ async fn handle_socket(
     // Fetch session state from in-memory manager
     let session_info = {
         let sessions = manager.sessions.lock().await;
-        sessions.get(&session_id).map(|s| (
-            s.vault_ids.clone(),
-            s.visibility.clone(),
-            s.allowed_roles.clone(),
-            s.invite_token.clone(),
-            s.host_user_id,
-            s.vault_owner_id,
-        ))
+        sessions.get(&session_id).map(|s| {
+            (
+                s.vault_ids.clone(),
+                s.visibility.clone(),
+                s.allowed_roles.clone(),
+                s.invite_token.clone(),
+                s.host_user_id,
+                s.vault_owner_id,
+                s.invitees.clone(),
+            )
+        })
     };
 
-    let (vault_ids, visibility, allowed_roles, stored_token, host_user_id, vault_owner_id) = match session_info {
+    let (
+        vault_ids,
+        visibility,
+        allowed_roles,
+        stored_token,
+        host_user_id,
+        vault_owner_id,
+        invitees,
+    ) = match session_info {
         Some(info) => info,
         None => {
             warn!(session_id = %session_id, user_id = %user_id, "WS: session not found");
@@ -686,54 +798,22 @@ async fn handle_socket(
         }
     };
 
-    // Host is always allowed
-    if user_id != host_user_id {
-        let authorized = if visibility == "invite_link" {
-            // Invite link: validate token
-            invite_token.is_some() && invite_token.as_deref() == stored_token.as_deref()
-        } else {
-            // Vault session: user must be a member of one of the session's vaults,
-            // satisfy the role filter (if any), and have JOIN_TERMINAL_SESSION permission.
-            if vault_ids.is_empty() {
-                false
-            } else {
-                let is_member = if allowed_roles.is_empty() {
-                    sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = ANY($1) AND user_id = $2)",
-                    )
-                    .bind(&vault_ids)
-                    .bind(user_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(false)
-                } else {
-                    sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(\
-                          SELECT 1 FROM team_members tm \
-                          JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id \
-                          JOIN team_roles tr ON tr.id = tmr.role_id \
-                          WHERE tm.team_id = ANY($1) AND tm.user_id = $2 AND tr.name = ANY($3)\
-                        )",
-                    )
-                    .bind(&vault_ids)
-                    .bind(user_id)
-                    .bind(&allowed_roles)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(false)
-                };
-                is_member && crate::permissions::has_any_team_permission(
-                    &pool, &vault_ids, user_id, crate::permissions::PERM_JOIN_TERMINAL_SESSION,
-                )
-                .await
-                .unwrap_or(false)
-            }
-        };
+    let authorized = is_authorized_participant(
+        &pool,
+        user_id,
+        host_user_id,
+        &visibility,
+        &vault_ids,
+        &allowed_roles,
+        stored_token.as_deref(),
+        invite_token.as_deref(),
+        &invitees,
+    )
+    .await;
 
-        if !authorized {
-            warn!(session_id = %session_id, user_id = %user_id, "WS: unauthorized user rejected");
-            return;
-        }
+    if !authorized {
+        warn!(session_id = %session_id, user_id = %user_id, "WS: unauthorized user rejected");
+        return;
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -1227,6 +1307,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(grants, 0);
+    }
+
+    #[tokio::test]
+    async fn ws_authorizes_an_invitee_of_a_vaultless_session() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let invitees = manager.sessions.lock().await.get(&session_id).unwrap().invitees.clone();
+        assert!(is_authorized_participant(&pool, mate, host, "direct", &[], &[], None, None, &invitees).await);
+        let stranger = seed_user(&pool).await;
+        assert!(!is_authorized_participant(&pool, stranger, host, "direct", &[], &[], None, None, &invitees).await);
     }
 
     async fn test_notifier_and_manager(
