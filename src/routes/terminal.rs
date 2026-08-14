@@ -248,13 +248,6 @@ pub async fn create_session(
         })?;
     }
 
-    if !body.vault_ids.is_empty() {
-        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, auth.0, |recipient| {
-            notifier.notify_session_shared(recipient, session_id, auth.0);
-        })
-        .await;
-    }
-
     // Insert wrapped keys for vault participants (E2EE)
     for entry in &body.participant_keys {
         sqlx::query(
@@ -269,6 +262,15 @@ pub async fn create_session(
             error!(error = %e, session_id = %session_id, "Failed to insert session key");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    }
+
+    // Notified last: a recipient acting on the push before its wrapped key row
+    // lands gets a 404 from get_my_session_key.
+    if !body.vault_ids.is_empty() {
+        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, auth.0, |recipient| {
+            notifier.notify_session_shared(recipient, session_id, auth.0);
+        })
+        .await;
     }
 
     // Get host public key
