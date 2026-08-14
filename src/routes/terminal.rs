@@ -46,11 +46,11 @@ async fn owner_effective_tier(pool: &PgPool, user_id: Uuid) -> String {
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
     /// Vaults whose members can join (multi-vault support).
-    /// Required for visibility="vault"; unused for visibility="invite_link".
+    /// Required for visibility="vault"; unused for visibility="invite_link"/"direct".
     #[serde(default)]
     pub vault_ids: Vec<Uuid>,
     pub connection_name: String,
-    /// "vault" (default) | "invite_link"
+    /// "vault" (default) | "invite_link" | "direct"
     pub visibility: Option<String>,
     /// Per-user wrapped session keys (E2EE) — used for vault sessions.
     #[serde(default)]
@@ -61,6 +61,10 @@ pub struct CreateSessionRequest {
     /// Values: "owner" | "manager" | "editor" | "member". Empty = all roles.
     #[serde(default)]
     pub allowed_roles: Vec<String>,
+    /// Named teammates granted access individually (visibility "direct", or
+    /// alongside a vault share). Each entry carries that user's wrapped key.
+    #[serde(default)]
+    pub invitees: Vec<ParticipantKeyEntry>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -173,6 +177,18 @@ pub(crate) async fn grant_invitee(
     Ok(())
 }
 
+/// Concurrent-session cap for a host billed on their own plan — `invite_link`
+/// and `direct` sessions, which have no vault owner to bill against.
+/// `None` means the tier may not host at all.
+fn host_tier_session_limit(tier: &str) -> Option<i64> {
+    match tier {
+        "business" => Some(20),
+        "teams" => Some(5),
+        "pro" => Some(1),
+        _ => None,
+    }
+}
+
 // ─── Create terminal session ──────────────────────────────────────────────────
 
 pub async fn create_session(
@@ -257,13 +273,13 @@ pub async fn create_session(
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     } else {
-        // invite_link visibility: gate on the host's own JWT tier
-        let session_limit: i64 = match auth_claims.0.tier.as_str() {
-            "business" => 20,
-            "teams"    => 5,
-            "pro"      => 1,
-            _          => return Err(StatusCode::PAYMENT_REQUIRED),
-        };
+        // invite_link and direct visibility: gate on the host's own JWT tier
+        if visibility == "direct" && body.invitees.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let session_limit = host_tier_session_limit(auth_claims.0.tier.as_str())
+            .ok_or(StatusCode::PAYMENT_REQUIRED)?;
 
         let active_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM terminal_sessions \
@@ -378,6 +394,22 @@ pub async fn create_session(
                 output_history: std::collections::VecDeque::new(),
             },
         );
+    }
+
+    // Named invitees: after the in-memory session state exists (grant_invitee
+    // fills its invitees set) and last, so a recipient acting on the push
+    // before their wrapped key row lands gets a 404 from get_my_session_key.
+    for entry in &body.invitees {
+        grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            session_id,
+            auth.0,
+            entry.user_id,
+            &entry.wrapped_key,
+        )
+        .await?;
     }
 
     info!(session_id = %session_id, visibility = %visibility, vault_count = body.vault_ids.len(), "Terminal session created");
@@ -1131,6 +1163,7 @@ mod authz_tests {
             participant_keys: Vec::new(),
             session_key_bytes: None,
             allowed_roles: Vec::new(),
+            invitees: Vec::new(),
         }
     }
 
@@ -1230,6 +1263,14 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("insert session")
+    }
+
+    #[test]
+    fn host_tier_session_limits_match_the_shipped_gate() {
+        assert_eq!(host_tier_session_limit("business"), Some(20));
+        assert_eq!(host_tier_session_limit("teams"), Some(5));
+        assert_eq!(host_tier_session_limit("pro"), Some(1));
+        assert_eq!(host_tier_session_limit("free"), None);
     }
 
     #[tokio::test]
