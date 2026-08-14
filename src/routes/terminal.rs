@@ -161,9 +161,13 @@ pub(crate) async fn grant_invitee(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Refreshed rather than skipped: a recipient whose X25519 keypair changed
+    // after an earlier grant can no longer open the stored wrapping, and with
+    // DO NOTHING every later invite was a silent no-op that left them stuck.
     sqlx::query(
         "INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) \
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (session_id, user_id) DO UPDATE SET wrapped_key = EXCLUDED.wrapped_key",
     )
     .bind(session_id)
     .bind(user_id)
@@ -171,7 +175,7 @@ pub(crate) async fn grant_invitee(
     .execute(pool)
     .await
     .map_err(|e| {
-        error!(error = %e, session_id = %session_id, "Failed to insert invitee session key");
+        error!(error = %e, session_id = %session_id, "Failed to store invitee session key");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -1557,6 +1561,53 @@ mod tests {
 
         let sessions = manager.sessions.lock().await;
         assert!(sessions.get(&session_id).unwrap().invitees.contains(&mate));
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_refreshes_a_stale_wrapped_key() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+
+        // The recipient rotates their keypair between the two grants, so the
+        // first wrapping can no longer be opened; the re-invite must replace it.
+        grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            session_id,
+            host,
+            mate,
+            "wrapped-to-the-old-key",
+        )
+        .await
+        .expect("first grant");
+        grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            session_id,
+            host,
+            mate,
+            "wrapped-to-the-current-key",
+        )
+        .await
+        .expect("second grant");
+
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT wrapped_key FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(mate)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, vec!["wrapped-to-the-current-key".to_string()]);
     }
 
     #[tokio::test]
