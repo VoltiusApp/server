@@ -516,7 +516,8 @@ async fn main() {
             "/v1/terminal-sessions/:id/ws",
             get(routes::terminal::ws_handler),
         )
-        .layer(Extension(terminal_manager));
+        .layer(Extension(terminal_manager))
+        .layer(Extension(notifier));
 
     let app = Router::new()
         .merge(public)

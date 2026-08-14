@@ -50,3 +50,30 @@ impl TerminalManager {
         }
     }
 }
+
+#[cfg(test)]
+impl TerminalManager {
+    /// Registers a minimal live `direct` session so tests can exercise code
+    /// that reads or mutates in-memory session state.
+    pub async fn insert_test_session(&self, session_id: Uuid, host: Uuid) {
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        self.sessions.lock().await.insert(
+            session_id,
+            SessionState {
+                vault_ids: vec![],
+                allowed_roles: vec![],
+                invite_token: None,
+                invitees: std::collections::HashSet::new(),
+                host_user_id: host,
+                host_public_key: String::new(),
+                visibility: "direct".to_string(),
+                vault_owner_id: None,
+                participants: HashMap::new(),
+                control_holder: host,
+                pending_control_request: None,
+                tx,
+                output_history: VecDeque::new(),
+            },
+        );
+    }
+}

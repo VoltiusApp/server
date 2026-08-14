@@ -191,6 +191,57 @@ pub(crate) async fn grant_invitee(
     Ok(())
 }
 
+/// Undoes `grant_invitee` for every grant `user_id` is no longer qualified for
+/// after leaving a team — both grants they hold and grants they issued, since
+/// the admission guard tests the inviter/invitee *pair*. Clears the durable
+/// row, the wrapped key (`GET .../key` would otherwise still hand it out) and
+/// the in-memory set the WebSocket actually reads.
+///
+/// Scope: this closes admission to *new* connections. The relay protocol has no
+/// eviction message, so a participant already attached to the live socket stays
+/// until they disconnect — deliberate, not an oversight.
+pub(crate) async fn revoke_grants_for_departed_member(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let revoked: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "DELETE FROM terminal_session_invitees tsi \
+          WHERE (tsi.user_id = $1 OR tsi.invited_by = $1) \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM team_members a \
+                JOIN team_members b ON a.team_id = b.team_id \
+               WHERE a.user_id = tsi.invited_by AND b.user_id = tsi.user_id) \
+          RETURNING tsi.session_id, tsi.user_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    if revoked.is_empty() {
+        return Ok(());
+    }
+
+    let (session_ids, user_ids): (Vec<Uuid>, Vec<Uuid>) = revoked.iter().copied().unzip();
+    sqlx::query(
+        "DELETE FROM terminal_session_keys tsk \
+          USING UNNEST($1::uuid[], $2::uuid[]) AS revoked(session_id, user_id) \
+          WHERE tsk.session_id = revoked.session_id AND tsk.user_id = revoked.user_id",
+    )
+    .bind(&session_ids)
+    .bind(&user_ids)
+    .execute(pool)
+    .await?;
+
+    let mut sessions = manager.sessions.lock().await;
+    for (session_id, revoked_user) in revoked {
+        if let Some(state) = sessions.get_mut(&session_id) {
+            state.invitees.remove(&revoked_user);
+        }
+    }
+    Ok(())
+}
+
 /// Concurrent-session cap for a host billed on their own plan — `invite_link`
 /// and `direct` sessions, which have no vault owner to bill against.
 /// `None` means the tier may not host at all.
@@ -729,6 +780,41 @@ async fn session_end_recipients(
     Ok(recipients.into_iter().collect())
 }
 
+/// Fan `session_ended` out to `session_end_recipients`. Callers with no
+/// `Result` channel of their own (host disconnect, not `end_session`'s HTTP
+/// response) can call this and just move on; the load failure is logged by
+/// `session_end_recipients` itself.
+async fn fan_out_session_ended(
+    pool: &PgPool,
+    notifier: &crate::sync_notifier::SyncNotifier,
+    session_id: Uuid,
+    host_user_id: Uuid,
+) {
+    let Ok(recipients) = session_end_recipients(pool, session_id, host_user_id).await else {
+        return;
+    };
+
+    // Recipients must be loaded above, before these deletes: they clear the very
+    // rows `session_end_recipients` reads invitees from, so deleting first
+    // would fan the "session ended" push out to nobody.
+    //
+    // Both tables hold per-invitee grant state whose `ON DELETE CASCADE` a soft
+    // end (`ended_at = now()`) never fires, so both must be cleared explicitly.
+    for table in ["terminal_session_invitees", "terminal_session_keys"] {
+        if let Err(e) = sqlx::query(&format!("DELETE FROM {table} WHERE session_id = $1"))
+            .bind(session_id)
+            .execute(pool)
+            .await
+        {
+            error!(error = %e, session_id = %session_id, table, "Failed to clear session grant rows");
+        }
+    }
+
+    for recipient in recipients {
+        notifier.notify_session_ended(recipient, session_id);
+    }
+}
+
 pub async fn end_session(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -754,10 +840,7 @@ pub async fn end_session(
         }
     }
 
-    let recipients = session_end_recipients(&pool, session_id, auth.0).await?;
-    for recipient in recipients {
-        notifier.notify_session_ended(recipient, session_id);
-    }
+    fan_out_session_ended(&pool, &notifier, session_id, auth.0).await;
 
     info!(session_id = %session_id, "Terminal session ended");
     Ok(StatusCode::NO_CONTENT)
@@ -810,6 +893,7 @@ pub async fn ws_handler(
     Query(query): Query<WsQuery>,
     State(pool): State<PgPool>,
     Extension(manager): Extension<TerminalManager>,
+    Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
 ) -> impl IntoResponse {
     let user_id = match validate_token(&query.token, "access") {
         Ok(claims) => claims.sub,
@@ -825,12 +909,21 @@ pub async fn ws_handler(
         .unwrap_or_else(|| user_id.to_string());
 
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, session_id, user_id, display_name, query.invite_token, pool, manager)
+        handle_socket(
+            socket,
+            session_id,
+            user_id,
+            display_name,
+            query.invite_token,
+            pool,
+            manager,
+            notifier,
+        )
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn is_authorized_participant(
+pub(crate) async fn is_authorized_participant(
     pool: &PgPool,
     user_id: Uuid,
     host_user_id: Uuid,
@@ -892,6 +985,7 @@ async fn is_authorized_participant(
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     session_id: Uuid,
@@ -900,6 +994,7 @@ async fn handle_socket(
     invite_token: Option<String>,
     pool: PgPool,
     manager: TerminalManager,
+    notifier: crate::sync_notifier::SyncNotifier,
 ) {
     // Fetch session state from in-memory manager
     let session_info = {
@@ -1021,14 +1116,14 @@ async fn handle_socket(
         .await
         .is_err()
     {
-        cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
+        cleanup_participant(&manager, session_id, user_id, &tx, &pool, &notifier).await;
         return;
     }
 
     // Replay terminal history so the new joiner sees what happened before they joined.
     for msg in history_snapshot {
         if ws_sender.send(Message::Text(msg)).await.is_err() {
-            cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
+            cleanup_participant(&manager, session_id, user_id, &tx, &pool, &notifier).await;
             return;
         }
     }
@@ -1163,7 +1258,7 @@ async fn handle_socket(
     }
 
     send_task.abort();
-    cleanup_participant(&manager, session_id, user_id, &tx, &pool).await;
+    cleanup_participant(&manager, session_id, user_id, &tx, &pool, &notifier).await;
     info!(session_id = %session_id, user_id = %user_id, "WS participant left");
 }
 
@@ -1173,6 +1268,7 @@ async fn cleanup_participant(
     user_id: Uuid,
     tx: &tokio::sync::broadcast::Sender<String>,
     pool: &PgPool,
+    notifier: &crate::sync_notifier::SyncNotifier,
 ) {
     let is_host = {
         let mut sessions = manager.sessions.lock().await;
@@ -1213,6 +1309,9 @@ async fn cleanup_participant(
         if let Some(state) = sessions.remove(&session_id) {
             let _ = state.tx.send(r#"{"type":"session_ended"}"#.to_string());
         }
+        drop(sessions);
+
+        fan_out_session_ended(pool, notifier, session_id, user_id).await;
 
         info!(session_id = %session_id, "Session ended: host disconnected");
     } else {
@@ -1758,31 +1857,196 @@ mod tests {
         assert_eq!(recipients, vec![mate]);
     }
 
+    #[tokio::test]
+    async fn host_disconnect_on_a_vaultless_session_retracts_the_invitees_knock() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        // Subscribe after the grant so its `SessionShared` push isn't mistaken
+        // for the `SessionEnded` push under test.
+        let mut events = notifier.subscribe();
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        // Simulates the host's WebSocket closing (app quit) rather than a
+        // "Stop sharing" click — the path that used to leave `mate` knocking
+        // on a session that no longer exists.
+        cleanup_participant(&manager, session_id, host, &tx, &pool, &notifier).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("SessionEnded must be pushed within 1s of host disconnect")
+            .expect("notifier channel must not close");
+        match event {
+            crate::sync_notifier::SyncEvent::SessionEnded { recipient, session_id: ended } => {
+                assert_eq!(recipient, mate, "the invitee, not the host, is the recipient");
+                assert_eq!(ended, session_id);
+            }
+            other => panic!("expected SessionEnded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_marks_the_session_ended_in_the_db() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        cleanup_participant(&manager, session_id, host, &tx, &pool, &notifier).await;
+
+        let ended_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT ended_at FROM terminal_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_at.is_some(), "host disconnect must mark the session ended");
+        assert!(manager.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_clears_its_invitee_grants_but_still_notifies_them() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let mut events = notifier.subscribe();
+        fan_out_session_ended(&pool, &notifier, session_id, host).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("SessionEnded must still be pushed after the grant row is deleted")
+            .expect("notifier channel must not close");
+        match event {
+            crate::sync_notifier::SyncEvent::SessionEnded { recipient, session_id: ended } => {
+                assert_eq!(recipient, mate);
+                assert_eq!(ended, session_id);
+            }
+            other => panic!("expected SessionEnded, got {other:?}"),
+        }
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "ending the session must clear its invitee grants");
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(keys, 0, "the wrapped keys are grant state too and must go with them");
+    }
+
+    #[tokio::test]
+    async fn a_guest_leaving_does_not_end_the_session_for_everyone() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        add_member(&pool, team, other).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        // Two invitees: with only the leaver invited, a wrongly fanned-out end
+        // would have no recipient left to push to and the assertion below would
+        // pass vacuously.
+        for invitee in [mate, other] {
+            grant_invitee(&pool, &notifier, &manager, session_id, host, invitee, "wrapped")
+                .await
+                .unwrap();
+        }
+
+        let mut events = notifier.subscribe();
+        let (tx, _keep) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        // The guest's socket closes, not the host's.
+        cleanup_participant(&manager, session_id, mate, &tx, &pool, &notifier).await;
+
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, crate::sync_notifier::SyncEvent::SessionEnded { .. }),
+                "one guest closing a tab must not end the session for everyone"
+            );
+        }
+        let ended_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT ended_at FROM terminal_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_at.is_none(), "the session must still be live");
+        assert!(manager.sessions.lock().await.contains_key(&session_id));
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grants, 2, "nobody's grant is revoked by a guest disconnecting");
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_also_clears_the_sessions_invitee_grants() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        cleanup_participant(&manager, session_id, host, &tx, &pool, &notifier).await;
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "a host disconnect runs the same cleanup helper");
+    }
+
     async fn test_notifier_and_manager(
         session_id: Uuid,
         host: Uuid,
     ) -> (crate::sync_notifier::SyncNotifier, TerminalManager) {
         let notifier = crate::sync_notifier::SyncNotifier::new();
         let manager = TerminalManager::new();
-        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
-        manager.sessions.lock().await.insert(
-            session_id,
-            crate::terminal_manager::SessionState {
-                vault_ids: vec![],
-                allowed_roles: vec![],
-                invite_token: None,
-                invitees: std::collections::HashSet::new(),
-                host_user_id: host,
-                host_public_key: String::new(),
-                visibility: "direct".to_string(),
-                vault_owner_id: None,
-                participants: std::collections::HashMap::new(),
-                control_holder: host,
-                pending_control_request: None,
-                tx,
-                output_history: std::collections::VecDeque::new(),
-            },
-        );
+        manager.insert_test_session(session_id, host).await;
         (notifier, manager)
     }
 }
