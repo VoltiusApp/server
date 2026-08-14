@@ -514,6 +514,25 @@ pub async fn remove_member(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Best effort, after commit: the membership row is already gone, so a
+    // failure here must not fail the request. Mirrors `grant_invitee`'s
+    // admission guard exactly — a grant survives only while inviter and
+    // invitee still share at least one team.
+    if let Err(e) = sqlx::query(
+        "DELETE FROM terminal_session_invitees tsi \
+          WHERE tsi.user_id = $1 \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM team_members a \
+                JOIN team_members b ON a.team_id = b.team_id \
+               WHERE a.user_id = tsi.invited_by AND b.user_id = tsi.user_id)",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    {
+        error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to revoke session invitee grants");
+    }
+
     let removed_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(&pool)
@@ -1394,11 +1413,48 @@ mod authz_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        env_lock, member_with_role, seed_role, seed_team, seed_user, set_user_seats,
-        set_user_tier, set_user_trial,
+        add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
+        seed_user, set_user_seats, set_user_tier, set_user_trial,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
+
+    /// Insert a bare `terminal_sessions` row — the invitee-revoke tests only
+    /// need it to satisfy `terminal_session_invitees`'s FK, not a full session.
+    async fn seed_direct_session(pool: &PgPool, host: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO terminal_sessions (host_user_id, connection_name, visibility) \
+             VALUES ($1, 'web-prod', 'direct') RETURNING id",
+        )
+        .bind(host)
+        .fetch_one(pool)
+        .await
+        .expect("insert session")
+    }
+
+    async fn seed_invitee_grant(pool: &PgPool, session_id: Uuid, user_id: Uuid, invited_by: Uuid) {
+        sqlx::query(
+            "INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(invited_by)
+        .execute(pool)
+        .await
+        .expect("insert invitee grant");
+    }
+
+    async fn grant_count(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn add_member_forbidden_without_invite_permission() {
@@ -1490,6 +1546,93 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_revokes_grants_from_a_host_they_no_longer_share_a_team_with() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_team_member(&pool, team, host).await;
+        add_team_member(&pool, team, mate).await;
+        let session_id = seed_direct_session(&pool, host).await;
+        seed_invitee_grant(&pool, session_id, mate, host).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(mate)),
+            Extension(SyncNotifier::new()),
+            Path((team, mate)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+        assert_eq!(
+            grant_count(&pool, session_id, mate).await,
+            0,
+            "leaving the only shared team must revoke the grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_from_one_of_two_shared_teams_leaves_the_grant_intact() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team_a = seed_team(&pool, host).await;
+        let team_b = seed_team(&pool, host).await;
+        add_team_member(&pool, team_a, host).await;
+        add_team_member(&pool, team_a, mate).await;
+        add_team_member(&pool, team_b, host).await;
+        add_team_member(&pool, team_b, mate).await;
+        let session_id = seed_direct_session(&pool, host).await;
+        seed_invitee_grant(&pool, session_id, mate, host).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(mate)),
+            Extension(SyncNotifier::new()),
+            Path((team_a, mate)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+        assert_eq!(
+            grant_count(&pool, session_id, mate).await,
+            1,
+            "host and invitee still share team_b, so the grant must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_does_not_touch_an_unrelated_users_grant() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_team_member(&pool, team, host).await;
+        add_team_member(&pool, team, mate).await;
+        add_team_member(&pool, team, stranger).await;
+        let session_id = seed_direct_session(&pool, host).await;
+        seed_invitee_grant(&pool, session_id, mate, host).await;
+        seed_invitee_grant(&pool, session_id, stranger, host).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(mate)),
+            Extension(SyncNotifier::new()),
+            Path((team, mate)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+        assert_eq!(
+            grant_count(&pool, session_id, stranger).await,
+            1,
+            "removing mate must not touch a grant belonging to a different invitee"
+        );
     }
 
     #[tokio::test]

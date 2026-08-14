@@ -742,6 +742,18 @@ async fn fan_out_session_ended(
     let Ok(recipients) = session_end_recipients(pool, session_id, host_user_id).await else {
         return;
     };
+
+    // Recipients must be loaded above, before this delete: it clears the very
+    // rows `session_end_recipients` reads invitees from, so deleting first
+    // would fan the "session ended" push out to nobody.
+    if let Err(e) = sqlx::query("DELETE FROM terminal_session_invitees WHERE session_id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await
+    {
+        error!(error = %e, session_id = %session_id, "Failed to clear session invitees");
+    }
+
     for recipient in recipients {
         notifier.notify_session_ended(recipient, session_id);
     }
@@ -1844,6 +1856,72 @@ mod tests {
                 .unwrap();
         assert!(ended_at.is_some(), "host disconnect must mark the session ended");
         assert!(manager.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_clears_its_invitee_grants_but_still_notifies_them() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let mut events = notifier.subscribe();
+        fan_out_session_ended(&pool, &notifier, session_id, host).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("SessionEnded must still be pushed after the grant row is deleted")
+            .expect("notifier channel must not close");
+        match event {
+            crate::sync_notifier::SyncEvent::SessionEnded { recipient, session_id: ended } => {
+                assert_eq!(recipient, mate);
+                assert_eq!(ended, session_id);
+            }
+            other => panic!("expected SessionEnded, got {other:?}"),
+        }
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "ending the session must clear its invitee grants");
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_also_clears_the_sessions_invitee_grants() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        cleanup_participant(&manager, session_id, host, &tx, &pool, &notifier).await;
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "a host disconnect runs the same cleanup helper");
     }
 
     async fn test_notifier_and_manager(
