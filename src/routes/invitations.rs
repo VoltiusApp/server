@@ -340,6 +340,11 @@ pub async fn decline_my_pending_invitation(
         })?;
 
     info!(user_id = %auth.0, team_id = %team_id, "Pending invitation declined");
+    // Notify my own other devices, or they keep offering Accept/Decline for an
+    // invitation that no longer exists. Accept gets this via
+    // notify_membership_changed; decline changes no membership, so it needs the
+    // invitation-scoped event explicitly.
+    notifier.notify(auth.0, format!("pending_invitations_changed:{}", auth.0));
     // Notify team so the inviter's pending list refreshes
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
@@ -353,7 +358,7 @@ mod authz_tests {
     //! bound to *your* user_id. Requires `TEST_DATABASE_URL`; otherwise each skips.
     use super::*;
     use crate::auth::AuthUser;
-    use crate::sync_notifier::SyncNotifier;
+    use crate::sync_notifier::{SyncEvent, SyncNotifier};
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member, seed_invitation, seed_team, seed_user, test_user_email,
@@ -559,6 +564,46 @@ mod authz_tests {
         .await
         .unwrap();
         assert!(gone);
+    }
+
+    /// A live two-account run caught this: declining on one client left the
+    /// invitation sitting in the notification inbox of the decliner's *other*
+    /// client, still offering Accept for a row that no longer exists. Accept
+    /// reaches those devices through MembershipChanged; decline changes no
+    /// membership, so it must send the invitation-scoped event itself.
+    #[tokio::test]
+    async fn decline_my_pending_invitation_notifies_my_other_devices() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let recipient = seed_user(&pool).await;
+        let (invitation_id, _token) =
+            seed_invitation(&pool, team, &test_user_email(recipient), "member", Some(recipient))
+                .await;
+
+        let notifier = SyncNotifier::new();
+        let mut rx = notifier.subscribe();
+
+        let res = decline_my_pending_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(recipient)),
+            Extension(notifier),
+            Path(invitation_id),
+        )
+        .await;
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+
+        let want = format!("pending_invitations_changed:{recipient}");
+        let mut saw = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let SyncEvent::BlobPushed { user_id, device_id } = ev {
+                if user_id == recipient && device_id == want {
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw, "decline must push {want} to the decliner's own devices");
     }
 
     #[tokio::test]
