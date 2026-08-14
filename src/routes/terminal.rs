@@ -423,13 +423,25 @@ pub async fn create_session(
         {
             // A partially-granted session must not linger as "active": it would
             // count against the host's own concurrency limit forever, and the
-            // client never learned its id to end it itself.
-            sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+            // client never learned its id to end it itself. Only drop the
+            // in-memory entry once the row is confirmed ended — otherwise the
+            // session would be both still-counted AND unreachable.
+            match sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
                 .bind(session_id)
                 .execute(&pool)
                 .await
-                .ok();
-            manager.sessions.lock().await.remove(&session_id);
+            {
+                Ok(_) => {
+                    manager.sessions.lock().await.remove(&session_id);
+                }
+                Err(update_err) => {
+                    error!(
+                        error = %update_err,
+                        session_id = %session_id,
+                        "Failed to end orphaned session after a failed grant; it remains live and reachable"
+                    );
+                }
+            }
             return Err(e);
         }
     }
@@ -482,7 +494,7 @@ async fn visible_sessions(
         FROM terminal_sessions ts
         WHERE ts.ended_at IS NULL
           AND (
-            (ts.host_user_id = $1 AND ts.visibility != 'invite_link')
+            (ts.host_user_id = $1 AND ts.visibility IN ('vault', 'direct'))
             OR EXISTS (SELECT 1 FROM terminal_session_invitees tsi
                         WHERE tsi.session_id = ts.id AND tsi.user_id = $1)
             OR (
