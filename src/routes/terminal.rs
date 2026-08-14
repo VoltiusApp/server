@@ -107,6 +107,7 @@ pub async fn create_session(
     Extension(auth): Extension<AuthUser>,
     Extension(auth_claims): Extension<AuthClaims>,
     Extension(manager): Extension<TerminalManager>,
+    Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), StatusCode> {
     let visibility = body.visibility.as_deref().unwrap_or("vault").to_string();
@@ -245,6 +246,13 @@ pub async fn create_session(
             error!(error = %e, session_id = %session_id, vault_id = %vault_id, "Failed to insert session vault");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    }
+
+    if !body.vault_ids.is_empty() {
+        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, auth.0, |recipient| {
+            notifier.notify_session_shared(recipient, session_id, auth.0);
+        })
+        .await;
     }
 
     // Insert wrapped keys for vault participants (E2EE)
@@ -479,6 +487,7 @@ pub async fn end_session(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(manager): Extension<TerminalManager>,
+    Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
     Path(session_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let host_id = sqlx::query_scalar::<_, Uuid>(
@@ -511,6 +520,21 @@ pub async fn end_session(
         if let Some(state) = sessions.remove(&session_id) {
             let _ = state.tx.send(r#"{"type":"session_ended"}"#.to_string());
         }
+    }
+
+    let team_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT team_id FROM terminal_session_vaults WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
+    if !team_ids.is_empty() {
+        crate::sync_notifier::notify_team_members(&pool, &team_ids, auth.0, |recipient| {
+            notifier.notify_session_ended(recipient, session_id);
+        })
+        .await;
     }
 
     info!(session_id = %session_id, "Terminal session ended");
@@ -912,6 +936,7 @@ mod authz_tests {
     use crate::auth::jwt::Claims;
     use crate::auth::{AuthClaims, AuthUser};
     use crate::permissions::PERM_CONNECT;
+    use crate::sync_notifier::SyncNotifier;
     use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
     use crate::test_support::{member_with_role, seed_team, seed_user};
@@ -958,6 +983,7 @@ mod authz_tests {
             Extension(AuthUser(outsider)),
             Extension(claims_for(outsider)),
             Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
             Json(vault_session_request(vec![team])),
         )
         .await;
@@ -981,6 +1007,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(claims_for(caller)),
             Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
             Json(vault_session_request(vec![team])),
         )
         .await;
@@ -1015,6 +1042,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(attacker)),
             Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
             axum::extract::Path(session_id),
         )
         .await;

@@ -326,6 +326,12 @@ pub async fn sync_stream(
                     subject, connection_id, flag
                 ))))
             }
+            Ok(SyncEvent::SessionShared { recipient, session_id, host_user_id }) if recipient == user_id => {
+                Some(Ok(Event::default().data(format!("session_shared:{}:{}", session_id, host_user_id))))
+            }
+            Ok(SyncEvent::SessionEnded { recipient, session_id }) if recipient == user_id => {
+                Some(Ok(Event::default().data(format!("session_ended:{}", session_id))))
+            }
             Ok(_) => None,
             // Lagged: we missed some events, tell the client to sync anyway
             Err(_) => Some(Ok(Event::default().data("sync"))),
