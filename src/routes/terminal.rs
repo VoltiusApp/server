@@ -96,6 +96,9 @@ pub struct ActiveSession {
     /// Set when the caller reaches this session through an individual grant
     /// (#66) rather than a vault share — names who invited them.
     pub invited_by: Option<Uuid>,
+    /// Everyone the host has individually invited (#66). Populated only when
+    /// the caller is the host — a guest must not learn the guest list.
+    pub invitee_ids: Vec<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -429,6 +432,7 @@ type VisibleSessionRow = (
     chrono::DateTime<Utc>,
     Vec<Uuid>,
     Option<Uuid>,
+    Vec<Uuid>,
 );
 
 /// Sessions `user_id` may see: their own, ones they hold an individual grant
@@ -452,7 +456,13 @@ async fn visible_sessions(
                 ARRAY[]::uuid[]
             ) AS vault_ids,
             (SELECT tsi.invited_by FROM terminal_session_invitees tsi
-              WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by
+              WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by,
+            CASE WHEN ts.host_user_id = $1 THEN
+              COALESCE(
+                (SELECT array_agg(tsi3.user_id) FROM terminal_session_invitees tsi3 WHERE tsi3.session_id = ts.id),
+                ARRAY[]::uuid[]
+              )
+            ELSE ARRAY[]::uuid[] END AS invitee_ids
         FROM terminal_sessions ts
         WHERE ts.ended_at IS NULL
           AND (
@@ -514,7 +524,7 @@ pub async fn list_active_sessions(
         .into_iter()
         .filter(|(id, ..)| sessions_lock.contains_key(id))
         .map(
-            |(id, connection_name, host_user_id, visibility, created_at, vault_ids, invited_by)| {
+            |(id, connection_name, host_user_id, visibility, created_at, vault_ids, invited_by, invitee_ids)| {
                 let (participant_count, participants, host_public_key) = sessions_lock
                     .get(&id)
                     .map(|s| {
@@ -533,6 +543,7 @@ pub async fn list_active_sessions(
                     participants,
                     vault_ids,
                     invited_by,
+                    invitee_ids,
                 }
             },
         )
@@ -1539,6 +1550,27 @@ mod tests {
         assert_eq!(for_host[0].6, None, "the host is not their own invitee");
 
         assert!(visible_sessions(&pool, stranger).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_query_reveals_invitee_ids_only_to_the_host() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert_eq!(for_host[0].7, vec![mate], "the host sees who they invited");
+
+        let for_mate = visible_sessions(&pool, mate).await.unwrap();
+        assert!(for_mate[0].7.is_empty(), "an invitee must not learn the guest list");
     }
 
     #[tokio::test]
