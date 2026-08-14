@@ -557,6 +557,34 @@ pub async fn get_my_session_key(
     Err(StatusCode::NOT_FOUND)
 }
 
+/// Confirms `caller` is the host of a still-active session, or fails with the
+/// status the caller should return: `NOT_FOUND` if the session doesn't exist
+/// or has already ended, `FORBIDDEN` if `caller` isn't its host. Shared by
+/// `end_session` and `invite_to_session` — both gate on exactly this check.
+async fn require_active_session_host(
+    pool: &PgPool,
+    session_id: Uuid,
+    caller: Uuid,
+) -> Result<(), StatusCode> {
+    let host_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT host_user_id FROM terminal_sessions WHERE id = $1 AND ended_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to get session host");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if host_id != caller {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(())
+}
+
 // ─── End session ─────────────────────────────────────────────────────────────
 
 pub async fn end_session(
@@ -566,21 +594,7 @@ pub async fn end_session(
     Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
     Path(session_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let host_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT host_user_id FROM terminal_sessions WHERE id = $1 AND ended_at IS NULL",
-    )
-    .bind(session_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to get session host");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    if host_id != auth.0 {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_active_session_host(&pool, session_id, auth.0).await?;
 
     sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
         .bind(session_id)
@@ -633,18 +647,7 @@ pub async fn invite_to_session(
     Path(session_id): Path<Uuid>,
     Json(body): Json<InviteToSessionRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let host_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT host_user_id FROM terminal_sessions WHERE id = $1 AND ended_at IS NULL",
-    )
-    .bind(session_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    if host_id != auth.0 {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_active_session_host(&pool, session_id, auth.0).await?;
 
     grant_invitee(
         &pool,
