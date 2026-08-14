@@ -25,8 +25,8 @@ struct TierInfo {
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>)>(
-        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>, Option<DateTime<Utc>>)>(
+        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -36,8 +36,16 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id) =
+    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at) =
         row;
+
+    // Soft-deleted accounts are locked: no session may be issued or renewed from one.
+    // Gating here covers every token-issuing path (login, refresh, password change) at once.
+    if deleted_at.is_some() {
+        warn!(user_id = %user_id, "Rejected request for soft-deleted account");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let effective = crate::entitlement::effective_tier(
         &stored_tier,
         trial_ends_at,
@@ -74,18 +82,20 @@ pub async fn challenge(
     State(pool): State<PgPool>,
     axum::extract::Query(query): axum::extract::Query<ChallengeQuery>,
 ) -> Result<Json<ChallengeResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid,)>("SELECT account_id FROM users WHERE email = $1")
-        .bind(&query.email)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|err| {
-            error!(error = %err, "Failed to fetch challenge account");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or_else(|| {
-            warn!("Challenge requested for unknown account");
-            StatusCode::NOT_FOUND
-        })?;
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT account_id FROM users WHERE email = $1 AND deleted_at IS NULL",
+    )
+    .bind(&query.email)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|err| {
+        error!(error = %err, "Failed to fetch challenge account");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or_else(|| {
+        warn!("Challenge requested for unknown account");
+        StatusCode::NOT_FOUND
+    })?;
 
     Ok(Json(ChallengeResponse { account_id: row.0 }))
 }
@@ -1168,6 +1178,85 @@ mod handler_tests {
         match login_of(&pool, Uuid::new_v4()).await {
             Err(s) => assert_eq!(s, StatusCode::UNAUTHORIZED),
             Ok(_) => panic!("expected UNAUTHORIZED for unknown account"),
+        }
+    }
+
+    // ── soft delete: a deleted account is locked out of every auth path ───────
+
+    async fn soft_delete(pool: &PgPool, user_id: Uuid) {
+        sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("soft-delete user");
+    }
+
+    #[tokio::test]
+    async fn login_soft_deleted_user_forbidden() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        soft_delete(&pool, uid).await;
+
+        match login_of(&pool, account_id).await {
+            Err(s) => assert_eq!(s, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected FORBIDDEN for soft-deleted user"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_soft_deleted_user_forbidden() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+
+        // Take a refresh token while the account is live, then delete underneath it.
+        let session = login_of(&pool, account_id).await.expect("login ok");
+        soft_delete(&pool, uid).await;
+
+        let res = refresh(
+            State(pool.clone()),
+            Json(RefreshRequest {
+                refresh_token: session.refresh_token,
+            }),
+        )
+        .await;
+
+        match res {
+            Err(s) => assert_eq!(s, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected FORBIDDEN when refreshing a soft-deleted account"),
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_soft_deleted_user_not_found() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let uid = seed_user_with_credentials(&pool, Uuid::new_v4(), "auth-key-secret").await;
+        let email = format!("{uid}@test.local");
+
+        let live = challenge(
+            State(pool.clone()),
+            axum::extract::Query(ChallengeQuery {
+                email: email.clone(),
+            }),
+        )
+        .await;
+        assert!(live.is_ok(), "challenge should resolve a live account");
+
+        soft_delete(&pool, uid).await;
+
+        let res = challenge(
+            State(pool.clone()),
+            axum::extract::Query(ChallengeQuery { email }),
+        )
+        .await;
+
+        match res {
+            Err(s) => assert_eq!(s, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected NOT_FOUND for soft-deleted account"),
         }
     }
 }
