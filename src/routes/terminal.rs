@@ -1134,7 +1134,7 @@ mod authz_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
-    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use crate::test_support::{add_member, member_with_role, seed_team, seed_user};
     use axum::extract::State;
     use axum::{Extension, Json};
 
@@ -1155,16 +1155,28 @@ mod authz_tests {
 
     // `CreateSessionRequest` derives only `Deserialize` — no `Default` — so every
     // field is enumerated explicitly here.
-    fn vault_session_request(vault_ids: Vec<uuid::Uuid>) -> CreateSessionRequest {
+    fn session_request(
+        vault_ids: Vec<uuid::Uuid>,
+        visibility: &str,
+        invitees: Vec<ParticipantKeyEntry>,
+    ) -> CreateSessionRequest {
         CreateSessionRequest {
             vault_ids,
             connection_name: "box".to_string(),
-            visibility: Some("vault".to_string()),
+            visibility: Some(visibility.to_string()),
             participant_keys: Vec::new(),
             session_key_bytes: None,
             allowed_roles: Vec::new(),
-            invitees: Vec::new(),
+            invitees,
         }
+    }
+
+    fn vault_session_request(vault_ids: Vec<uuid::Uuid>) -> CreateSessionRequest {
+        session_request(vault_ids, "vault", Vec::new())
+    }
+
+    fn direct_session_request(invitees: Vec<ParticipantKeyEntry>) -> CreateSessionRequest {
+        session_request(Vec::new(), "direct", invitees)
     }
 
     #[tokio::test]
@@ -1209,6 +1221,78 @@ mod authz_tests {
         .await;
 
         assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+    }
+
+    #[tokio::test]
+    async fn create_session_direct_grants_invitee_and_populates_in_memory_state() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+
+        let manager = TerminalManager::new();
+        let entry = ParticipantKeyEntry {
+            user_id: mate,
+            wrapped_key: "wrapped".to_string(),
+        };
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(manager.clone()),
+            Extension(SyncNotifier::new()),
+            Json(direct_session_request(vec![entry])),
+        )
+        .await;
+
+        let (status, Json(body)) = res.expect("direct session with an invitee must be created");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+
+        let sessions = manager.sessions.lock().await;
+        let state = sessions
+            .get(&body.session_id)
+            .expect("session must be in memory");
+        assert!(state.invitees.contains(&mate));
+        drop(sessions);
+
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(body.session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(body.session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((grants, keys), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn create_session_direct_rejects_empty_invitees() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
+            Json(direct_session_request(Vec::new())),
+        )
+        .await;
+
+        assert!(matches!(res, Err(axum::http::StatusCode::BAD_REQUEST)));
     }
 
     #[tokio::test]
