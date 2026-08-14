@@ -100,6 +100,83 @@ pub struct SessionKeyResponse {
     pub host_public_key: String,
 }
 
+/// True when the two users are members of at least one team in common.
+// Wired into the direct-invitees endpoint in a later task; unused by production
+// code until then.
+#[allow(dead_code)]
+pub(crate) async fn shares_a_team(pool: &PgPool, a: Uuid, b: Uuid) -> Result<bool, StatusCode> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(\
+           SELECT 1 FROM team_members ma \
+           JOIN team_members mb ON mb.team_id = ma.team_id \
+           WHERE ma.user_id = $1 AND mb.user_id = $2)",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to check shared team membership");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Grants one named user access to a session: the durable row, the wrapped key,
+/// the in-memory authorization set, and the push. The single grant path — both
+/// `create_session` with visibility "direct" and the invitees endpoint call it.
+#[allow(dead_code)]
+pub(crate) async fn grant_invitee(
+    pool: &PgPool,
+    notifier: &crate::sync_notifier::SyncNotifier,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    host_user_id: Uuid,
+    user_id: Uuid,
+    wrapped_key: &str,
+) -> Result<(), StatusCode> {
+    // A direct session has no vault, so none of the vault permission checks
+    // apply to it. Without this the host could grant an arbitrary user id.
+    if user_id != host_user_id && !shares_a_team(pool, host_user_id, user_id).await? {
+        warn!(host = %host_user_id, invitee = %user_id, "Invite rejected: not a teammate");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    sqlx::query(
+        "INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(host_user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, session_id = %session_id, "Failed to insert session invitee");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(wrapped_key)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, session_id = %session_id, "Failed to insert invitee session key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Some(state) = manager.sessions.lock().await.get_mut(&session_id) {
+        state.invitees.insert(user_id);
+    }
+
+    notifier.notify_session_shared(user_id, session_id, host_user_id);
+    Ok(())
+}
+
 // ─── Create terminal session ──────────────────────────────────────────────────
 
 pub async fn create_session(
@@ -293,6 +370,7 @@ pub async fn create_session(
                 vault_ids: body.vault_ids.clone(),
                 allowed_roles: body.allowed_roles.clone(),
                 invite_token: invite_token.clone(),
+                invitees: std::collections::HashSet::new(),
                 host_user_id: auth.0,
                 host_public_key,
                 visibility: visibility.clone(),
@@ -1050,5 +1128,132 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_user};
+
+    async fn seed_session(pool: &PgPool, host: Uuid, visibility: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO terminal_sessions (host_user_id, connection_name, visibility) \
+             VALUES ($1, 'web-prod', $2) RETURNING id",
+        )
+        .bind(host)
+        .bind(visibility)
+        .fetch_one(pool)
+        .await
+        .expect("insert session")
+    }
+
+    #[tokio::test]
+    async fn shares_a_team_is_true_only_for_a_common_team() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+
+        assert!(shares_a_team(&pool, host, mate).await.unwrap());
+        assert!(!shares_a_team(&pool, host, stranger).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_is_idempotent_and_inserts_both_rows() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        for _ in 0..2 {
+            grant_invitee(
+                &pool, &notifier, &manager, session_id, host, mate, "wrapped",
+            )
+            .await
+            .expect("grant");
+        }
+
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(mate)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((grants, keys), (1, 1));
+
+        let sessions = manager.sessions.lock().await;
+        assert!(sessions.get(&session_id).unwrap().invitees.contains(&mate));
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_rejects_a_non_teammate() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        let err = grant_invitee(
+            &pool, &notifier, &manager, session_id, host, stranger, "wrapped",
+        )
+        .await
+        .expect_err("stranger must be rejected");
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grants, 0);
+    }
+
+    async fn test_notifier_and_manager(
+        session_id: Uuid,
+        host: Uuid,
+    ) -> (crate::sync_notifier::SyncNotifier, TerminalManager) {
+        let notifier = crate::sync_notifier::SyncNotifier::new();
+        let manager = TerminalManager::new();
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+        manager.sessions.lock().await.insert(
+            session_id,
+            crate::terminal_manager::SessionState {
+                vault_ids: vec![],
+                allowed_roles: vec![],
+                invite_token: None,
+                invitees: std::collections::HashSet::new(),
+                host_user_id: host,
+                host_public_key: String::new(),
+                visibility: "direct".to_string(),
+                vault_owner_id: None,
+                participants: std::collections::HashMap::new(),
+                control_holder: host,
+                pending_control_request: None,
+                tx,
+                output_history: std::collections::VecDeque::new(),
+            },
+        );
+        (notifier, manager)
     }
 }
