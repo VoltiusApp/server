@@ -147,7 +147,7 @@ pub(crate) async fn grant_invitee(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    sqlx::query(
+    let invitee_insert = sqlx::query(
         "INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) \
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
@@ -179,7 +179,11 @@ pub(crate) async fn grant_invitee(
         state.invitees.insert(user_id);
     }
 
-    notifier.notify_session_shared(user_id, session_id, host_user_id);
+    // Only push on a genuinely new grant — the ON CONFLICT above means a repeat
+    // invite of someone already granted must not re-knock them.
+    if invitee_insert.rows_affected() > 0 {
+        notifier.notify_session_shared(user_id, session_id, host_user_id);
+    }
     Ok(())
 }
 
@@ -406,7 +410,7 @@ pub async fn create_session(
     // fills its invitees set) and last, so a recipient acting on the push
     // before their wrapped key row lands gets a 404 from get_my_session_key.
     for entry in &body.invitees {
-        grant_invitee(
+        if let Err(e) = grant_invitee(
             &pool,
             &notifier,
             &manager,
@@ -415,7 +419,19 @@ pub async fn create_session(
             entry.user_id,
             &entry.wrapped_key,
         )
-        .await?;
+        .await
+        {
+            // A partially-granted session must not linger as "active": it would
+            // count against the host's own concurrency limit forever, and the
+            // client never learned its id to end it itself.
+            sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                .ok();
+            manager.sessions.lock().await.remove(&session_id);
+            return Err(e);
+        }
     }
 
     info!(session_id = %session_id, visibility = %visibility, vault_count = body.vault_ids.len(), "Terminal session created");
@@ -466,7 +482,7 @@ async fn visible_sessions(
         FROM terminal_sessions ts
         WHERE ts.ended_at IS NULL
           AND (
-            ts.host_user_id = $1
+            (ts.host_user_id = $1 AND ts.visibility != 'invite_link')
             OR EXISTS (SELECT 1 FROM terminal_session_invitees tsi
                         WHERE tsi.session_id = ts.id AND tsi.user_id = $1)
             OR (
@@ -1364,6 +1380,57 @@ mod authz_tests {
     }
 
     #[tokio::test]
+    async fn create_session_direct_tears_down_the_session_when_a_grant_fails() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await; // no shared team with `host`
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+
+        let manager = TerminalManager::new();
+        let entries = vec![
+            ParticipantKeyEntry { user_id: mate, wrapped_key: "wrapped".to_string() },
+            ParticipantKeyEntry { user_id: stranger, wrapped_key: "wrapped".to_string() },
+        ];
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(manager.clone()),
+            Extension(SyncNotifier::new()),
+            Json(direct_session_request(entries)),
+        )
+        .await;
+
+        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+
+        // The session must not linger as "active": ended_at set, and gone from
+        // in-memory state (or `SELECT COUNT ... WHERE ended_at IS NULL` would
+        // keep counting it against the host's own concurrency limit forever).
+        let ended_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT ended_at FROM terminal_sessions WHERE host_user_id = $1",
+        )
+        .bind(host)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(ended_at.is_some(), "the orphaned session must be ended, not left live");
+
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_sessions WHERE host_user_id = $1 AND ended_at IS NULL",
+        )
+        .bind(host)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_count, 0);
+        assert!(manager.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn end_session_forbidden_for_non_host() {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
@@ -1481,6 +1548,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_invitee_pushes_only_on_the_first_grant() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let session_id = seed_session(&pool, host, "direct").await;
+
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        let mut events = notifier.subscribe();
+        for _ in 0..2 {
+            grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+                .await
+                .expect("grant");
+        }
+
+        let mut shared_count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, crate::sync_notifier::SyncEvent::SessionShared { recipient, .. } if recipient == mate) {
+                shared_count += 1;
+            }
+        }
+        assert_eq!(shared_count, 1, "a repeat grant of the same invitee must not re-push");
+    }
+
+    #[tokio::test]
     async fn grant_invitee_rejects_a_non_teammate() {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
@@ -1523,6 +1617,16 @@ mod tests {
         assert!(is_authorized_participant(&pool, mate, host, "direct", &[], &[], None, None, &invitees).await);
         let stranger = seed_user(&pool).await;
         assert!(!is_authorized_participant(&pool, stranger, host, "direct", &[], &[], None, None, &invitees).await);
+    }
+
+    #[tokio::test]
+    async fn list_query_excludes_an_invite_link_session_for_its_own_host() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        seed_session(&pool, host, "invite_link").await;
+
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert!(for_host.is_empty(), "invite_link sessions are reachable only via the link, never listed");
     }
 
     #[tokio::test]
