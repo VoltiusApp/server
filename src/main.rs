@@ -22,8 +22,8 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    InviteRateLimiter, RateLimiter, RegisterRateLimiter, SearchRateLimiter, SyncRateLimiter,
-    WaitlistRateLimiter,
+    InviteRateLimiter, KnockRateLimiter, RateLimiter, RegisterRateLimiter, SearchRateLimiter,
+    SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
 use std::net::SocketAddr;
@@ -152,6 +152,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
+    let knock_per_hour: usize = std::env::var("STRANGER_KNOCK_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     let auth_limiter = RateLimiter::<std::net::IpAddr>::new(10, Duration::from_secs(60));
     let register_limiter = RegisterRateLimiter(RateLimiter::new(
         register_per_day,
@@ -173,6 +177,8 @@ async fn main() {
         AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
     let search_limiter =
         SearchRateLimiter(RateLimiter::<uuid::Uuid>::new(search_rate, Duration::from_secs(60)));
+    let knock_limiter =
+        KnockRateLimiter(RateLimiter::<uuid::Uuid>::new(knock_per_hour, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -184,6 +190,7 @@ async fn main() {
         waitlist_per_hour,
         sync_per_hour = sync_rate,
         search_per_minute = search_rate,
+        knock_per_hour,
         "Configured rate limits"
     );
 
@@ -477,6 +484,7 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
         .layer(Extension(search_limiter))
+        .layer(Extension(knock_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

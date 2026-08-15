@@ -1497,10 +1497,15 @@ mod authz_tests {
         let session_id = seed_direct_session(pool, host).await;
         let manager = TerminalManager::new();
         manager.insert_test_session(session_id, host).await;
+        let knocks = crate::rate_limit::KnockRateLimiter(crate::rate_limit::RateLimiter::new(
+            20,
+            std::time::Duration::from_secs(3600),
+        ));
         crate::routes::terminal::grant_invitee(
             pool,
             &SyncNotifier::new(),
             &manager,
+            &knocks,
             session_id,
             host,
             invitee,

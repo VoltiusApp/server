@@ -99,6 +99,11 @@ pub struct WaitlistRateLimiter(pub RateLimiter<IpAddr>);
 #[derive(Clone)]
 pub struct SearchRateLimiter(pub RateLimiter<Uuid>);
 
+/// Stranger knocks per sender. Configurable because a hardcoded limiter has
+/// cost real time in every end-to-end run since the auth one shipped.
+#[derive(Clone)]
+pub struct KnockRateLimiter(pub RateLimiter<Uuid>);
+
 /// Register endpoint: N registrations/day per IP.
 pub async fn register_rate_limit(
     axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,

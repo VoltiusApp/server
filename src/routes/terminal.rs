@@ -129,32 +129,88 @@ pub(crate) async fn shares_a_team(pool: &PgPool, a: Uuid, b: Uuid) -> Result<boo
         })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantOutcome {
+    Granted,
+    /// The recipient blocked the sender or opted out. Reported as success and
+    /// written as nothing: a sender must not be able to learn either fact, and a
+    /// row that is never written cannot hold a guest seat.
+    Suppressed,
+}
+
+/// Live block from `blocked_by` against `sender`.
+async fn is_blocked(pool: &PgPool, blocked_by: Uuid, sender: Uuid) -> Result<bool, StatusCode> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM user_blocks \
+          WHERE blocker_id = $1 AND blocked_id = $2 \
+            AND (expires_at IS NULL OR expires_at > now()))",
+    )
+    .bind(blocked_by)
+    .bind(sender)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to check user block");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 /// Grants one named user access to a session: the durable row, the wrapped key,
 /// the in-memory authorization set, and the push. The single grant path — both
 /// `create_session` with visibility "direct" and the invitees endpoint call it.
+///
+/// A teammate is granted unconditionally, as before. A stranger is granted
+/// only on the recipient's terms — their opt-out, their block list, and a
+/// per-sender knock budget — and a refusal on those terms is reported back as
+/// `Suppressed`, identical to success, so a blocked sender can never learn it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn grant_invitee(
     pool: &PgPool,
     notifier: &crate::sync_notifier::SyncNotifier,
     manager: &TerminalManager,
+    knocks: &crate::rate_limit::KnockRateLimiter,
     session_id: Uuid,
     host_user_id: Uuid,
     user_id: Uuid,
     wrapped_key: &str,
-) -> Result<(), StatusCode> {
-    // A direct session has no vault, so none of the vault permission checks
-    // apply to it. Without this the host could grant an arbitrary user id.
-    if user_id != host_user_id && !shares_a_team(pool, host_user_id, user_id).await? {
-        warn!(host = %host_user_id, invitee = %user_id, "Invite rejected: not a teammate");
-        return Err(StatusCode::FORBIDDEN);
+) -> Result<GrantOutcome, StatusCode> {
+    let is_teammate = user_id == host_user_id || shares_a_team(pool, host_user_id, user_id).await?;
+
+    // A stranger knock is allowed, but on the recipient's terms: their opt-out,
+    // their block list, and a per-sender budget. Teammates keep today's path
+    // untouched, budget included.
+    if !is_teammate {
+        if !knocks.0.check(host_user_id).await {
+            warn!(host = %host_user_id, "Knock rate limit exceeded");
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        let opted_in = sqlx::query_scalar::<_, bool>(
+            "SELECT allow_stranger_invites FROM users WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to read invite preference");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .unwrap_or(false);
+
+        if !opted_in || is_blocked(pool, user_id, host_user_id).await? {
+            info!(target: "knock", sender = %host_user_id, recipient = %user_id, outcome = "suppressed", "Stranger knock suppressed");
+            return Ok(GrantOutcome::Suppressed);
+        }
+        info!(target: "knock", sender = %host_user_id, recipient = %user_id, outcome = "granted", "Stranger knock");
     }
 
     let invitee_insert = sqlx::query(
-        "INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) \
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        "INSERT INTO terminal_session_invitees (session_id, user_id, invited_by, accepted_at) \
+         VALUES ($1, $2, $3, CASE WHEN $4 THEN now() ELSE NULL END) ON CONFLICT DO NOTHING",
     )
     .bind(session_id)
     .bind(user_id)
     .bind(host_user_id)
+    .bind(is_teammate)
     .execute(pool)
     .await
     .map_err(|e| {
@@ -189,7 +245,7 @@ pub(crate) async fn grant_invitee(
     if invitee_insert.rows_affected() > 0 {
         notifier.notify_session_shared(user_id, session_id, host_user_id);
     }
-    Ok(())
+    Ok(GrantOutcome::Granted)
 }
 
 /// Undoes `grant_invitee` for every grant `user_id` is no longer qualified for
@@ -263,6 +319,7 @@ pub async fn create_session(
     Extension(auth_claims): Extension<AuthClaims>,
     Extension(manager): Extension<TerminalManager>,
     Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
+    Extension(knocks): Extension<crate::rate_limit::KnockRateLimiter>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), StatusCode> {
     let visibility = body.visibility.as_deref().unwrap_or("vault").to_string();
@@ -470,6 +527,7 @@ pub async fn create_session(
             &pool,
             &notifier,
             &manager,
+            &knocks,
             session_id,
             auth.0,
             entry.user_id,
@@ -860,15 +918,19 @@ pub async fn invite_to_session(
     Extension(auth): Extension<AuthUser>,
     Extension(manager): Extension<TerminalManager>,
     Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
+    Extension(knocks): Extension<crate::rate_limit::KnockRateLimiter>,
     Path(session_id): Path<Uuid>,
     Json(body): Json<InviteToSessionRequest>,
 ) -> Result<StatusCode, StatusCode> {
     require_active_session_host(&pool, session_id, auth.0).await?;
 
+    // Granted or Suppressed both return 204: the sender must not be able to
+    // tell a block/opt-out apart from an ordinary successful invite.
     grant_invitee(
         &pool,
         &notifier,
         &manager,
+        &knocks,
         session_id,
         auth.0,
         body.user_id,
@@ -1331,12 +1393,19 @@ mod authz_tests {
     use crate::auth::jwt::Claims;
     use crate::auth::{AuthClaims, AuthUser};
     use crate::permissions::PERM_CONNECT;
+    use crate::rate_limit::RateLimiter;
     use crate::sync_notifier::SyncNotifier;
     use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, member_with_role, seed_team, seed_user};
     use axum::extract::State;
     use axum::{Extension, Json};
+    use std::time::Duration;
+
+    /// Default-budget limiter for tests that don't care about the knock limit.
+    fn knocks() -> crate::rate_limit::KnockRateLimiter {
+        crate::rate_limit::KnockRateLimiter(RateLimiter::new(20, Duration::from_secs(3600)))
+    }
 
     fn claims_for(user: uuid::Uuid) -> AuthClaims {
         AuthClaims(Claims {
@@ -1392,6 +1461,7 @@ mod authz_tests {
             Extension(claims_for(outsider)),
             Extension(TerminalManager::new()),
             Extension(SyncNotifier::new()),
+            Extension(knocks()),
             Json(vault_session_request(vec![team])),
         )
         .await;
@@ -1416,6 +1486,7 @@ mod authz_tests {
             Extension(claims_for(caller)),
             Extension(TerminalManager::new()),
             Extension(SyncNotifier::new()),
+            Extension(knocks()),
             Json(vault_session_request(vec![team])),
         )
         .await;
@@ -1444,6 +1515,7 @@ mod authz_tests {
             Extension(claims_for(host)),
             Extension(manager.clone()),
             Extension(SyncNotifier::new()),
+            Extension(knocks()),
             Json(direct_session_request(vec![entry])),
         )
         .await;
@@ -1488,6 +1560,7 @@ mod authz_tests {
             Extension(claims_for(host)),
             Extension(TerminalManager::new()),
             Extension(SyncNotifier::new()),
+            Extension(knocks()),
             Json(direct_session_request(Vec::new())),
         )
         .await;
@@ -1511,17 +1584,21 @@ mod authz_tests {
             ParticipantKeyEntry { user_id: stranger, wrapped_key: "wrapped".to_string() },
         ];
 
+        // Zero budget: the stranger knock is what fails this grant, since a
+        // stranger is no longer forbidden outright.
+        let exhausted = crate::rate_limit::KnockRateLimiter(RateLimiter::new(0, Duration::from_secs(3600)));
         let res = create_session(
             State(pool.clone()),
             Extension(AuthUser(host)),
             Extension(claims_for(host)),
             Extension(manager.clone()),
             Extension(SyncNotifier::new()),
+            Extension(exhausted),
             Json(direct_session_request(entries)),
         )
         .await;
 
-        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+        assert!(matches!(res, Err(axum::http::StatusCode::TOO_MANY_REQUESTS)));
 
         // The session must not linger as "active": ended_at set, and gone from
         // in-memory state (or `SELECT COUNT ... WHERE ended_at IS NULL` would
@@ -1585,8 +1662,10 @@ mod authz_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rate_limit::RateLimiter;
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, seed_team, seed_user};
+    use std::time::Duration;
 
     async fn seed_session(pool: &PgPool, host: Uuid, visibility: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
@@ -1598,6 +1677,41 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("insert session")
+    }
+
+    fn harness() -> (crate::sync_notifier::SyncNotifier, TerminalManager) {
+        (
+            crate::sync_notifier::SyncNotifier::new(),
+            TerminalManager::new(),
+        )
+    }
+
+    /// Default-budget limiter for tests that don't care about the knock limit.
+    fn knocks() -> crate::rate_limit::KnockRateLimiter {
+        crate::rate_limit::KnockRateLimiter(RateLimiter::new(20, Duration::from_secs(3600)))
+    }
+
+    async fn mk_stranger(pool: &PgPool) -> Uuid {
+        seed_user(pool).await
+    }
+
+    /// A direct session with a host and a user who shares no team — a stranger.
+    async fn direct_session_with_stranger(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+        let host = seed_user(pool).await;
+        let stranger = mk_stranger(pool).await;
+        let session_id = seed_session(pool, host, "direct").await;
+        (host, stranger, session_id)
+    }
+
+    /// A direct session with a host and a user who shares a team — a teammate.
+    async fn direct_session_with_teammate(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+        let host = seed_user(pool).await;
+        let mate = seed_user(pool).await;
+        let team = seed_team(pool, host).await;
+        add_member(pool, team, host).await;
+        add_member(pool, team, mate).await;
+        let session_id = seed_session(pool, host, "direct").await;
+        (host, mate, session_id)
     }
 
     #[test]
@@ -1635,7 +1749,14 @@ mod tests {
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         for _ in 0..2 {
             grant_invitee(
-                &pool, &notifier, &manager, session_id, host, mate, "wrapped",
+                &pool,
+                &notifier,
+                &manager,
+                &knocks(),
+                session_id,
+                host,
+                mate,
+                "wrapped",
             )
             .await
             .expect("grant");
@@ -1680,6 +1801,7 @@ mod tests {
             &pool,
             &notifier,
             &manager,
+            &knocks(),
             session_id,
             host,
             mate,
@@ -1691,6 +1813,7 @@ mod tests {
             &pool,
             &notifier,
             &manager,
+            &knocks(),
             session_id,
             host,
             mate,
@@ -1723,7 +1846,7 @@ mod tests {
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         let mut events = notifier.subscribe();
         for _ in 0..2 {
-            grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+            grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
                 .await
                 .expect("grant");
         }
@@ -1738,19 +1861,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_invitee_rejects_a_non_teammate() {
+    async fn grant_invitee_suppresses_a_knock_to_an_opted_out_stranger() {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
         let stranger = seed_user(&pool).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger)
+            .execute(&pool)
+            .await
+            .unwrap();
         let session_id = seed_session(&pool, host, "direct").await;
 
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        let err = grant_invitee(
-            &pool, &notifier, &manager, session_id, host, stranger, "wrapped",
+        let outcome = grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            &knocks(),
+            session_id,
+            host,
+            stranger,
+            "wrapped",
         )
         .await
-        .expect_err("stranger must be rejected");
-        assert_eq!(err, StatusCode::FORBIDDEN);
+        .expect("suppression must look exactly like success to the sender");
+        assert_eq!(outcome, GrantOutcome::Suppressed);
 
         let grants: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1",
@@ -1772,7 +1907,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
 
@@ -1803,7 +1938,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
 
@@ -1829,7 +1964,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
 
@@ -1850,7 +1985,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
 
@@ -1868,7 +2003,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
 
@@ -1925,7 +2060,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
 
@@ -1979,9 +2114,18 @@ mod tests {
         // would have no recipient left to push to and the assertion below would
         // pass vacuously.
         for invitee in [mate, other] {
-            grant_invitee(&pool, &notifier, &manager, session_id, host, invitee, "wrapped")
-                .await
-                .unwrap();
+            grant_invitee(
+                &pool,
+                &notifier,
+                &manager,
+                &knocks(),
+                session_id,
+                host,
+                invitee,
+                "wrapped",
+            )
+            .await
+            .unwrap();
         }
 
         let mut events = notifier.subscribe();
@@ -2024,7 +2168,7 @@ mod tests {
         add_member(&pool, team, mate).await;
         let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
-        grant_invitee(&pool, &notifier, &manager, session_id, host, mate, "wrapped")
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
         let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
@@ -2049,5 +2193,165 @@ mod tests {
         let manager = TerminalManager::new();
         manager.insert_test_session(session_id, host).await;
         (notifier, manager)
+    }
+
+    #[tokio::test]
+    async fn grant_invitee_accepts_a_stranger_and_leaves_acceptance_unset() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+
+        let outcome = grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            &knocks(),
+            session_id,
+            host,
+            stranger,
+            "wrapped",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, GrantOutcome::Granted);
+
+        let accepted: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT accepted_at FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
+        assert!(accepted.is_none(), "a stranger grant is unaccepted until they join");
+    }
+
+    #[tokio::test]
+    async fn a_teammate_grant_is_accepted_on_creation() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
+
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+        let accepted: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT accepted_at FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(mate).fetch_one(&pool).await.unwrap();
+        assert!(accepted.is_some(), "the shipped teammate path must not change behaviour");
+    }
+
+    #[tokio::test]
+    async fn a_block_suppresses_the_grant_without_reporting_failure() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id, expires_at) VALUES ($1, $2, now() + interval '7 days')")
+            .bind(stranger).bind(host).execute(&pool).await.unwrap();
+
+        let outcome = grant_invitee(
+            &pool,
+            &notifier,
+            &manager,
+            &knocks(),
+            session_id,
+            host,
+            stranger,
+            "wrapped",
+        )
+        .await
+        .expect("a block must look exactly like success to the sender");
+        assert_eq!(outcome, GrantOutcome::Suppressed);
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(stranger)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 0,
+            "no row means no phantom invite holding a guest seat"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_block_no_longer_suppresses() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id, expires_at) VALUES ($1, $2, now() - interval '1 day')")
+            .bind(stranger).bind(host).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            grant_invitee(
+                &pool,
+                &notifier,
+                &manager,
+                &knocks(),
+                session_id,
+                host,
+                stranger,
+                "wrapped"
+            )
+            .await
+            .unwrap(),
+            GrantOutcome::Granted,
+        );
+    }
+
+    #[tokio::test]
+    async fn opting_out_suppresses_the_grant() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            grant_invitee(
+                &pool,
+                &notifier,
+                &manager,
+                &knocks(),
+                session_id,
+                host,
+                stranger,
+                "wrapped"
+            )
+            .await
+            .unwrap(),
+            GrantOutcome::Suppressed,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_knock_rate_limit_trips_and_teammates_are_exempt() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let limiter =
+            crate::rate_limit::KnockRateLimiter(RateLimiter::new(1, Duration::from_secs(3600)));
+        let (host, stranger_a, session_id) = direct_session_with_stranger(&pool).await;
+        let stranger_b = mk_stranger(&pool).await;
+
+        grant_invitee(
+            &pool, &notifier, &manager, &limiter, session_id, host, stranger_a, "w",
+        )
+        .await
+        .unwrap();
+        let err = grant_invitee(
+            &pool, &notifier, &manager, &limiter, session_id, host, stranger_b, "w",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::TOO_MANY_REQUESTS);
+
+        // A teammate invite must not consume or be refused by the stranger budget.
+        let (host2, mate, session2) = direct_session_with_teammate(&pool).await;
+        grant_invitee(
+            &pool, &notifier, &manager, &limiter, session2, host2, mate, "w",
+        )
+        .await
+        .unwrap();
     }
 }
