@@ -192,13 +192,19 @@ mod tests {
     use uuid::Uuid;
 
     async fn user(pool: &sqlx::PgPool, tier: &str) -> Uuid {
+        // `generate_unique_handle`, like every other seeding path: the test
+        // database is persistent and accumulates users, so an unchecked
+        // `generate_handle` eventually collides on the unique index.
+        let handle = crate::handles::generate_unique_handle(pool)
+            .await
+            .expect("generate handle");
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO users (email, display_name, account_id, auth_hash, subscription_tier, handle)
              VALUES ($1, 'x', gen_random_uuid(), 'h', $2, $3) RETURNING id",
         )
         .bind(format!("{}@example.test", Uuid::new_v4()))
         .bind(tier)
-        .bind(crate::handles::generate_handle())
+        .bind(&handle)
         .fetch_one(pool)
         .await
         .unwrap();
