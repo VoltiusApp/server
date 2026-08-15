@@ -75,8 +75,8 @@ pub struct ActiveSession {
     /// (#66) rather than a vault share — names who invited them.
     pub invited_by: Option<Uuid>,
     /// `invited_by`'s handle, resolved server-side from `users`. The knock UI
-    /// renders this and nothing else: the participant list isn't available
-    /// yet, and its `handle` is resolved from `users` the same way.
+    /// renders this and nothing else: `list_active_sessions` deliberately
+    /// redacts `participants` to empty for an unaccepted stranger.
     pub invited_by_handle: Option<String>,
     /// Everyone the host has individually invited (#66). Populated only when
     /// the caller is the host — a guest must not learn the guest list.
