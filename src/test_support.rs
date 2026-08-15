@@ -221,6 +221,15 @@ pub async fn set_user_trial(pool: &PgPool, user: Uuid, days: i64) {
         .expect("set user trial");
 }
 
+/// Handles are unique and never recycled (that's the feature), so two test
+/// functions cannot both claim a literal base like "kevin-p" against the same
+/// real, persistent test database — whichever runs first wins it permanently
+/// and every other test collides. Each call mints a fresh suffix, the same way
+/// `seed_user` avoids colliding on `email`.
+pub fn unique_handle(base: &str) -> String {
+    format!("{base}-{}", &Uuid::new_v4().simple().to_string()[..6])
+}
+
 /// The deterministic email `seed_user` assigns, so invitation tests can target a
 /// seeded user by the exact address their acceptance handler will compare against.
 pub fn test_user_email(id: Uuid) -> String {

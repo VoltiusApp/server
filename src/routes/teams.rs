@@ -2218,6 +2218,7 @@ mod authz_tests {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+    use crate::test_support::unique_handle;
     use uuid::Uuid;
 
     async fn mk_user(pool: &PgPool, email: &str, name: &str, handle: &str, custom: bool) -> Uuid {
@@ -2227,13 +2228,6 @@ mod search_tests {
         )
         .bind(email).bind(name).bind(handle).bind(custom)
         .fetch_one(pool).await.unwrap()
-    }
-
-    // Handles and emails are unique and the test DB is real and persistent, so a
-    // literal like "kevin-p" collides with itself on the second test run. Mint a
-    // fresh suffix per call, matching the pattern in routes::users's tests.
-    fn unique_handle(base: &str) -> String {
-        format!("{base}-{}", &Uuid::new_v4().simple().to_string()[..6])
     }
 
     #[tokio::test]
