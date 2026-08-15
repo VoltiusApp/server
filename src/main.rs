@@ -272,6 +272,11 @@ async fn main() {
             post(routes::auth::resend_verification_email),
         )
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
+        .route("/v1/users/me/handle", put(routes::users::claim_handle))
+        .route(
+            "/v1/users/me/preferences",
+            put(routes::users::update_preferences),
+        )
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .route(

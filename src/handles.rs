@@ -1,11 +1,5 @@
 //! The handle namespace: every user has one, it is never recycled, and a custom
 //! one is what makes an account fuzzy-searchable.
-//!
-//! The custom-handle validation path (`validate_custom_handle` and friends) has
-//! no caller yet — the claim endpoint that lets a user set one lands in a later
-//! task. Suppress dead-code here rather than that task; the foundation is meant
-//! to sit unconsumed for a while.
-#![allow(dead_code)]
 
 use rand::Rng;
 

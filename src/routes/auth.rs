@@ -580,14 +580,17 @@ pub struct MeResponse {
     pub trial_ends_at: Option<i64>,
     pub email_verified: bool,
     pub wrapped_user_secrets: Option<String>,
+    pub handle: String,
+    pub handle_is_custom: bool,
+    pub allow_stranger_invites: bool,
 }
 
 pub async fn get_me(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<MeResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>)>(
-        "SELECT email, display_name, account_id, wrapped_user_secrets FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool)>(
+        "SELECT email, display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites FROM users WHERE id = $1",
     )
     .bind(auth.0)
     .fetch_one(&pool)
@@ -607,6 +610,9 @@ pub async fn get_me(
         trial_ends_at: tier.trial_ends_at,
         email_verified: tier.email_verified,
         wrapped_user_secrets: row.3,
+        handle: row.4,
+        handle_is_custom: row.5,
+        allow_stranger_invites: row.6,
     }))
 }
 
