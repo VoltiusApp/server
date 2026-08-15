@@ -74,6 +74,10 @@ pub struct ActiveSession {
     /// Set when the caller reaches this session through an individual grant
     /// (#66) rather than a vault share — names who invited them.
     pub invited_by: Option<Uuid>,
+    /// `invited_by`'s handle, resolved server-side from `users`. The knock UI
+    /// renders this and nothing else: every other inviter identity reaching the
+    /// client (participant `display_name`) is supplied by the sender.
+    pub invited_by_handle: Option<String>,
     /// Everyone the host has individually invited (#66). Populated only when
     /// the caller is the host — a guest must not learn the guest list.
     pub invitee_ids: Vec<Uuid>,
@@ -706,6 +710,8 @@ struct VisibleSessionRow {
     created_at: chrono::DateTime<Utc>,
     vault_ids: Vec<Uuid>,
     invited_by: Option<Uuid>,
+    /// `invited_by`'s handle, read from `users`.
+    invited_by_handle: Option<String>,
     invitee_ids: Vec<Uuid>,
 }
 
@@ -747,6 +753,14 @@ async fn visible_sessions(
             ) AS vault_ids,
             (SELECT tsi.invited_by FROM terminal_session_invitees tsi
               WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by,
+            -- The inviter's handle, for the caller's own grant only. A knock is
+            -- the one surface a stranger reads before consenting, so its
+            -- identity must come from `users` — a participant-supplied
+            -- display_name there is an impersonation vector the reserved-handle
+            -- list would otherwise be powerless against.
+            (SELECT u.handle FROM terminal_session_invitees tsi
+               JOIN users u ON u.id = tsi.invited_by
+              WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by_handle,
             -- Suppressed knocks are unioned in here, and only here: the host must see
             -- a blocked/opted-out stranger exactly as an ordinary pending invite, or
             -- the missing id would tell them what the silent block exists to hide.
@@ -839,6 +853,7 @@ pub async fn list_active_sessions(
                 participants,
                 vault_ids: row.vault_ids,
                 invited_by: row.invited_by,
+                invited_by_handle: row.invited_by_handle,
                 invitee_ids: row.invitee_ids,
             }
         })
@@ -2761,5 +2776,27 @@ mod tests {
             "SELECT count(*) FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
             .bind(session_id).bind(mate).fetch_one(&pool).await.unwrap();
         assert_eq!(suppressed, 0, "a departed member's suppressed row must not keep the seat occupied");
+    }
+
+    #[tokio::test]
+    async fn a_knock_carries_the_inviters_handle_from_the_users_table() {
+        let pool = test_pool_or_skip!();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) VALUES ($1, $2, $3)")
+            .bind(session_id).bind(stranger).bind(host).execute(&pool).await.unwrap();
+        let host_handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(host).fetch_one(&pool).await.unwrap();
+
+        let rows = visible_sessions(&pool, stranger).await.unwrap();
+        let row = rows.iter().find(|r| r.id == session_id).expect("the knock must be visible");
+        assert_eq!(
+            row.invited_by_handle.as_deref(),
+            Some(host_handle.as_str()),
+            "the knock's identity is the server-owned handle, not anything the sender supplies",
+        );
+
+        // The host is nobody's invitee, so their own row carries no inviter.
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert!(for_host.iter().find(|r| r.id == session_id).unwrap().invited_by_handle.is_none());
     }
 }
