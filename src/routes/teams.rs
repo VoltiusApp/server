@@ -262,8 +262,8 @@ pub async fn list_members(
         ),
     >(
         r#"
-        SELECT tm.team_id, tm.user_id, inv.display_name AS invited_by_display_name, tm.joined_at,
-               u.display_name, u.handle, u.public_key, tmr.role_id
+        SELECT tm.team_id, tm.user_id, inv.handle AS invited_by_display_name, tm.joined_at,
+               u.handle AS display_name, u.handle, u.public_key, tmr.role_id
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
@@ -412,7 +412,7 @@ pub async fn add_member(
     }
 
     let (invitee_email, invitee_display_name) = sqlx::query_as::<_, (String, String)>(
-        "SELECT email, display_name FROM users WHERE id = $1",
+        "SELECT email, handle FROM users WHERE id = $1",
     )
     .bind(invitee_id)
     .fetch_one(&pool)
@@ -526,7 +526,7 @@ pub async fn remove_member(
         error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to revoke session invitee grants");
     }
 
-    let removed_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+    let removed_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(&pool)
         .await
@@ -1045,7 +1045,7 @@ pub async fn assign_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let target_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+    let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
         .fetch_optional(&pool)
         .await
@@ -1134,7 +1134,7 @@ pub async fn remove_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let target_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+    let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
         .fetch_optional(&pool)
         .await
@@ -1268,7 +1268,7 @@ pub async fn invite_member(
         .map_err(|e| { error!(error = %e, "Failed to create pending invitation for existing user"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
         info!(team_id = %team_id, user_id = %user_id, role = %role, "Pending invitation created for existing user via invite endpoint");
-        let invite_display_name = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+        let invite_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
             .bind(user_id)
             .fetch_optional(&pool)
             .await
@@ -1373,7 +1373,7 @@ pub async fn list_pending_invitations(
     }
 
     let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT pi.id, COALESCE(invitee.display_name, pi.email), pi.role, inv.display_name, pi.created_at, pi.expires_at
+        r#"SELECT pi.id, COALESCE(invitee.handle, pi.email), pi.role, inv.handle, pi.created_at, pi.expires_at
            FROM pending_invitations pi
            LEFT JOIN users inv ON inv.id = pi.invited_by
            LEFT JOIN users invitee ON invitee.id = pi.user_id
@@ -1445,7 +1445,7 @@ mod authz_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
-        seed_user, set_user_seats, set_user_tier, set_user_trial,
+        seed_user, set_user_seats, set_user_tier, set_user_trial, unique_handle,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -1644,6 +1644,66 @@ mod authz_tests {
         };
         assert_eq!(handle_of(caller), caller_handle);
         assert_eq!(handle_of(other), other_handle);
+    }
+
+    #[tokio::test]
+    async fn a_roster_row_carries_the_handle_in_both_fields() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_team_member(&pool, team, owner).await;
+
+        let handle = unique_handle("merry-quartz");
+        sqlx::query("UPDATE users SET handle = $1 WHERE id = $2")
+            .bind(&handle)
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let presence: PresenceMap = std::sync::Arc::new(dashmap::DashMap::new());
+        let members = list_members(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(presence),
+            Path(team),
+        )
+        .await
+        .expect("list members")
+        .0;
+
+        let me = members.iter().find(|m| m.member.user_id == owner).unwrap();
+        assert_eq!(me.member.handle, handle);
+        // ALIAS for pre-0.26 clients.
+        assert_eq!(me.member.display_name, handle);
+    }
+
+    #[tokio::test]
+    async fn a_pending_invitation_to_an_unregistered_email_still_shows_the_email() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_team_member(&pool, team, owner).await;
+
+        sqlx::query(
+            "INSERT INTO pending_invitations (team_id, email, role, invited_by, expires_at)
+             VALUES ($1, $2, 'member', $3, now() + interval '7 days')",
+        )
+        .bind(team)
+        .bind("nobody@example.com")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pending = list_pending_invitations(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("list pending invitations")
+            .0;
+
+        // No account means no handle, so the admin sees the address they typed.
+        // This is what keeps a handle-only roster mappable back to a person.
+        assert_eq!(pending[0].display_name, "nobody@example.com");
     }
 
     #[tokio::test]

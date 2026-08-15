@@ -25,7 +25,7 @@ pub async fn get_invitation(
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<Json<InvitationDetails>, StatusCode> {
     let row = sqlx::query_as::<_, (String, Option<String>, String, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT t.name, u.display_name, pi.role, pi.expires_at
+        r#"SELECT t.name, u.handle, pi.role, pi.expires_at
            FROM pending_invitations pi
            JOIN teams t ON t.id = pi.team_id
            LEFT JOIN users u ON u.id = pi.invited_by
@@ -182,7 +182,7 @@ pub async fn list_my_pending_invitations(
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<MyPendingInvitation>>, StatusCode> {
     let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT pi.id, pi.team_id, t.name, u.display_name, pi.role, pi.created_at, pi.expires_at
+        r#"SELECT pi.id, pi.team_id, t.name, u.handle, pi.role, pi.created_at, pi.expires_at
            FROM pending_invitations pi
            JOIN teams t ON t.id = pi.team_id
            LEFT JOIN users u ON u.id = pi.invited_by
