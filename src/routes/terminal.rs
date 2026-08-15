@@ -75,8 +75,8 @@ pub struct ActiveSession {
     /// (#66) rather than a vault share — names who invited them.
     pub invited_by: Option<Uuid>,
     /// `invited_by`'s handle, resolved server-side from `users`. The knock UI
-    /// renders this and nothing else: every other inviter identity reaching the
-    /// client (participant `display_name`) is supplied by the sender.
+    /// renders this and nothing else: the participant list isn't available
+    /// yet, and its `handle` is resolved from `users` the same way.
     pub invited_by_handle: Option<String>,
     /// Everyone the host has individually invited (#66). Populated only when
     /// the caller is the host — a guest must not learn the guest list.
@@ -770,10 +770,9 @@ async fn visible_sessions(
             (SELECT tsi.invited_by FROM terminal_session_invitees tsi
               WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by,
             -- The inviter's handle, for the caller's own grant only. A knock is
-            -- the one surface a stranger reads before consenting, so its
-            -- identity must come from `users` — a participant-supplied
-            -- display_name there is an impersonation vector the reserved-handle
-            -- list would otherwise be powerless against.
+            -- the one surface a stranger reads before consenting, so its identity
+            -- must come from `users` — same resolution the participant list uses,
+            -- closing the impersonation vector a client-supplied name would open.
             (SELECT u.handle FROM terminal_session_invitees tsi
                JOIN users u ON u.id = tsi.invited_by
               WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by_handle,
@@ -2935,9 +2934,12 @@ mod tests {
     async fn the_participant_handle_comes_from_the_database_not_the_caller() {
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
+        // Handles are unique and never recycled, so a fixed literal collides
+        // on a second run against a persistent test database.
+        let handle = crate::test_support::unique_handle("merry-quartz");
 
         sqlx::query("UPDATE users SET handle = $1 WHERE id = $2")
-            .bind("merry-quartz-2597")
+            .bind(&handle)
             .bind(user)
             .execute(&pool)
             .await
@@ -2945,7 +2947,7 @@ mod tests {
 
         // The caller cannot influence this value: there is no argument for them to set.
         let resolved = resolve_participant_handle(&pool, user).await;
-        assert_eq!(resolved, "merry-quartz-2597");
+        assert_eq!(resolved, handle);
     }
 
     #[tokio::test]
