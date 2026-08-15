@@ -70,13 +70,15 @@ macro_rules! test_pool_or_skip {
 /// tests never collide on the unique `email`/`account_id` columns.
 pub async fn seed_user(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
+    let handle = crate::handles::generate_unique_handle(pool).await;
     sqlx::query(
-        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name)
-         VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User')",
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, handle)
+         VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User', $4)",
     )
     .bind(id)
     .bind(format!("{id}@test.local"))
     .bind(Uuid::new_v4())
+    .bind(&handle)
     .execute(pool)
     .await
     .expect("seed user");
@@ -89,14 +91,16 @@ pub async fn seed_user(pool: &PgPool) -> Uuid {
 pub async fn seed_user_with_credentials(pool: &PgPool, account_id: Uuid, auth_key: &str) -> Uuid {
     let id = Uuid::new_v4();
     let hash = crate::auth::password::hash_auth_key(auth_key).expect("hash auth key");
+    let handle = crate::handles::generate_unique_handle(pool).await;
     sqlx::query(
-        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name)
-         VALUES ($1, $2, $3, $4, 'test-pubkey', 'Test User')",
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, handle)
+         VALUES ($1, $2, $3, $4, 'test-pubkey', 'Test User', $5)",
     )
     .bind(id)
     .bind(format!("{id}@test.local"))
     .bind(account_id)
     .bind(&hash)
+    .bind(&handle)
     .execute(pool)
     .await
     .expect("seed user with credentials");

@@ -176,9 +176,11 @@ pub async fn register(
         ("pro", Some(Utc::now() + Duration::days(14)))
     };
 
+    let handle = crate::handles::generate_unique_handle(&pool).await;
+
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at)
-         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7) RETURNING id",
+        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
+         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(&email)
     .bind(body.account_id)
@@ -187,6 +189,7 @@ pub async fn register(
     .bind(body.wrapped_user_secrets.as_deref())
     .bind(initial_tier)
     .bind(trial_ends_at)
+    .bind(&handle)
     .fetch_one(&pool)
     .await
     .map_err(|e| {

@@ -1799,15 +1799,17 @@ mod admin_handler_tests {
     /// own rows out of a shared database via the `search` filter.
     async fn seed_tagged_user(pool: &PgPool, tag: &str, name: &str, seen_days_ago: Option<i32>) -> Uuid {
         let id = Uuid::new_v4();
+        let handle = crate::handles::generate_unique_handle(pool).await;
         sqlx::query(
-            "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, last_seen_on)
+            "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, last_seen_on, handle)
              VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User',
-                     CASE WHEN $4::int IS NULL THEN NULL ELSE current_date - $4::int END)",
+                     CASE WHEN $4::int IS NULL THEN NULL ELSE current_date - $4::int END, $5)",
         )
         .bind(id)
         .bind(format!("{name}-{tag}@test.local"))
         .bind(Uuid::new_v4())
         .bind(seen_days_ago)
+        .bind(&handle)
         .execute(pool)
         .await
         .expect("seed tagged user");
