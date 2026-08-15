@@ -57,3 +57,15 @@ CREATE TABLE user_blocks (
 -- NULL until the invitee's WebSocket is first admitted. Drives both the
 -- session-name redaction and the "unaccepted stranger" state.
 ALTER TABLE terminal_session_invitees ADD COLUMN accepted_at TIMESTAMPTZ NULL;
+
+-- A suppressed knock (blocked or opted-out recipient) writes no grant row —
+-- that silence is what makes the block undetectable. This table exists only
+-- so the host's own invitee list still shows the stranger as "invited",
+-- indistinguishable from a real pending grant; nothing else may read it.
+CREATE TABLE suppressed_invites (
+  session_id UUID NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  invited_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, user_id)
+);

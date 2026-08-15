@@ -198,6 +198,22 @@ pub(crate) async fn grant_invitee(
 
         if !opted_in || is_blocked(pool, user_id, host_user_id).await? {
             info!(target: "knock", sender = %host_user_id, recipient = %user_id, outcome = "suppressed", "Stranger knock suppressed");
+            // No grant row, ever — that silence is the whole point. This is the
+            // one place that writes here: it exists only so the host's own
+            // invitee list can't tell a block/opt-out apart from a real grant.
+            sqlx::query(
+                "INSERT INTO suppressed_invites (session_id, user_id, invited_by) \
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(host_user_id)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, session_id = %session_id, "Failed to record suppressed invite");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
             return Ok(GrantOutcome::Suppressed);
         }
         info!(target: "knock", sender = %host_user_id, recipient = %user_id, outcome = "granted", "Stranger knock");
@@ -599,9 +615,16 @@ async fn visible_sessions(
             ) AS vault_ids,
             (SELECT tsi.invited_by FROM terminal_session_invitees tsi
               WHERE tsi.session_id = ts.id AND tsi.user_id = $1) AS invited_by,
+            -- Suppressed knocks are unioned in here, and only here: the host must see
+            -- a blocked/opted-out stranger exactly as an ordinary pending invite, or
+            -- the missing id would tell them what the silent block exists to hide.
             CASE WHEN ts.host_user_id = $1 THEN
               COALESCE(
-                (SELECT array_agg(tsi3.user_id) FROM terminal_session_invitees tsi3 WHERE tsi3.session_id = ts.id),
+                (SELECT array_agg(uid) FROM (
+                  SELECT tsi3.user_id AS uid FROM terminal_session_invitees tsi3 WHERE tsi3.session_id = ts.id
+                  UNION
+                  SELECT si.user_id FROM suppressed_invites si WHERE si.session_id = ts.id
+                ) all_invitee_ids),
                 ARRAY[]::uuid[]
               )
             ELSE ARRAY[]::uuid[] END AS invitee_ids
@@ -1729,12 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn grant_invitee_is_idempotent_and_inserts_both_rows() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
 
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         for _ in 0..2 {
@@ -1777,12 +1795,7 @@ mod tests {
     #[tokio::test]
     async fn grant_invitee_refreshes_a_stale_wrapped_key() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
 
         // The recipient rotates their keypair between the two grants, so the
@@ -1826,12 +1839,7 @@ mod tests {
     #[tokio::test]
     async fn grant_invitee_pushes_only_on_the_first_grant() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
 
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         let mut events = notifier.subscribe();
@@ -1890,12 +1898,7 @@ mod tests {
     #[tokio::test]
     async fn ws_authorizes_an_invitee_of_a_vaultless_session() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -1920,13 +1923,8 @@ mod tests {
     #[tokio::test]
     async fn list_query_returns_a_direct_session_only_for_host_and_invitee() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let stranger = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -1947,12 +1945,7 @@ mod tests {
     #[tokio::test]
     async fn list_query_reveals_invitee_ids_only_to_the_host() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -1968,12 +1961,7 @@ mod tests {
     #[tokio::test]
     async fn end_session_recipients_include_invitees_of_a_vaultless_session() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -1986,12 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn host_disconnect_on_a_vaultless_session_retracts_the_invitees_knock() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -2043,12 +2026,7 @@ mod tests {
     #[tokio::test]
     async fn ending_a_session_clears_its_invitee_grants_but_still_notifies_them() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -2151,12 +2129,7 @@ mod tests {
     #[tokio::test]
     async fn host_disconnect_also_clears_the_sessions_invitee_grants() {
         let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        add_member(&pool, team, mate).await;
-        let session_id = seed_session(&pool, host, "direct").await;
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
         let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
         grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
             .await
@@ -2259,6 +2232,68 @@ mod tests {
         assert_eq!(
             rows, 0,
             "no row means no phantom invite holding a guest seat"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_knock_still_appears_in_the_hosts_invitee_ids() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped")
+            .await
+            .unwrap();
+        assert_eq!(outcome, GrantOutcome::Suppressed);
+
+        // The host's own view must be unable to tell this apart from a real
+        // grant, or the missing id would leak the very thing the block hides.
+        let for_host = visible_sessions(&pool, host).await.unwrap();
+        assert_eq!(for_host[0].7, vec![stranger], "a suppressed knock occupies a seat exactly like a real one");
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_stranger_cannot_see_the_session_themselves() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped")
+            .await
+            .unwrap();
+
+        assert!(
+            visible_sessions(&pool, stranger).await.unwrap().is_empty(),
+            "the suppressed row must never grant the recipient their own visibility"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_stranger_is_not_an_authorized_participant() {
+        let pool = test_pool_or_skip!();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        let (notifier, manager) = test_notifier_and_manager(session_id, host).await;
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id, expires_at) VALUES ($1, $2, NULL)")
+            .bind(stranger).bind(host).execute(&pool).await.unwrap();
+
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped")
+            .await
+            .unwrap();
+
+        let invitees = manager.sessions.lock().await.get(&session_id).unwrap().invitees.clone();
+        assert!(
+            !is_authorized_participant(&pool, stranger, host, "direct", &[], &[], None, None, &invitees).await,
+            "the suppressed row must not admit the WebSocket"
         );
     }
 
