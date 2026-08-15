@@ -1151,6 +1151,28 @@ pub struct WsQuery {
     pub invite_token: Option<String>,
 }
 
+/// Longest display name the relay will carry. Long enough for any real name or
+/// email, short enough that it cannot be used as a payload.
+const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// Sanitizes the caller-supplied `display_name` before it reaches participant
+/// lists. `None` (empty or absent) means "fall back to the user id"; `Err` means
+/// the value is malformed and the upgrade is refused.
+///
+/// Control characters are rejected rather than stripped: no legitimate client
+/// sends them, and a name is rendered in enough places that silently reshaping
+/// one is worse than telling the caller it was wrong. Length is truncated
+/// instead, since a merely long name is plausible input.
+fn sanitize_display_name(raw: Option<String>) -> Result<Option<String>, ()> {
+    let Some(name) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if name.chars().any(|c| c.is_control()) {
+        return Err(());
+    }
+    Ok(Some(name.chars().take(MAX_DISPLAY_NAME_CHARS).collect()))
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(session_id): Path<Uuid>,
@@ -1167,10 +1189,13 @@ pub async fn ws_handler(
         }
     };
 
-    let display_name = query
-        .display_name
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| user_id.to_string());
+    let display_name = match sanitize_display_name(query.display_name) {
+        Ok(name) => name.unwrap_or_else(|| user_id.to_string()),
+        Err(()) => {
+            warn!(session_id = %session_id, "WS upgrade rejected: malformed display_name");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
 
     ws.on_upgrade(move |socket| {
         handle_socket(
@@ -2798,5 +2823,28 @@ mod tests {
         // The host is nobody's invitee, so their own row carries no inviter.
         let for_host = visible_sessions(&pool, host).await.unwrap();
         assert!(for_host.iter().find(|r| r.id == session_id).unwrap().invited_by_handle.is_none());
+    }
+
+    #[test]
+    fn an_over_long_display_name_is_truncated() {
+        let name = "k".repeat(500);
+        let out = sanitize_display_name(Some(name)).unwrap().unwrap();
+        assert_eq!(out.chars().count(), MAX_DISPLAY_NAME_CHARS);
+    }
+
+    #[test]
+    fn a_display_name_with_control_characters_is_refused() {
+        assert!(sanitize_display_name(Some("Voltius\u{0}Support".to_string())).is_err());
+        assert!(sanitize_display_name(Some("line\nbreak".to_string())).is_err());
+    }
+
+    #[test]
+    fn an_ordinary_display_name_passes_through_unchanged() {
+        assert_eq!(
+            sanitize_display_name(Some("Kévin P.".to_string())).unwrap().as_deref(),
+            Some("Kévin P."),
+        );
+        assert_eq!(sanitize_display_name(Some(String::new())).unwrap(), None);
+        assert_eq!(sanitize_display_name(None).unwrap(), None);
     }
 }
