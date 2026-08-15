@@ -83,7 +83,9 @@ pub struct CreateSessionResponse {
 #[derive(Serialize)]
 pub struct ActiveSession {
     pub id: Uuid,
-    pub connection_name: String,
+    /// `None` for an unaccepted stranger invitee — a mis-aimed invite must not
+    /// leak what it was for until the recipient accepts.
+    pub connection_name: Option<String>,
     pub host_user_id: Uuid,
     pub host_public_key: String,
     pub visibility: String,
@@ -582,16 +584,18 @@ pub async fn create_session(
 
 // ─── List active sessions (vault sessions the user is part of) ────────────────
 
-type VisibleSessionRow = (
-    Uuid,
-    String,
-    Uuid,
-    String,
-    chrono::DateTime<Utc>,
-    Vec<Uuid>,
-    Option<Uuid>,
-    Vec<Uuid>,
-);
+#[derive(sqlx::FromRow)]
+struct VisibleSessionRow {
+    id: Uuid,
+    /// `None` for an unaccepted stranger invitee (see the CASE in `visible_sessions`).
+    connection_name: Option<String>,
+    host_user_id: Uuid,
+    visibility: String,
+    created_at: chrono::DateTime<Utc>,
+    vault_ids: Vec<Uuid>,
+    invited_by: Option<Uuid>,
+    invitee_ids: Vec<Uuid>,
+}
 
 /// Sessions `user_id` may see: their own, ones they hold an individual grant
 /// (#66) on, and vault sessions shared with a team they belong to (respecting
@@ -605,7 +609,17 @@ async fn visible_sessions(
         r#"
         SELECT
             ts.id,
-            ts.connection_name,
+            -- An unaccepted stranger invitee must not learn what they were
+            -- invited to; the host and any teammate always see the name.
+            CASE
+              WHEN ts.host_user_id = $1 THEN ts.connection_name
+              WHEN EXISTS (SELECT 1 FROM team_members a JOIN team_members b ON a.team_id = b.team_id
+                            WHERE a.user_id = $1 AND b.user_id = ts.host_user_id) THEN ts.connection_name
+              WHEN EXISTS (SELECT 1 FROM terminal_session_invitees tsi2
+                            WHERE tsi2.session_id = ts.id AND tsi2.user_id = $1
+                              AND tsi2.accepted_at IS NULL) THEN NULL
+              ELSE ts.connection_name
+            END AS connection_name,
             ts.host_user_id,
             ts.visibility,
             ts.created_at,
@@ -687,31 +701,29 @@ pub async fn list_active_sessions(
     let sessions_lock = manager.sessions.lock().await;
     let result = rows
         .into_iter()
-        .filter(|(id, ..)| sessions_lock.contains_key(id))
-        .map(
-            |(id, connection_name, host_user_id, visibility, created_at, vault_ids, invited_by, invitee_ids)| {
-                let (participant_count, participants, host_public_key) = sessions_lock
-                    .get(&id)
-                    .map(|s| {
-                        let ps: Vec<Participant> = s.participants.values().cloned().collect();
-                        (ps.len() as i64, ps, s.host_public_key.clone())
-                    })
-                    .unwrap_or_default();
-                ActiveSession {
-                    id,
-                    connection_name,
-                    host_user_id,
-                    host_public_key,
-                    visibility,
-                    created_at,
-                    participant_count,
-                    participants,
-                    vault_ids,
-                    invited_by,
-                    invitee_ids,
-                }
-            },
-        )
+        .filter(|row| sessions_lock.contains_key(&row.id))
+        .map(|row| {
+            let (participant_count, participants, host_public_key) = sessions_lock
+                .get(&row.id)
+                .map(|s| {
+                    let ps: Vec<Participant> = s.participants.values().cloned().collect();
+                    (ps.len() as i64, ps, s.host_public_key.clone())
+                })
+                .unwrap_or_default();
+            ActiveSession {
+                id: row.id,
+                connection_name: row.connection_name,
+                host_user_id: row.host_user_id,
+                host_public_key,
+                visibility: row.visibility,
+                created_at: row.created_at,
+                participant_count,
+                participants,
+                vault_ids: row.vault_ids,
+                invited_by: row.invited_by,
+                invitee_ids: row.invitee_ids,
+            }
+        })
         .collect();
 
     Ok(Json(result))
@@ -1071,6 +1083,23 @@ pub(crate) async fn is_authorized_participant(
         .unwrap_or(false)
 }
 
+/// Stamps first admission. `accepted_at IS NULL` in the predicate makes a
+/// re-join idempotent — the timestamp is "when they first said yes", and the
+/// redaction above reads it.
+pub(crate) async fn stamp_acceptance(pool: &PgPool, session_id: Uuid, user_id: Uuid) {
+    if let Err(e) = sqlx::query(
+        "UPDATE terminal_session_invitees SET accepted_at = now() \
+          WHERE session_id = $1 AND user_id = $2 AND accepted_at IS NULL",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    {
+        warn!(error = %e, session_id = %session_id, "Failed to stamp invitee acceptance");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
@@ -1131,6 +1160,8 @@ async fn handle_socket(
         warn!(session_id = %session_id, user_id = %user_id, "WS: unauthorized user rejected");
         return;
     }
+
+    stamp_acceptance(&pool, session_id, user_id).await;
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -1932,12 +1963,12 @@ mod tests {
 
         let for_mate = visible_sessions(&pool, mate).await.unwrap();
         assert_eq!(for_mate.len(), 1);
-        assert_eq!(for_mate[0].0, session_id);
-        assert_eq!(for_mate[0].6, Some(host), "invited_by names the host");
+        assert_eq!(for_mate[0].id, session_id);
+        assert_eq!(for_mate[0].invited_by, Some(host), "invited_by names the host");
 
         let for_host = visible_sessions(&pool, host).await.unwrap();
         assert_eq!(for_host.len(), 1);
-        assert_eq!(for_host[0].6, None, "the host is not their own invitee");
+        assert_eq!(for_host[0].invited_by, None, "the host is not their own invitee");
 
         assert!(visible_sessions(&pool, stranger).await.unwrap().is_empty());
     }
@@ -1952,10 +1983,60 @@ mod tests {
             .unwrap();
 
         let for_host = visible_sessions(&pool, host).await.unwrap();
-        assert_eq!(for_host[0].7, vec![mate], "the host sees who they invited");
+        assert_eq!(for_host[0].invitee_ids, vec![mate], "the host sees who they invited");
 
         let for_mate = visible_sessions(&pool, mate).await.unwrap();
-        assert!(for_mate[0].7.is_empty(), "an invitee must not learn the guest list");
+        assert!(for_mate[0].invitee_ids.is_empty(), "an invitee must not learn the guest list");
+    }
+
+    #[tokio::test]
+    async fn a_stranger_sees_no_session_name_until_accepted() {
+        let pool = test_pool_or_skip!();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) VALUES ($1, $2, $3)")
+            .bind(session_id).bind(stranger).bind(host).execute(&pool).await.unwrap();
+
+        let rows = visible_sessions(&pool, stranger).await.unwrap();
+        let row = rows.iter().find(|r| r.id == session_id).expect("the knock must be visible");
+        assert!(row.connection_name.is_none(), "a mis-aimed invite leaks a handle, never a hostname");
+
+        sqlx::query("UPDATE terminal_session_invitees SET accepted_at = now() WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).execute(&pool).await.unwrap();
+        let rows = visible_sessions(&pool, stranger).await.unwrap();
+        assert!(rows.iter().find(|r| r.id == session_id).unwrap().connection_name.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_teammate_and_the_host_always_see_the_name() {
+        let pool = test_pool_or_skip!();
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
+        sqlx::query("INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) VALUES ($1, $2, $3)")
+            .bind(session_id).bind(mate).bind(host).execute(&pool).await.unwrap();
+
+        assert!(visible_sessions(&pool, mate).await.unwrap()
+            .iter().find(|r| r.id == session_id).unwrap().connection_name.is_some());
+        assert!(visible_sessions(&pool, host).await.unwrap()
+            .iter().find(|r| r.id == session_id).unwrap().connection_name.is_some());
+    }
+
+    #[tokio::test]
+    async fn admission_stamps_acceptance_once() {
+        let pool = test_pool_or_skip!();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) VALUES ($1, $2, $3)")
+            .bind(session_id).bind(stranger).bind(host).execute(&pool).await.unwrap();
+
+        stamp_acceptance(&pool, session_id, stranger).await;
+        let first: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT accepted_at FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
+        assert!(first.is_some());
+
+        stamp_acceptance(&pool, session_id, stranger).await;
+        let second: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT accepted_at FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
+        assert_eq!(first, second, "re-joining must not move the acceptance timestamp");
     }
 
     #[tokio::test]
@@ -2254,7 +2335,7 @@ mod tests {
         // The host's own view must be unable to tell this apart from a real
         // grant, or the missing id would leak the very thing the block hides.
         let for_host = visible_sessions(&pool, host).await.unwrap();
-        assert_eq!(for_host[0].7, vec![stranger], "a suppressed knock occupies a seat exactly like a real one");
+        assert_eq!(for_host[0].invitee_ids, vec![stranger], "a suppressed knock occupies a seat exactly like a real one");
     }
 
     #[tokio::test]
