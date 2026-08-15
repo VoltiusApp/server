@@ -266,10 +266,53 @@ pub(crate) async fn grant_invitee(
     Ok(GrantOutcome::Granted)
 }
 
+/// Tables keyed by `(session_id, user_id)` that ride along whenever
+/// `terminal_session_invitees` is cleared for a grant: the wrapped key and the
+/// suppressed-knock row. Both revoke paths delete from `terminal_session_invitees`
+/// with their own shape (a plain pair delete here, a set-scoped delete with a
+/// teammate check in the bulk path below) but must clear these two identically —
+/// drive both from this list so a future table can't drift out of one of them.
+const GRANT_SIDE_TABLES: &[&str] = &["terminal_session_keys", "suppressed_invites"];
+
+/// Deletes `table`'s row for one `(session_id, user_id)` pair.
+async fn delete_grant_side_row(
+    pool: &PgPool,
+    table: &str,
+    session_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!("DELETE FROM {table} WHERE session_id = $1 AND user_id = $2"))
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Deletes `table`'s rows for a batch of `(session_id, user_id)` pairs in one round trip.
+async fn delete_grant_side_rows(
+    pool: &PgPool,
+    table: &str,
+    session_ids: &[Uuid],
+    user_ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "DELETE FROM {table} t \
+          USING UNNEST($1::uuid[], $2::uuid[]) AS revoked(session_id, user_id) \
+          WHERE t.session_id = revoked.session_id AND t.user_id = revoked.user_id"
+    ))
+    .bind(session_ids)
+    .bind(user_ids)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Undoes `grant_invitee` for every grant `user_id` is no longer qualified for
 /// after leaving a team — both grants they hold and grants they issued, since
 /// the admission guard tests the inviter/invitee *pair*. Clears the durable
-/// row, the wrapped key (`GET .../key` would otherwise still hand it out) and
+/// row, the wrapped key (`GET .../key` would otherwise still hand it out), the
+/// suppressed-knock row (else the seat it fakes-occupies never frees up) and
 /// the in-memory set the WebSocket actually reads.
 ///
 /// Scope: this closes admission to *new* connections. The relay protocol has no
@@ -303,15 +346,9 @@ pub(crate) async fn revoke_grants_for_departed_member(
     }
 
     let (session_ids, user_ids): (Vec<Uuid>, Vec<Uuid>) = revoked.iter().copied().unzip();
-    sqlx::query(
-        "DELETE FROM terminal_session_keys tsk \
-          USING UNNEST($1::uuid[], $2::uuid[]) AS revoked(session_id, user_id) \
-          WHERE tsk.session_id = revoked.session_id AND tsk.user_id = revoked.user_id",
-    )
-    .bind(&session_ids)
-    .bind(&user_ids)
-    .execute(pool)
-    .await?;
+    for table in GRANT_SIDE_TABLES {
+        delete_grant_side_rows(pool, table, &session_ids, &user_ids).await?;
+    }
 
     let mut sessions = manager.sessions.lock().await;
     for (session_id, revoked_user) in revoked {
@@ -338,16 +375,9 @@ pub(crate) async fn revoke_one_grant(
         .bind(user_id)
         .execute(pool)
         .await?;
-    sqlx::query("DELETE FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2")
-        .bind(session_id)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
-        .bind(session_id)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
+    for table in GRANT_SIDE_TABLES {
+        delete_grant_side_row(pool, table, session_id, user_id).await?;
+    }
     if let Some(state) = manager.sessions.lock().await.get_mut(&session_id) {
         state.invitees.remove(&user_id);
     }
@@ -2709,5 +2739,51 @@ mod tests {
             "SELECT count(*) FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
             .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
         assert_eq!(after, 0);
+    }
+
+    #[tokio::test]
+    async fn departed_member_revoke_clears_the_suppressed_row_too() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, mate, session_id) = direct_session_with_teammate(&pool).await;
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+
+        // A suppressed row can coexist with a real grant row for the same pair
+        // (e.g. an earlier stranger knock, before host and mate shared a team) —
+        // seed one directly rather than relying on `grant_invitee` to produce it.
+        sqlx::query(
+            "INSERT INTO suppressed_invites (session_id, user_id, invited_by) VALUES ($1, $2, $3)",
+        )
+        .bind(session_id)
+        .bind(mate)
+        .bind(host)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM team_members WHERE user_id = $1")
+            .bind(mate)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        revoke_grants_for_departed_member(&pool, &manager, mate).await.unwrap();
+
+        let invitees: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(mate).fetch_one(&pool).await.unwrap();
+        assert_eq!(invitees, 0);
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(mate).fetch_one(&pool).await.unwrap();
+        assert_eq!(keys, 0);
+
+        let suppressed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(mate).fetch_one(&pool).await.unwrap();
+        assert_eq!(suppressed, 0, "a departed member's suppressed row must not keep the seat occupied");
     }
 }
