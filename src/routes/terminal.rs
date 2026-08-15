@@ -835,13 +835,22 @@ pub async fn list_active_sessions(
         .into_iter()
         .filter(|row| sessions_lock.contains_key(&row.id))
         .map(|row| {
-            let (participant_count, participants, host_public_key) = sessions_lock
+            let (mut participant_count, mut participants, host_public_key) = sessions_lock
                 .get(&row.id)
                 .map(|s| {
                     let ps: Vec<Participant> = s.participants.values().cloned().collect();
                     (ps.len() as i64, ps, s.host_public_key.clone())
                 })
                 .unwrap_or_default();
+            // A redacted `connection_name` marks an unaccepted stranger, and the
+            // rest of this row is just as identifying: participant display names
+            // and a headcount say who is already in the room. D7 promises such a
+            // recipient learns a handle and nothing else. `host_public_key` stays
+            // — it is inert and plausibly needed before joining.
+            if row.connection_name.is_none() {
+                participants = Vec::new();
+                participant_count = 0;
+            }
             ActiveSession {
                 id: row.id,
                 connection_name: row.connection_name,
@@ -2881,5 +2890,42 @@ mod tests {
             "SELECT count(*) FROM suppressed_invites WHERE session_id = $1")
             .bind(session_id).fetch_one(&pool).await.unwrap();
         assert_eq!(suppressed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unaccepted_stranger_sees_no_participant_names() {
+        let pool = test_pool_or_skip!();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("INSERT INTO terminal_session_invitees (session_id, user_id, invited_by) VALUES ($1, $2, $3)")
+            .bind(session_id).bind(stranger).bind(host).execute(&pool).await.unwrap();
+
+        let manager = TerminalManager::new();
+        manager.insert_test_session(session_id, host).await;
+        manager.sessions.lock().await.get_mut(&session_id).unwrap().participants.insert(
+            host,
+            Participant { user_id: host, display_name: "Real Hostname Owner".to_string() },
+        );
+
+        let Json(sessions) = list_active_sessions(
+            State(pool.clone()),
+            Extension(AuthUser(stranger)),
+            Extension(manager.clone()),
+        )
+        .await
+        .unwrap();
+        let row = sessions.iter().find(|s| s.id == session_id).expect("the knock must be listed");
+        assert!(row.connection_name.is_none());
+        assert!(row.participants.is_empty(), "D7 leaks a handle, never who is already in the room");
+        assert_eq!(row.participant_count, 0);
+
+        // Accepting un-redacts the whole row, participants included.
+        sqlx::query("UPDATE terminal_session_invitees SET accepted_at = now() WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).execute(&pool).await.unwrap();
+        let Json(sessions) =
+            list_active_sessions(State(pool), Extension(AuthUser(stranger)), Extension(manager))
+                .await
+                .unwrap();
+        let row = sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(row.participant_count, 1);
     }
 }
