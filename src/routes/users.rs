@@ -1,6 +1,10 @@
-use axum::{extract::State, http::StatusCode, Extension, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Extension, Json,
+};
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
@@ -137,6 +141,44 @@ pub async fn update_preferences(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct UserKeyResponse {
+    pub user_id: Uuid,
+    pub display_name: String,
+    pub handle: String,
+    pub public_key: String,
+}
+
+/// One user's current X25519 key, read at wrap time. Deliberately a lookup by a
+/// known id rather than a field on search: search is callable by anyone who
+/// types two characters, and #66's live run proved that wrapping to a key from
+/// any other source than a fresh read fails with `aead::Error`.
+pub(crate) async fn user_public_key_inner(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<UserKeyResponse, StatusCode> {
+    sqlx::query_as::<_, UserKeyResponse>(
+        "SELECT id AS user_id, display_name, handle, public_key
+           FROM users WHERE id = $1 AND deleted_at IS NULL AND public_key IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to read user public key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)
+}
+
+pub async fn get_user_public_key(
+    State(pool): State<PgPool>,
+    Extension(_auth): Extension<AuthUser>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<UserKeyResponse>, StatusCode> {
+    Ok(Json(user_public_key_inner(&pool, user_id).await?))
 }
 
 #[cfg(test)]
@@ -286,5 +328,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn public_key_lookup_returns_identity_and_key_or_404() {
+        let pool = crate::test_pool_or_skip!();
+        let me = user(&pool, "pro").await;
+        let them = user(&pool, "free").await;
+        sqlx::query("UPDATE users SET public_key = 'pk-them' WHERE id = $1")
+            .bind(them)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let found = user_public_key_inner(&pool, them).await.unwrap();
+        assert_eq!(found.public_key, "pk-them");
+        assert!(!found.handle.is_empty());
+
+        sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+            .bind(them)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            user_public_key_inner(&pool, them).await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+
+        let _ = me;
     }
 }

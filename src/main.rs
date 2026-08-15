@@ -327,6 +327,10 @@ async fn main() {
             delete(routes::teams::remove_member_role),
         )
         .route("/v1/users/search", get(routes::teams::search_users))
+        .route(
+            "/v1/users/:user_id/public-key",
+            get(routes::users::get_user_public_key),
+        )
         // Team invitations (invite POST is on invite_route with stricter rate limit)
         .route(
             "/v1/teams/:team_id/pending-invitations",
