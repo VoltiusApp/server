@@ -137,6 +137,34 @@ async fn is_blocked(pool: &PgPool, blocked_by: Uuid, sender: Uuid) -> Result<boo
     })
 }
 
+/// Whether a stranger knock may be delivered: the recipient's opt-in and the
+/// absence of a live block.
+///
+/// Both reads always run, and the two booleans are combined only after the fact.
+/// Written as `!opted_in || is_blocked(..).await?` the block query was skipped
+/// for an opted-out recipient, so the three outcomes (granted / opted-out /
+/// blocked) each cost a different number of round trips — measurable as latency,
+/// and a sender is promised they can learn neither fact.
+async fn stranger_knock_allowed(
+    pool: &PgPool,
+    recipient: Uuid,
+    sender: Uuid,
+) -> Result<bool, StatusCode> {
+    let opted_in = sqlx::query_scalar::<_, bool>(
+        "SELECT allow_stranger_invites FROM users WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(recipient)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to read invite preference");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .unwrap_or(false);
+    let blocked = is_blocked(pool, recipient, sender).await?;
+    Ok(opted_in && !blocked)
+}
+
 /// Grants one named user access to a session: the durable row, the wrapped key,
 /// the in-memory authorization set, and the push. The single grant path — both
 /// `create_session` with visibility "direct" and the invitees endpoint call it.
@@ -166,19 +194,7 @@ pub(crate) async fn grant_invitee(
             warn!(host = %host_user_id, "Knock rate limit exceeded");
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        let opted_in = sqlx::query_scalar::<_, bool>(
-            "SELECT allow_stranger_invites FROM users WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to read invite preference");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .unwrap_or(false);
-
-        if !opted_in || is_blocked(pool, user_id, host_user_id).await? {
+        if !stranger_knock_allowed(pool, user_id, host_user_id).await? {
             info!(target: "knock", sender = %host_user_id, recipient = %user_id, outcome = "suppressed", "Stranger knock suppressed");
             // No grant row, ever — that silence is the whole point. This is the
             // one place that writes here: it exists only so the host's own
@@ -2482,6 +2498,29 @@ mod tests {
             "SELECT accepted_at FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
             .bind(session_id).bind(mate).fetch_one(&pool).await.unwrap();
         assert!(accepted.is_some(), "the shipped teammate path must not change behaviour");
+    }
+
+    /// The three stranger outcomes must take the same path through the two
+    /// consent reads, so that neither an opt-out nor a block is distinguishable
+    /// from a grant — or from each other — by how much work the server did.
+    #[tokio::test]
+    async fn stranger_consent_reads_both_facts_for_every_outcome() {
+        let pool = test_pool_or_skip!();
+        let (host, stranger, _) = direct_session_with_stranger(&pool).await;
+        assert!(stranger_knock_allowed(&pool, stranger, host).await.unwrap());
+
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id, expires_at) VALUES ($1, $2, now() + interval '7 days')")
+            .bind(stranger).bind(host).execute(&pool).await.unwrap();
+        assert!(!stranger_knock_allowed(&pool, stranger, host).await.unwrap());
+
+        // Opted out *and* blocked: the block read still runs, since the opt-out
+        // no longer short-circuits it.
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger).execute(&pool).await.unwrap();
+        assert!(!stranger_knock_allowed(&pool, stranger, host).await.unwrap());
+
+        sqlx::query("DELETE FROM user_blocks WHERE blocker_id = $1").bind(stranger).execute(&pool).await.unwrap();
+        assert!(!stranger_knock_allowed(&pool, stranger, host).await.unwrap(), "opted out alone still refuses");
     }
 
     #[tokio::test]
