@@ -620,6 +620,7 @@ pub(crate) const TEAMMATE_PAIR_SQL: &str = "EXISTS (SELECT 1 FROM team_members a
 #[derive(Serialize, sqlx::FromRow)]
 pub struct UserSearchResult {
     pub user_id: Uuid,
+    /// ALIAS for pre-0.26 clients. Value is the handle. Delete in 0.27.
     pub display_name: String,
     pub handle: String,
     pub is_teammate: bool,
