@@ -19,8 +19,11 @@ const NOUNS: &[&str] = &[
     "anchor", "beacon",
 ];
 
-/// Names that must never be claimable: a `@voltius-support` asking to share your
-/// terminal is the phishing shape this feature would otherwise create.
+/// Names that must never be claimable outright: a `@voltius-support` asking to
+/// share your terminal is the phishing shape this feature would otherwise
+/// create. Checked against the whole handle, so `administrator` is reserved
+/// but `administrator-fan` is not — see `VENDOR_RESERVED` for the narrower set
+/// that's also checked component-by-component.
 const RESERVED: &[&str] = &[
     "admin",
     "administrator",
@@ -37,6 +40,24 @@ const RESERVED: &[&str] = &[
     "mod",
     "official",
     "team",
+];
+
+/// Subset of `RESERVED` also rejected as a standalone `-`/`_` component
+/// (`voltius-support`, `admin-2`). Narrower than `RESERVED` on purpose: the
+/// list exists to stop vendor impersonation, not to ban ordinary English
+/// words like "team" or "help" from appearing anywhere in a handle.
+const VENDOR_RESERVED: &[&str] = &[
+    "voltius",
+    "support",
+    "security",
+    "billing",
+    "admin",
+    "root",
+    "system",
+    "help",
+    "staff",
+    "official",
+    "moderator",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,17 +84,18 @@ pub fn generate_handle() -> String {
 /// Generate a handle and confirm it's free before handing it to a caller about
 /// to `INSERT` a new user. Every new-user insert path needs this same
 /// generate-and-check loop, so it lives here once rather than once per caller.
-pub async fn generate_unique_handle(pool: &sqlx::PgPool) -> String {
+/// Returns the DB error rather than panicking, so a transient hiccup here maps
+/// to the same controlled response as the `INSERT` that follows it.
+pub async fn generate_unique_handle(pool: &sqlx::PgPool) -> Result<String, sqlx::Error> {
     loop {
         let candidate = generate_handle();
         let taken: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE lower(handle) = $1)")
                 .bind(&candidate)
                 .fetch_one(pool)
-                .await
-                .expect("check handle uniqueness");
+                .await?;
         if !taken {
-            return candidate;
+            return Ok(candidate);
         }
     }
 }
@@ -92,7 +114,7 @@ fn impersonation_key(handle: &str) -> String {
         .filter(|c| *c != '-' && *c != '_')
         .map(|c| match c {
             '0' => 'o',
-            '1' => 'l',
+            '1' => 'i',
             '3' => 'e',
             '4' => 'a',
             '5' => 's',
@@ -122,14 +144,15 @@ pub fn validate_custom_handle(input: &str) -> Result<String, HandleError> {
         return Err(HandleError::EdgeSeparator);
     }
 
-    // Reserved on the whole-name key, plus any name that *contains* a reserved
-    // vendor word as a separated component (`voltius-support`, `admin-2`).
+    // Reserved on the whole-name key, plus any name whose separated component
+    // is a vendor word (`voltius-support`, `admin-2`) — but not merely
+    // containing one as a substring (`administrator-fan` stays allowed).
     let key = impersonation_key(&handle);
     if RESERVED.contains(&key.as_str()) {
         return Err(HandleError::Reserved);
     }
     for component in handle.split(['-', '_']) {
-        if RESERVED.contains(&impersonation_key(component).as_str()) {
+        if VENDOR_RESERVED.contains(&impersonation_key(component).as_str()) {
             return Err(HandleError::Reserved);
         }
     }
@@ -181,7 +204,14 @@ mod tests {
     #[test]
     fn rejects_reserved_names_and_their_near_variants() {
         for h in [
-            "admin", "support", "voltius", "security", "billing", "root", "system", "help",
+            "admin",
+            "adm1n",
+            "voltius",
+            "v0ltius",
+            "voltius-support",
+            "admin-2",
+            "administrator",
+            "team",
         ] {
             assert_eq!(
                 validate_custom_handle(h),
@@ -189,26 +219,16 @@ mod tests {
                 "{h} must be reserved"
             );
         }
-        // Near-variants: separators and digits stripped before the reserved check, so
-        // @voltius-support and @adm1n cannot be used to impersonate the vendor.
-        assert_eq!(
-            validate_custom_handle("voltius-support"),
-            Err(HandleError::Reserved)
-        );
-        assert_eq!(
-            validate_custom_handle("v0ltius"),
-            Err(HandleError::Reserved)
-        );
-        assert_eq!(
-            validate_custom_handle("admin-2"),
-            Err(HandleError::Reserved)
-        );
     }
 
     #[test]
     fn allows_ordinary_names_that_merely_contain_a_reserved_substring() {
-        assert!(validate_custom_handle("administrator-fan").is_ok() || true);
-        assert!(validate_custom_handle("rooted-tree").is_ok());
+        for h in ["administrator-fan", "rooted-tree", "team-lead"] {
+            assert!(
+                validate_custom_handle(h).is_ok(),
+                "{h} must be allowed, not a vendor impersonation"
+            );
+        }
     }
 
     #[tokio::test]

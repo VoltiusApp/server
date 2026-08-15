@@ -176,7 +176,12 @@ pub async fn register(
         ("pro", Some(Utc::now() + Duration::days(14)))
     };
 
-    let handle = crate::handles::generate_unique_handle(&pool).await;
+    let handle = crate::handles::generate_unique_handle(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to generate a handle for registration");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let row = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
