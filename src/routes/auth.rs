@@ -176,9 +176,16 @@ pub async fn register(
         ("pro", Some(Utc::now() + Duration::days(14)))
     };
 
+    let handle = crate::handles::generate_unique_handle(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to generate a handle for registration");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at)
-         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7) RETURNING id",
+        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
+         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(&email)
     .bind(body.account_id)
@@ -187,6 +194,7 @@ pub async fn register(
     .bind(body.wrapped_user_secrets.as_deref())
     .bind(initial_tier)
     .bind(trial_ends_at)
+    .bind(&handle)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
@@ -572,14 +580,17 @@ pub struct MeResponse {
     pub trial_ends_at: Option<i64>,
     pub email_verified: bool,
     pub wrapped_user_secrets: Option<String>,
+    pub handle: String,
+    pub handle_is_custom: bool,
+    pub allow_stranger_invites: bool,
 }
 
 pub async fn get_me(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<MeResponse>, StatusCode> {
-    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>)>(
-        "SELECT email, display_name, account_id, wrapped_user_secrets FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool)>(
+        "SELECT email, display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites FROM users WHERE id = $1",
     )
     .bind(auth.0)
     .fetch_one(&pool)
@@ -599,6 +610,9 @@ pub async fn get_me(
         trial_ends_at: tier.trial_ends_at,
         email_verified: tier.email_verified,
         wrapped_user_secrets: row.3,
+        handle: row.4,
+        handle_is_custom: row.5,
+        allow_stranger_invites: row.6,
     }))
 }
 

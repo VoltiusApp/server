@@ -28,6 +28,7 @@ pub struct TeamMember {
     pub team_id: Uuid,
     pub user_id: Uuid,
     pub display_name: String,
+    pub handle: String,
     pub public_key: String,
     pub invited_by_display_name: Option<String>,
     pub joined_at: DateTime<Utc>,

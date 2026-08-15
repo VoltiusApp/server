@@ -2,6 +2,7 @@ mod auth;
 mod db;
 mod email;
 mod entitlement;
+mod handles;
 mod last_seen;
 mod lemonsqueezy;
 mod models;
@@ -21,7 +22,8 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    InviteRateLimiter, RateLimiter, RegisterRateLimiter, SyncRateLimiter, WaitlistRateLimiter,
+    InviteRateLimiter, KnockRateLimiter, RateLimiter, RegisterRateLimiter, SearchRateLimiter,
+    SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
 use std::net::SocketAddr;
@@ -146,6 +148,14 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
+    let search_rate: usize = std::env::var("USER_SEARCH_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let knock_per_hour: usize = std::env::var("STRANGER_KNOCK_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     let auth_limiter = RateLimiter::<std::net::IpAddr>::new(10, Duration::from_secs(60));
     let register_limiter = RegisterRateLimiter(RateLimiter::new(
         register_per_day,
@@ -165,6 +175,10 @@ async fn main() {
     ));
     let audit_client_limiter =
         AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
+    let search_limiter =
+        SearchRateLimiter(RateLimiter::<uuid::Uuid>::new(search_rate, Duration::from_secs(60)));
+    let knock_limiter =
+        KnockRateLimiter(RateLimiter::<uuid::Uuid>::new(knock_per_hour, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -175,6 +189,8 @@ async fn main() {
         invite_per_hour,
         waitlist_per_hour,
         sync_per_hour = sync_rate,
+        search_per_minute = search_rate,
+        knock_per_hour,
         "Configured rate limits"
     );
 
@@ -271,6 +287,11 @@ async fn main() {
             post(routes::auth::resend_verification_email),
         )
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
+        .route("/v1/users/me/handle", put(routes::users::claim_handle))
+        .route(
+            "/v1/users/me/preferences",
+            put(routes::users::update_preferences),
+        )
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .route(
@@ -313,6 +334,10 @@ async fn main() {
             delete(routes::teams::remove_member_role),
         )
         .route("/v1/users/search", get(routes::teams::search_users))
+        .route(
+            "/v1/users/:user_id/public-key",
+            get(routes::users::get_user_public_key),
+        )
         // Team invitations (invite POST is on invite_route with stricter rate limit)
         .route(
             "/v1/teams/:team_id/pending-invitations",
@@ -428,6 +453,15 @@ async fn main() {
             "/v1/terminal-sessions/:id/invitees",
             post(routes::terminal::invite_to_session),
         )
+        // Registered before .../:user_id so the literal "me" wins the match.
+        .route(
+            "/v1/terminal-sessions/:id/invitees/me",
+            delete(routes::terminal::decline_invite),
+        )
+        .route(
+            "/v1/terminal-sessions/:id/invitees/:user_id",
+            delete(routes::terminal::uninvite),
+        )
         // Audit logs — read + export (VIEW_AUDIT_LOG enforced in handler)
         .route(
             "/v1/teams/:team_id/audit-logs",
@@ -458,6 +492,8 @@ async fn main() {
         )
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
+        .layer(Extension(search_limiter))
+        .layer(Extension(knock_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

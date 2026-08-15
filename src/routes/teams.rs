@@ -256,13 +256,14 @@ pub async fn list_members(
             Option<String>,
             chrono::DateTime<chrono::Utc>,
             String,
+            String,
             Option<String>,
             Option<Uuid>,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.display_name AS invited_by_display_name, tm.joined_at,
-               u.display_name, u.public_key, tmr.role_id
+               u.display_name, u.handle, u.public_key, tmr.role_id
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
@@ -280,7 +281,8 @@ pub async fn list_members(
     })?;
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
-    for (t_id, user_id, invited_by_display_name, joined_at, display_name, public_key, role_id) in rows {
+    for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key, role_id) in rows
+    {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
                 if let Some(rid) = role_id {
@@ -294,6 +296,7 @@ pub async fn list_members(
                         team_id: t_id,
                         user_id,
                         display_name,
+                        handle,
                         public_key: member_public_key_for_response(public_key),
                         invited_by_display_name,
                         joined_at,
@@ -598,56 +601,93 @@ pub struct SearchUsersQuery {
     pub q: String,
 }
 
-#[derive(Serialize)]
+/// The teammate pair test. Four copies exist; if you change the predicate,
+/// change all four:
+///   - This constant, spliced via `format!` into `search_users_inner` (below,
+///     in this file) and into `shares_a_team` (routes::terminal), which share
+///     its `$2`/`u.id` parameter shape.
+///   - The `NOT EXISTS` in `revoke_grants_for_departed_member`
+///     (routes::terminal) — inlined because it binds only `$1` and needs
+///     `tsi.invited_by`/`tsi.user_id`, not `$2`/`u.id`.
+///   - The `connection_name` redaction `CASE` in `visible_sessions`
+///     (routes::terminal) — inlined because that query already uses `$2` for
+///     `PERM_VIEW_TERMINAL_SESSIONS` (an int, not a uuid), so splicing this
+///     constant's hardcoded `$2` in would silently bind the wrong value.
+pub(crate) const TEAMMATE_PAIR_SQL: &str = "EXISTS (SELECT 1 FROM team_members a \
+     JOIN team_members b ON a.team_id = b.team_id \
+     WHERE a.user_id = $2 AND b.user_id = u.id)";
+
+#[derive(Serialize, sqlx::FromRow)]
 pub struct UserSearchResult {
     pub user_id: Uuid,
     pub display_name: String,
-    pub public_key: String,
+    pub handle: String,
+    pub is_teammate: bool,
+}
+
+/// Resolution rules (D2): teammates fuzzy on name and email; anyone with a
+/// *custom* handle fuzzy on that handle; everyone else on a full email address
+/// or an exact handle. Email substring matching is gone — it was an enumeration
+/// oracle, and rate-limiting it would only have slowed the harvest down.
+pub(crate) async fn search_users_inner(
+    pool: &PgPool,
+    me: Uuid,
+    q: &str,
+) -> Result<Vec<UserSearchResult>, StatusCode> {
+    if q.trim().chars().count() < 2 {
+        return Ok(vec![]);
+    }
+    let q = q.trim().to_lowercase();
+    let fuzzy = format!("%{q}%");
+    let prefix = format!("{q}%");
+    let exact_email = if q.contains('@') && q.contains('.') { q.clone() } else { String::new() };
+    let exact_handle = crate::handles::normalize_handle(&q);
+
+    let sql = format!(
+        r#"
+        SELECT u.id AS user_id, u.display_name, u.handle, {pair} AS is_teammate
+        FROM users u
+        WHERE u.id <> $2
+          AND u.deleted_at IS NULL
+          AND (
+               ({pair} AND (LOWER(u.display_name) LIKE $1 OR LOWER(u.email) LIKE $1))
+            OR (u.handle_is_custom AND LOWER(u.handle) LIKE $1)
+            OR LOWER(u.email) = $3
+            OR LOWER(u.handle) = $4
+          )
+        ORDER BY is_teammate DESC,
+                 CASE WHEN LOWER(u.display_name) LIKE $5 OR LOWER(u.handle) LIKE $5 THEN 0 ELSE 1 END,
+                 u.display_name
+        LIMIT 8
+        "#,
+        pair = TEAMMATE_PAIR_SQL,
+    );
+
+    sqlx::query_as::<_, UserSearchResult>(&sql)
+        .bind(&fuzzy)
+        .bind(me)
+        .bind(&exact_email)
+        .bind(&exact_handle)
+        .bind(&prefix)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to search users");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 pub async fn search_users(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(limiter): axum::Extension<crate::rate_limit::SearchRateLimiter>,
     Query(params): Query<SearchUsersQuery>,
 ) -> Result<Json<Vec<UserSearchResult>>, StatusCode> {
-    if params.q.len() < 2 {
-        return Ok(Json(vec![]));
+    if !limiter.0.check(auth.0).await {
+        warn!(user_id = %auth.0, "User search rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-
-    let pattern = format!("%{}%", params.q.to_lowercase());
-    let prefix = format!("{}%", params.q.to_lowercase());
-    let results = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
-        r#"
-        SELECT id, display_name, public_key
-        FROM users
-        WHERE (LOWER(display_name) LIKE $1 OR LOWER(email) LIKE $1)
-          AND id != $2
-        ORDER BY
-          CASE WHEN LOWER(display_name) LIKE $3 OR LOWER(email) LIKE $3 THEN 0 ELSE 1 END,
-          display_name
-        LIMIT 8
-        "#,
-    )
-    .bind(&pattern)
-    .bind(auth.0)
-    .bind(&prefix)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to search users");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    Ok(Json(
-        results
-            .into_iter()
-            .map(|(user_id, display_name, public_key)| UserSearchResult {
-                user_id,
-                display_name,
-                public_key: member_public_key_for_response(public_key),
-            })
-            .collect(),
-    ))
+    Ok(Json(search_users_inner(&pool, auth.0, &params.q).await?))
 }
 
 // ─── Update public key ────────────────────────────────────────────────────────
@@ -1473,6 +1513,7 @@ mod authz_tests {
             pool,
             &SyncNotifier::new(),
             &manager,
+            &crate::test_support::default_knock_limiter(),
             session_id,
             host,
             invitee,
@@ -1557,6 +1598,52 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn list_members_returns_each_members_own_handle() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        add_team_member(&pool, team, caller).await;
+        add_team_member(&pool, team, other).await;
+
+        let caller_handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(caller)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let other_handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(caller_handle, other_handle);
+
+        let presence: PresenceMap = std::sync::Arc::new(dashmap::DashMap::new());
+        let members = list_members(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(presence),
+            Path(team),
+        )
+        .await
+        .expect("list members")
+        .0;
+
+        let handle_of = |id: Uuid| {
+            members
+                .iter()
+                .find(|m| m.member.user_id == id)
+                .expect("member present")
+                .member
+                .handle
+                .clone()
+        };
+        assert_eq!(handle_of(caller), caller_handle);
+        assert_eq!(handle_of(other), other_handle);
     }
 
     #[tokio::test]
@@ -2125,5 +2212,90 @@ mod authz_tests {
             Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
             Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
         }
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::test_support::unique_handle;
+    use uuid::Uuid;
+
+    async fn mk_user(pool: &PgPool, email: &str, name: &str, handle: &str, custom: bool) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO users (email, display_name, account_id, auth_hash, handle, handle_is_custom, public_key)
+             VALUES ($1, $2, gen_random_uuid(), 'h', $3, $4, 'pk') RETURNING id",
+        )
+        .bind(email).bind(name).bind(handle).bind(custom)
+        .fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stranger_is_not_found_by_an_email_substring() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let email = format!("kevin.parker.{}@corp.test", &Uuid::new_v4().simple().to_string()[..6]);
+        let them = mk_user(&pool, &email, "Kevin Parker", &unique_handle("quiet-otter"), false).await;
+
+        let hits = search_users_inner(&pool, me, "kevin").await.unwrap();
+        assert!(!hits.iter().any(|r| r.user_id == them), "email substring must not resolve a stranger");
+
+        let hits = search_users_inner(&pool, me, &email).await.unwrap();
+        assert!(hits.iter().any(|r| r.user_id == them), "a full email address must resolve");
+    }
+
+    #[tokio::test]
+    async fn a_generated_handle_matches_only_exactly() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let handle = unique_handle("swift-otter");
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Gen", &handle, false).await;
+
+        assert!(!search_users_inner(&pool, me, "swift-otter").await.unwrap().iter().any(|r| r.user_id == them));
+        assert!(search_users_inner(&pool, me, &format!("@{handle}")).await.unwrap().iter().any(|r| r.user_id == them));
+    }
+
+    #[tokio::test]
+    async fn a_custom_handle_matches_fuzzily() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let handle = unique_handle("kevin-p");
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Kev", &handle, true).await;
+
+        // Search on the unique suffix rather than the common "kev" prefix: the
+        // test DB is persistent, and LIMIT 8 means a common substring can be
+        // crowded out entirely by unrelated rows accumulated across runs.
+        let hits = search_users_inner(&pool, me, &handle[..handle.len() - 1]).await.unwrap();
+        assert!(hits.iter().any(|r| r.user_id == them));
+        assert!(!hits.iter().any(|r| r.is_teammate));
+    }
+
+    #[tokio::test]
+    async fn a_teammate_still_matches_a_name_substring_and_is_flagged() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let mate = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Zoe Teammate", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let team: Uuid = sqlx::query_scalar("INSERT INTO teams (name, owner_id) VALUES ('t', $1) RETURNING id")
+            .bind(me).fetch_one(&pool).await.unwrap();
+        for u in [me, mate] {
+            sqlx::query("INSERT INTO team_members (team_id, user_id) VALUES ($1, $2)")
+                .bind(team).bind(u).execute(&pool).await.unwrap();
+        }
+
+        let hits = search_users_inner(&pool, me, "zo").await.unwrap();
+        let hit = hits.iter().find(|r| r.user_id == mate).expect("teammate must match a name substring");
+        assert!(hit.is_teammate);
+    }
+
+    #[tokio::test]
+    async fn the_response_carries_no_public_key() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let handle = unique_handle("kevin-pk");
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Kev", &handle, true).await;
+        let hits = search_users_inner(&pool, me, &handle).await.unwrap();
+        let json = serde_json::to_string(&hits).unwrap();
+        assert!(!json.contains("public_key"), "search must never carry key material: {json}");
+        assert!(hits.iter().any(|r| r.user_id == them));
     }
 }

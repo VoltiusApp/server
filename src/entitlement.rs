@@ -8,6 +8,7 @@
 //! with an active paid subscription are always left untouched.
 
 use chrono::{DateTime, Utc};
+use sqlx::PgPool;
 
 /// Returns the effective tier: `"free"` if this is an expired trial, otherwise
 /// the stored tier unchanged. Borrows `stored_tier` for the non-expired case.
@@ -26,6 +27,33 @@ pub fn effective_tier(
         }
     }
     stored_tier
+}
+
+/// [`effective_tier`] for one account, read from the database. Every tier gate
+/// outside `/v1/auth/me` must go through this rather than comparing
+/// `users.subscription_tier`: an expired trial still stores `'pro'` there, so a
+/// direct comparison hands a lapsed account a paid feature.
+///
+/// Falls back to `"free"` if the row can't be read — a gate that fails open is
+/// the bug this function exists to prevent.
+pub async fn effective_tier_for_user(pool: &PgPool, user_id: uuid::Uuid) -> String {
+    match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, Option<String>)>(
+        "SELECT subscription_tier, trial_ends_at, admin_override, ls_subscription_id FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok((tier, trial_ends_at, admin_override, ls_subscription_id)) => effective_tier(
+            &tier,
+            trial_ends_at,
+            ls_subscription_id.is_some(),
+            admin_override,
+            Utc::now(),
+        )
+        .to_string(),
+        Err(_) => "free".to_string(),
+    }
 }
 
 #[cfg(test)]

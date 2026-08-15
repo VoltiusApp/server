@@ -66,17 +66,30 @@ macro_rules! test_pool_or_skip {
     };
 }
 
+/// Default-budget knock limiter for tests that don't care about the knock
+/// limit itself — only tests exercising the limit construct their own.
+pub fn default_knock_limiter() -> crate::rate_limit::KnockRateLimiter {
+    crate::rate_limit::KnockRateLimiter(crate::rate_limit::RateLimiter::new(
+        20,
+        std::time::Duration::from_secs(3600),
+    ))
+}
+
 /// Insert a minimal valid user and return its id. Each call uses fresh UUIDs so
 /// tests never collide on the unique `email`/`account_id` columns.
 pub async fn seed_user(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
+    let handle = crate::handles::generate_unique_handle(pool)
+        .await
+        .expect("generate handle");
     sqlx::query(
-        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name)
-         VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User')",
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, handle)
+         VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User', $4)",
     )
     .bind(id)
     .bind(format!("{id}@test.local"))
     .bind(Uuid::new_v4())
+    .bind(&handle)
     .execute(pool)
     .await
     .expect("seed user");
@@ -89,14 +102,18 @@ pub async fn seed_user(pool: &PgPool) -> Uuid {
 pub async fn seed_user_with_credentials(pool: &PgPool, account_id: Uuid, auth_key: &str) -> Uuid {
     let id = Uuid::new_v4();
     let hash = crate::auth::password::hash_auth_key(auth_key).expect("hash auth key");
+    let handle = crate::handles::generate_unique_handle(pool)
+        .await
+        .expect("generate handle");
     sqlx::query(
-        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name)
-         VALUES ($1, $2, $3, $4, 'test-pubkey', 'Test User')",
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, handle)
+         VALUES ($1, $2, $3, $4, 'test-pubkey', 'Test User', $5)",
     )
     .bind(id)
     .bind(format!("{id}@test.local"))
     .bind(account_id)
     .bind(&hash)
+    .bind(&handle)
     .execute(pool)
     .await
     .expect("seed user with credentials");
@@ -202,6 +219,15 @@ pub async fn set_user_trial(pool: &PgPool, user: Uuid, days: i64) {
         .execute(pool)
         .await
         .expect("set user trial");
+}
+
+/// Handles are unique and never recycled (that's the feature), so two test
+/// functions cannot both claim a literal base like "kevin-p" against the same
+/// real, persistent test database — whichever runs first wins it permanently
+/// and every other test collides. Each call mints a fresh suffix, the same way
+/// `seed_user` avoids colliding on `email`.
+pub fn unique_handle(base: &str) -> String {
+    format!("{base}-{}", &Uuid::new_v4().simple().to_string()[..6])
 }
 
 /// The deterministic email `seed_user` assigns, so invitation tests can target a
