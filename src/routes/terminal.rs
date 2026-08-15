@@ -1025,9 +1025,13 @@ async fn fan_out_session_ended(
     // rows `session_end_recipients` reads invitees from, so deleting first
     // would fan the "session ended" push out to nobody.
     //
-    // Both tables hold per-invitee grant state whose `ON DELETE CASCADE` a soft
-    // end (`ended_at = now()`) never fires, so both must be cleared explicitly.
-    for table in ["terminal_session_invitees", "terminal_session_keys"] {
+    // Every one of these holds per-invitee grant state whose `ON DELETE CASCADE`
+    // a soft end (`ended_at = now()`) never fires, so each must be cleared
+    // explicitly. The side tables come from `GRANT_SIDE_TABLES` rather than a
+    // second hardcoded list — that is the whole point of the constant, and a
+    // stale `suppressed_invites` row is exactly the social-graph record D9
+    // refused to create.
+    for table in std::iter::once(&"terminal_session_invitees").chain(GRANT_SIDE_TABLES) {
         if let Err(e) = sqlx::query(&format!("DELETE FROM {table} WHERE session_id = $1"))
             .bind(session_id)
             .execute(pool)
@@ -2846,5 +2850,36 @@ mod tests {
         );
         assert_eq!(sanitize_display_name(Some(String::new())).unwrap(), None);
         assert_eq!(sanitize_display_name(None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_clears_the_suppressed_rows_too() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "w").await.unwrap(),
+            GrantOutcome::Suppressed,
+        );
+
+        // A soft end never fires ON DELETE CASCADE, so a row saying "this
+        // recipient blocked or opted out of this sender" would otherwise outlive
+        // the session forever — the social-graph record D9 refused to create.
+        sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        fan_out_session_ended(&pool, &notifier, session_id, host).await;
+
+        let suppressed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM suppressed_invites WHERE session_id = $1")
+            .bind(session_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(suppressed, 0);
     }
 }
