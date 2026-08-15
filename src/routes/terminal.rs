@@ -611,8 +611,14 @@ async fn visible_sessions(
             ts.id,
             -- An unaccepted stranger invitee must not learn what they were
             -- invited to; the host and any teammate always see the name.
+            -- The teammate arm deliberately comes before the invite-status
+            -- check below, so a teammate sees the name even while their own
+            -- individual invite row is still unaccepted.
             CASE
               WHEN ts.host_user_id = $1 THEN ts.connection_name
+              -- Teammate pair test, inlined: TEAMMATE_PAIR_SQL (teams.rs) hardcodes
+              -- `$2`/`u.id`, which collide with this query's own `$2` (a permission
+              -- bitmask) and lack of a `u`-aliased row — see that constant's doc.
               WHEN EXISTS (SELECT 1 FROM team_members a JOIN team_members b ON a.team_id = b.team_id
                             WHERE a.user_id = $1 AND b.user_id = ts.host_user_id) THEN ts.connection_name
               WHEN EXISTS (SELECT 1 FROM terminal_session_invitees tsi2

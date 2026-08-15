@@ -598,9 +598,18 @@ pub struct SearchUsersQuery {
     pub q: String,
 }
 
-/// The teammate pair test. `shares_a_team` in routes::terminal and the
-/// `NOT EXISTS` in revoke_grants_for_departed_member are the same predicate on
-/// different sides; if you change one, change all three.
+/// The teammate pair test. Four copies exist; if you change the predicate,
+/// change all four:
+///   - This constant, spliced via `format!` into `search_users_inner` (below,
+///     in this file) and into `shares_a_team` (routes::terminal), which share
+///     its `$2`/`u.id` parameter shape.
+///   - The `NOT EXISTS` in `revoke_grants_for_departed_member`
+///     (routes::terminal) — inlined because it binds only `$1` and needs
+///     `tsi.invited_by`/`tsi.user_id`, not `$2`/`u.id`.
+///   - The `connection_name` redaction `CASE` in `visible_sessions`
+///     (routes::terminal) — inlined because that query already uses `$2` for
+///     `PERM_VIEW_TERMINAL_SESSIONS` (an int, not a uuid), so splicing this
+///     constant's hardcoded `$2` in would silently bind the wrong value.
 pub(crate) const TEAMMATE_PAIR_SQL: &str = "EXISTS (SELECT 1 FROM team_members a \
      JOIN team_members b ON a.team_id = b.team_id \
      WHERE a.user_id = $2 AND b.user_id = u.id)";
