@@ -1175,31 +1175,27 @@ pub async fn uninvite(
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: String,
+    /// Accepted and discarded. Pre-0.26 clients still append
+    /// `&display_name=<email>`; a struct without the field would make serde
+    /// reject their upgrade. Never read this. Delete it in 0.27.
+    #[allow(dead_code)]
     pub display_name: Option<String>,
     /// Required when joining invite_link sessions
     pub invite_token: Option<String>,
 }
 
-/// Longest display name the relay will carry. Long enough for any real name or
-/// email, short enough that it cannot be used as a payload.
-const MAX_DISPLAY_NAME_CHARS: usize = 64;
-
-/// Sanitizes the caller-supplied `display_name` before it reaches participant
-/// lists. `None` (empty or absent) means "fall back to the user id"; `Err` means
-/// the value is malformed and the upgrade is refused.
-///
-/// Control characters are rejected rather than stripped: no legitimate client
-/// sends them, and a name is rendered in enough places that silently reshaping
-/// one is worse than telling the caller it was wrong. Length is truncated
-/// instead, since a merely long name is plausible input.
-fn sanitize_display_name(raw: Option<String>) -> Result<Option<String>, ()> {
-    let Some(name) = raw.filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    if name.chars().any(|c| c.is_control()) {
-        return Err(());
-    }
-    Ok(Some(name.chars().take(MAX_DISPLAY_NAME_CHARS).collect()))
+/// Resolves the name shown on participant lists. Reads `users.handle` by the
+/// authenticated user id, so the value cannot be influenced by the caller.
+/// Falls back to the user id — matching the previous behaviour for a caller
+/// that sent nothing — rather than refusing an upgrade over a missing row.
+pub(crate) async fn resolve_participant_handle(pool: &PgPool, user_id: Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| user_id.to_string())
 }
 
 pub async fn ws_handler(
@@ -1218,20 +1214,14 @@ pub async fn ws_handler(
         }
     };
 
-    let display_name = match sanitize_display_name(query.display_name) {
-        Ok(name) => name.unwrap_or_else(|| user_id.to_string()),
-        Err(()) => {
-            warn!(session_id = %session_id, "WS upgrade rejected: malformed display_name");
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
+    let handle = resolve_participant_handle(&pool, user_id).await;
 
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
             session_id,
             user_id,
-            display_name,
+            handle,
             query.invite_token,
             pool,
             manager,
@@ -1325,7 +1315,7 @@ async fn handle_socket(
     socket: WebSocket,
     session_id: Uuid,
     user_id: Uuid,
-    display_name: String,
+    handle: String,
     invite_token: Option<String>,
     pool: PgPool,
     manager: TerminalManager,
@@ -1417,13 +1407,7 @@ async fn handle_socket(
             None => return,
         };
 
-        state.participants.insert(
-            user_id,
-            Participant {
-                user_id,
-                display_name: display_name.clone(),
-            },
-        );
+        state.participants.insert(user_id, Participant::new(user_id, handle.clone()));
 
         let participant_list: Vec<&Participant> = state.participants.values().collect();
         let list_json = serde_json::json!({
@@ -1468,7 +1452,9 @@ async fn handle_socket(
     let joined_msg = serde_json::json!({
         "type": "participant_joined",
         "user_id": user_id,
-        "display_name": display_name,
+        "handle": handle,
+        // ALIAS for pre-0.26 clients. Delete in 0.27.
+        "display_name": handle,
     })
     .to_string();
     let _ = tx.send(joined_msg);
@@ -2877,29 +2863,6 @@ mod tests {
         assert!(for_host.iter().find(|r| r.id == session_id).unwrap().invited_by_handle.is_none());
     }
 
-    #[test]
-    fn an_over_long_display_name_is_truncated() {
-        let name = "k".repeat(500);
-        let out = sanitize_display_name(Some(name)).unwrap().unwrap();
-        assert_eq!(out.chars().count(), MAX_DISPLAY_NAME_CHARS);
-    }
-
-    #[test]
-    fn a_display_name_with_control_characters_is_refused() {
-        assert!(sanitize_display_name(Some("Voltius\u{0}Support".to_string())).is_err());
-        assert!(sanitize_display_name(Some("line\nbreak".to_string())).is_err());
-    }
-
-    #[test]
-    fn an_ordinary_display_name_passes_through_unchanged() {
-        assert_eq!(
-            sanitize_display_name(Some("Kévin P.".to_string())).unwrap().as_deref(),
-            Some("Kévin P."),
-        );
-        assert_eq!(sanitize_display_name(Some(String::new())).unwrap(), None);
-        assert_eq!(sanitize_display_name(None).unwrap(), None);
-    }
-
     #[tokio::test]
     async fn ending_a_session_clears_the_suppressed_rows_too() {
         let pool = test_pool_or_skip!();
@@ -2942,7 +2905,7 @@ mod tests {
         manager.insert_test_session(session_id, host).await;
         manager.sessions.lock().await.get_mut(&session_id).unwrap().participants.insert(
             host,
-            Participant { user_id: host, display_name: "Real Hostname Owner".to_string() },
+            Participant::new(host, "real-hostname-owner".to_string()),
         );
 
         let Json(sessions) = list_active_sessions(
@@ -2966,5 +2929,39 @@ mod tests {
                 .unwrap();
         let row = sessions.iter().find(|s| s.id == session_id).unwrap();
         assert_eq!(row.participant_count, 1);
+    }
+
+    #[tokio::test]
+    async fn the_participant_handle_comes_from_the_database_not_the_caller() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+
+        sqlx::query("UPDATE users SET handle = $1 WHERE id = $2")
+            .bind("merry-quartz-2597")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The caller cannot influence this value: there is no argument for them to set.
+        let resolved = resolve_participant_handle(&pool, user).await;
+        assert_eq!(resolved, "merry-quartz-2597");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_user_resolves_to_its_id_rather_than_failing_the_upgrade() {
+        let pool = test_pool_or_skip!();
+        let ghost = Uuid::new_v4();
+        assert_eq!(resolve_participant_handle(&pool, ghost).await, ghost.to_string());
+    }
+
+    #[test]
+    fn a_participant_carries_its_handle_in_both_json_keys() {
+        let id = Uuid::new_v4();
+        let p = Participant::new(id, "merry-quartz-2597".to_string());
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["handle"], "merry-quartz-2597");
+        // The alias pre-0.26 clients read. Deleted in 0.27.
+        assert_eq!(json["display_name"], "merry-quartz-2597");
     }
 }

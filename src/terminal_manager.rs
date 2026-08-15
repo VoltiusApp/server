@@ -1,16 +1,30 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub const BROADCAST_CAPACITY: usize = 512;
 /// Maximum number of encrypted output messages kept per session for late-join replay.
 pub const OUTPUT_HISTORY_MAX: usize = 500;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A live participant in a shared session. The name is resolved server-side
+/// from `users.handle` — it is never supplied by the client, which is what
+/// stops a participant naming themselves "Voltius Support" and what stops the
+/// list carrying anyone's email address.
+#[derive(Debug, Clone, Serialize)]
 pub struct Participant {
     pub user_id: Uuid,
+    pub handle: String,
+    /// ALIAS for pre-0.26 clients. Value is the handle; there is no stored
+    /// `display_name`. Delete this field in 0.27, and never repopulate it
+    /// from anything.
     pub display_name: String,
+}
+
+impl Participant {
+    pub fn new(user_id: Uuid, handle: String) -> Self {
+        Self { user_id, display_name: handle.clone(), handle }
+    }
 }
 
 pub struct SessionState {
