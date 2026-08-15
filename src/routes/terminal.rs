@@ -1397,15 +1397,10 @@ mod authz_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, member_with_role, seed_team, seed_user};
+    use crate::test_support::{add_member, default_knock_limiter as knocks, member_with_role, seed_team, seed_user};
     use axum::extract::State;
     use axum::{Extension, Json};
     use std::time::Duration;
-
-    /// Default-budget limiter for tests that don't care about the knock limit.
-    fn knocks() -> crate::rate_limit::KnockRateLimiter {
-        crate::rate_limit::KnockRateLimiter(RateLimiter::new(20, Duration::from_secs(3600)))
-    }
 
     fn claims_for(user: uuid::Uuid) -> AuthClaims {
         AuthClaims(Claims {
@@ -1664,7 +1659,7 @@ mod tests {
     use super::*;
     use crate::rate_limit::RateLimiter;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, seed_team, seed_user};
+    use crate::test_support::{add_member, default_knock_limiter as knocks, seed_team, seed_user};
     use std::time::Duration;
 
     async fn seed_session(pool: &PgPool, host: Uuid, visibility: &str) -> Uuid {
@@ -1684,11 +1679,6 @@ mod tests {
             crate::sync_notifier::SyncNotifier::new(),
             TerminalManager::new(),
         )
-    }
-
-    /// Default-budget limiter for tests that don't care about the knock limit.
-    fn knocks() -> crate::rate_limit::KnockRateLimiter {
-        crate::rate_limit::KnockRateLimiter(RateLimiter::new(20, Duration::from_secs(3600)))
     }
 
     async fn mk_stranger(pool: &PgPool) -> Uuid {

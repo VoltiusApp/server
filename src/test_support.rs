@@ -66,6 +66,15 @@ macro_rules! test_pool_or_skip {
     };
 }
 
+/// Default-budget knock limiter for tests that don't care about the knock
+/// limit itself — only tests exercising the limit construct their own.
+pub fn default_knock_limiter() -> crate::rate_limit::KnockRateLimiter {
+    crate::rate_limit::KnockRateLimiter(crate::rate_limit::RateLimiter::new(
+        20,
+        std::time::Duration::from_secs(3600),
+    ))
+}
+
 /// Insert a minimal valid user and return its id. Each call uses fresh UUIDs so
 /// tests never collide on the unique `email`/`account_id` columns.
 pub async fn seed_user(pool: &PgPool) -> Uuid {
