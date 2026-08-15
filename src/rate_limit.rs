@@ -94,6 +94,11 @@ pub struct SyncRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct WaitlistRateLimiter(pub RateLimiter<IpAddr>);
 
+/// Directory search, keyed by user id rather than IP: the endpoint is
+/// authenticated, and an IP key would throttle a whole office at once.
+#[derive(Clone)]
+pub struct SearchRateLimiter(pub RateLimiter<Uuid>);
+
 /// Register endpoint: N registrations/day per IP.
 pub async fn register_rate_limit(
     axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,

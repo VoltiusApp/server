@@ -110,22 +110,23 @@ pub struct SessionKeyResponse {
     pub host_public_key: String,
 }
 
-/// True when the two users are members of at least one team in common.
+/// True when the two users are members of at least one team in common. Shares
+/// `TEAMMATE_PAIR_SQL` with `search_users_inner`: `u.id` there is bound here via
+/// a one-row derived table so the same predicate text serves both call shapes.
 pub(crate) async fn shares_a_team(pool: &PgPool, a: Uuid, b: Uuid) -> Result<bool, StatusCode> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(\
-           SELECT 1 FROM team_members ma \
-           JOIN team_members mb ON mb.team_id = ma.team_id \
-           WHERE ma.user_id = $1 AND mb.user_id = $2)",
-    )
-    .bind(a)
-    .bind(b)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to check shared team membership");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    let sql = format!(
+        "SELECT {pair} FROM (SELECT $1::uuid AS id) u",
+        pair = crate::routes::teams::TEAMMATE_PAIR_SQL,
+    );
+    sqlx::query_scalar::<_, bool>(&sql)
+        .bind(b)
+        .bind(a)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to check shared team membership");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// Grants one named user access to a session: the durable row, the wrapped key,
