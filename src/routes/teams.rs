@@ -625,7 +625,7 @@ pub struct UserSearchResult {
     pub is_teammate: bool,
 }
 
-/// Resolution rules (D2): teammates fuzzy on name and email; anyone with a
+/// Resolution rules (D2): teammates fuzzy on email; anyone with a
 /// *custom* handle fuzzy on that handle; everyone else on a full email address
 /// or an exact handle. Email substring matching is gone — it was an enumeration
 /// oracle, and rate-limiting it would only have slowed the harvest down.
@@ -645,19 +645,19 @@ pub(crate) async fn search_users_inner(
 
     let sql = format!(
         r#"
-        SELECT u.id AS user_id, u.display_name, u.handle, {pair} AS is_teammate
+        SELECT u.id AS user_id, u.handle AS display_name, u.handle, {pair} AS is_teammate
         FROM users u
         WHERE u.id <> $2
           AND u.deleted_at IS NULL
           AND (
-               ({pair} AND (LOWER(u.display_name) LIKE $1 OR LOWER(u.email) LIKE $1))
+               ({pair} AND LOWER(u.email) LIKE $1)
             OR (u.handle_is_custom AND LOWER(u.handle) LIKE $1)
             OR LOWER(u.email) = $3
             OR LOWER(u.handle) = $4
           )
         ORDER BY is_teammate DESC,
-                 CASE WHEN LOWER(u.display_name) LIKE $5 OR LOWER(u.handle) LIKE $5 THEN 0 ELSE 1 END,
-                 u.display_name
+                 CASE WHEN LOWER(u.handle) LIKE $5 THEN 0 ELSE 1 END,
+                 u.handle
         LIMIT 8
         "#,
         pair = TEAMMATE_PAIR_SQL,
@@ -2331,10 +2331,11 @@ mod search_tests {
     }
 
     #[tokio::test]
-    async fn a_teammate_still_matches_a_name_substring_and_is_flagged() {
+    async fn a_teammate_still_matches_an_email_substring_and_is_flagged() {
         let pool = crate::test_pool_or_skip!();
         let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
-        let mate = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Zoe Teammate", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let email = format!("zoe.teammate.{}@a.test", &Uuid::new_v4().simple().to_string()[..6]);
+        let mate = mk_user(&pool, &email, "Zoe Teammate", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let team: Uuid = sqlx::query_scalar("INSERT INTO teams (name, owner_id) VALUES ('t', $1) RETURNING id")
             .bind(me).fetch_one(&pool).await.unwrap();
         for u in [me, mate] {
@@ -2342,9 +2343,45 @@ mod search_tests {
                 .bind(team).bind(u).execute(&pool).await.unwrap();
         }
 
-        let hits = search_users_inner(&pool, me, "zo").await.unwrap();
-        let hit = hits.iter().find(|r| r.user_id == mate).expect("teammate must match a name substring");
+        let hits = search_users_inner(&pool, me, "zoe.teammate").await.unwrap();
+        let hit = hits.iter().find(|r| r.user_id == mate).expect("teammate must match an email substring");
         assert!(hit.is_teammate);
+    }
+
+    #[tokio::test]
+    async fn a_teammate_is_no_longer_found_by_a_display_name_substring() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let mate = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Ada Lovelace", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let team: Uuid = sqlx::query_scalar("INSERT INTO teams (name, owner_id) VALUES ('t', $1) RETURNING id")
+            .bind(me).fetch_one(&pool).await.unwrap();
+        for u in [me, mate] {
+            sqlx::query("INSERT INTO team_members (team_id, user_id) VALUES ($1, $2)")
+                .bind(team).bind(u).execute(&pool).await.unwrap();
+        }
+
+        let handle = unique_handle("merry-quartz");
+        let email = format!("ada.lovelace.{}@example.com", &Uuid::new_v4().simple().to_string()[..6]);
+        sqlx::query("UPDATE users SET handle = $1, email = $2 WHERE id = $3")
+            .bind(&handle)
+            .bind(&email)
+            .bind(mate)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // "lovelace" is in the email, so the teammate email fuzzy still finds them.
+        let by_email = search_users_inner(&pool, me, "lovelace").await.unwrap();
+        assert!(by_email.iter().any(|r| r.user_id == mate));
+
+        // A prefix of the handle is in the handle, but a generated handle is exact-match only.
+        let by_handle_substring = search_users_inner(&pool, me, &handle[..handle.len() - 1]).await.unwrap();
+        assert!(!by_handle_substring.iter().any(|r| r.user_id == mate));
+
+        // The result still carries the handle under both keys.
+        let hit = by_email.iter().find(|r| r.user_id == mate).unwrap();
+        assert_eq!(hit.handle, handle);
+        assert_eq!(hit.display_name, handle);
     }
 
     #[tokio::test]
