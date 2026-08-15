@@ -34,18 +34,22 @@ pub(crate) async fn claim_handle_inner(
         | HandleError::TooLong => StatusCode::UNPROCESSABLE_ENTITY,
     })?;
 
-    let (tier, current, is_custom, updated_at): (String, String, bool, Option<DateTime<Utc>>) =
-        sqlx::query_as(
-            "SELECT subscription_tier, handle, handle_is_custom, handle_updated_at FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to read user before handle claim");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let (current, is_custom, updated_at): (String, bool, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT handle, handle_is_custom, handle_updated_at FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to read user before handle claim");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
+    // The effective tier, not the stored one: an expired trial still reads
+    // `subscription_tier = 'pro'`, and a claim is permanent — `handle_is_custom`
+    // never reverts — so a stored-tier gate would hand a lapsed account a paid
+    // feature that can never be walked back.
+    let tier = crate::entitlement::effective_tier_for_user(pool, user_id).await;
     if !matches!(tier.as_str(), "pro" | "teams" | "business") {
         return Err(StatusCode::PAYMENT_REQUIRED);
     }
@@ -205,6 +209,25 @@ mod tests {
     async fn free_tier_cannot_claim_a_custom_handle() {
         let pool = crate::test_pool_or_skip!();
         let id = user(&pool, "free").await;
+        let err = claim_handle_inner(&pool, id, &unique_handle("kevin-p"))
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn an_expired_trial_cannot_claim_a_custom_handle() {
+        let pool = crate::test_pool_or_skip!();
+        let id = user(&pool, "pro").await;
+        // A lapsed trial keeps `subscription_tier = 'pro'`; only the effective
+        // tier knows it is really free. A claim is permanent, so gating on the
+        // stored tier would hand out a paid feature that never reverts.
+        sqlx::query("UPDATE users SET trial_ends_at = now() - interval '1 day' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let err = claim_handle_inner(&pool, id, &unique_handle("kevin-p"))
             .await
             .unwrap_err();
