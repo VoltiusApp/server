@@ -150,6 +150,7 @@ pub async fn update_preferences(
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct UserKeyResponse {
     pub user_id: Uuid,
+    /// ALIAS for pre-0.26 clients. Value is the handle. Delete in 0.27.
     pub display_name: String,
     pub handle: String,
     pub public_key: String,
@@ -164,7 +165,7 @@ pub(crate) async fn user_public_key_inner(
     user_id: Uuid,
 ) -> Result<UserKeyResponse, StatusCode> {
     sqlx::query_as::<_, UserKeyResponse>(
-        "SELECT id AS user_id, display_name, handle, public_key
+        "SELECT id AS user_id, handle AS display_name, handle, public_key
            FROM users WHERE id = $1 AND deleted_at IS NULL AND public_key IS NOT NULL",
     )
     .bind(user_id)
@@ -199,8 +200,8 @@ mod tests {
             .await
             .expect("generate handle");
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO users (email, display_name, account_id, auth_hash, subscription_tier, handle)
-             VALUES ($1, 'x', gen_random_uuid(), 'h', $2, $3) RETURNING id",
+            "INSERT INTO users (email, account_id, auth_hash, subscription_tier, handle)
+             VALUES ($1, gen_random_uuid(), 'h', $2, $3) RETURNING id",
         )
         .bind(format!("{}@example.test", Uuid::new_v4()))
         .bind(tier)

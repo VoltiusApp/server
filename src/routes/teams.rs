@@ -2281,21 +2281,21 @@ mod search_tests {
     use crate::test_support::unique_handle;
     use uuid::Uuid;
 
-    async fn mk_user(pool: &PgPool, email: &str, name: &str, handle: &str, custom: bool) -> Uuid {
+    async fn mk_user(pool: &PgPool, email: &str, handle: &str, custom: bool) -> Uuid {
         sqlx::query_scalar(
-            "INSERT INTO users (email, display_name, account_id, auth_hash, handle, handle_is_custom, public_key)
-             VALUES ($1, $2, gen_random_uuid(), 'h', $3, $4, 'pk') RETURNING id",
+            "INSERT INTO users (email, account_id, auth_hash, handle, handle_is_custom, public_key)
+             VALUES ($1, gen_random_uuid(), 'h', $2, $3, 'pk') RETURNING id",
         )
-        .bind(email).bind(name).bind(handle).bind(custom)
+        .bind(email).bind(handle).bind(custom)
         .fetch_one(pool).await.unwrap()
     }
 
     #[tokio::test]
     async fn a_stranger_is_not_found_by_an_email_substring() {
         let pool = crate::test_pool_or_skip!();
-        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let email = format!("kevin.parker.{}@corp.test", &Uuid::new_v4().simple().to_string()[..6]);
-        let them = mk_user(&pool, &email, "Kevin Parker", &unique_handle("quiet-otter"), false).await;
+        let them = mk_user(&pool, &email, &unique_handle("quiet-otter"), false).await;
 
         let hits = search_users_inner(&pool, me, "kevin").await.unwrap();
         assert!(!hits.iter().any(|r| r.user_id == them), "email substring must not resolve a stranger");
@@ -2307,9 +2307,9 @@ mod search_tests {
     #[tokio::test]
     async fn a_generated_handle_matches_only_exactly() {
         let pool = crate::test_pool_or_skip!();
-        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let handle = unique_handle("swift-otter");
-        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Gen", &handle, false).await;
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &handle, false).await;
 
         assert!(!search_users_inner(&pool, me, "swift-otter").await.unwrap().iter().any(|r| r.user_id == them));
         assert!(search_users_inner(&pool, me, &format!("@{handle}")).await.unwrap().iter().any(|r| r.user_id == them));
@@ -2318,9 +2318,9 @@ mod search_tests {
     #[tokio::test]
     async fn a_custom_handle_matches_fuzzily() {
         let pool = crate::test_pool_or_skip!();
-        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let handle = unique_handle("kevin-p");
-        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Kev", &handle, true).await;
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &handle, true).await;
 
         // Search on the unique suffix rather than the common "kev" prefix: the
         // test DB is persistent, and LIMIT 8 means a common substring can be
@@ -2333,9 +2333,9 @@ mod search_tests {
     #[tokio::test]
     async fn a_teammate_still_matches_an_email_substring_and_is_flagged() {
         let pool = crate::test_pool_or_skip!();
-        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let email = format!("zoe.teammate.{}@a.test", &Uuid::new_v4().simple().to_string()[..6]);
-        let mate = mk_user(&pool, &email, "Zoe Teammate", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let mate = mk_user(&pool, &email, &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let team: Uuid = sqlx::query_scalar("INSERT INTO teams (name, owner_id) VALUES ('t', $1) RETURNING id")
             .bind(me).fetch_one(&pool).await.unwrap();
         for u in [me, mate] {
@@ -2351,8 +2351,8 @@ mod search_tests {
     #[tokio::test]
     async fn a_teammate_is_no_longer_found_by_a_display_name_substring() {
         let pool = crate::test_pool_or_skip!();
-        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
-        let mate = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Ada Lovelace", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let mate = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let team: Uuid = sqlx::query_scalar("INSERT INTO teams (name, owner_id) VALUES ('t', $1) RETURNING id")
             .bind(me).fetch_one(&pool).await.unwrap();
         for u in [me, mate] {
@@ -2387,9 +2387,9 @@ mod search_tests {
     #[tokio::test]
     async fn the_response_carries_no_public_key() {
         let pool = crate::test_pool_or_skip!();
-        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Me", &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
         let handle = unique_handle("kevin-pk");
-        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), "Kev", &handle, true).await;
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &handle, true).await;
         let hits = search_users_inner(&pool, me, &handle).await.unwrap();
         let json = serde_json::to_string(&hits).unwrap();
         assert!(!json.contains("public_key"), "search must never carry key material: {json}");

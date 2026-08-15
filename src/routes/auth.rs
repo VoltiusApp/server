@@ -184,8 +184,8 @@ pub async fn register(
         })?;
 
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
-         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(&email)
     .bind(body.account_id)
