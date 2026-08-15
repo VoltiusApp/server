@@ -256,13 +256,14 @@ pub async fn list_members(
             Option<String>,
             chrono::DateTime<chrono::Utc>,
             String,
+            String,
             Option<String>,
             Option<Uuid>,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.display_name AS invited_by_display_name, tm.joined_at,
-               u.display_name, u.public_key, tmr.role_id
+               u.display_name, u.handle, u.public_key, tmr.role_id
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
@@ -280,7 +281,8 @@ pub async fn list_members(
     })?;
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
-    for (t_id, user_id, invited_by_display_name, joined_at, display_name, public_key, role_id) in rows {
+    for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key, role_id) in rows
+    {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
                 if let Some(rid) = role_id {
@@ -294,6 +296,7 @@ pub async fn list_members(
                         team_id: t_id,
                         user_id,
                         display_name,
+                        handle,
                         public_key: member_public_key_for_response(public_key),
                         invited_by_display_name,
                         joined_at,
@@ -1595,6 +1598,52 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn list_members_returns_each_members_own_handle() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        add_team_member(&pool, team, caller).await;
+        add_team_member(&pool, team, other).await;
+
+        let caller_handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(caller)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let other_handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(caller_handle, other_handle);
+
+        let presence: PresenceMap = std::sync::Arc::new(dashmap::DashMap::new());
+        let members = list_members(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(presence),
+            Path(team),
+        )
+        .await
+        .expect("list members")
+        .0;
+
+        let handle_of = |id: Uuid| {
+            members
+                .iter()
+                .find(|m| m.member.user_id == id)
+                .expect("member present")
+                .member
+                .handle
+                .clone()
+        };
+        assert_eq!(handle_of(caller), caller_handle);
+        assert_eq!(handle_of(other), other_handle);
     }
 
     #[tokio::test]
