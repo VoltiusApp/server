@@ -453,6 +453,15 @@ async fn main() {
             "/v1/terminal-sessions/:id/invitees",
             post(routes::terminal::invite_to_session),
         )
+        // Registered before .../:user_id so the literal "me" wins the match.
+        .route(
+            "/v1/terminal-sessions/:id/invitees/me",
+            delete(routes::terminal::decline_invite),
+        )
+        .route(
+            "/v1/terminal-sessions/:id/invitees/:user_id",
+            delete(routes::terminal::uninvite),
+        )
         // Audit logs — read + export (VIEW_AUDIT_LOG enforced in handler)
         .route(
             "/v1/teams/:team_id/audit-logs",

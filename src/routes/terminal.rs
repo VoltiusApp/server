@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -275,6 +275,11 @@ pub(crate) async fn grant_invitee(
 /// Scope: this closes admission to *new* connections. The relay protocol has no
 /// eviction message, so a participant already attached to the live socket stays
 /// until they disconnect — deliberate, not an oversight.
+// Kept as its own bulk-statement shape rather than looping `revoke_one_grant`
+// per pair: the filtered `NOT EXISTS` DELETE below computes the whole revoked
+// set in one round trip, and a departed member can hold or have issued many
+// grants — looping would turn one statement into 3N and re-derive the same
+// teammate check per row.
 pub(crate) async fn revoke_grants_for_departed_member(
     pool: &PgPool,
     manager: &TerminalManager,
@@ -315,6 +320,107 @@ pub(crate) async fn revoke_grants_for_departed_member(
         }
     }
     Ok(())
+}
+
+/// The single-pair form of `revoke_grants_for_departed_member`: durable row,
+/// wrapped key, the suppressed-knock row, and the in-memory set the WebSocket
+/// actually reads. All four, always — a DB-only revoke leaves live admission
+/// open, and a stale `suppressed_invites` row occupies a guest seat that
+/// `visible_sessions` reports back to the host as still-invited.
+pub(crate) async fn revoke_one_grant(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2")
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    if let Some(state) = manager.sessions.lock().await.get_mut(&session_id) {
+        state.invitees.remove(&user_id);
+    }
+    Ok(())
+}
+
+pub(crate) async fn decline_invite_inner(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    user_id: Uuid,
+    permanent: bool,
+) -> Result<(), StatusCode> {
+    let inviter: Option<Uuid> = sqlx::query_scalar(
+        "SELECT invited_by FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to read invite before decline");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .flatten();
+
+    revoke_one_grant(pool, manager, session_id, user_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to revoke declined invite");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Declining blocks by default: the abuse shape is one sender knocking
+    // repeatedly at one target, and making the victim hunt for a setting after
+    // each knock is the wrong default.
+    if let Some(inviter) = inviter {
+        let expires = if permanent {
+            None
+        } else {
+            Some(Utc::now() + Duration::days(7))
+        };
+        sqlx::query(
+            "INSERT INTO user_blocks (blocker_id, blocked_id, expires_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (blocker_id, blocked_id) DO UPDATE SET expires_at = EXCLUDED.expires_at, created_at = now()",
+        )
+        .bind(user_id)
+        .bind(inviter)
+        .bind(expires)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to write block on decline");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn uninvite_inner(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    caller: Uuid,
+    target: Uuid,
+) -> Result<(), StatusCode> {
+    require_active_session_host(pool, session_id, caller).await?;
+    revoke_one_grant(pool, manager, session_id, target)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to un-invite");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// Concurrent-session cap for a host billed on their own plan — `invite_link`
@@ -978,6 +1084,39 @@ pub async fn invite_to_session(
         &body.wrapped_key,
     )
     .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct DeclineQuery {
+    /// "permanent" writes a never-expiring block; anything else (including
+    /// absent) blocks for 7 days — decline blocks by default, silently.
+    pub block: Option<String>,
+}
+
+/// The invitee's own path — must be registered before `/invitees/:user_id`
+/// so the literal "me" wins the match instead of failing to parse as a UUID.
+pub async fn decline_invite(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(manager): Extension<TerminalManager>,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<DeclineQuery>,
+) -> Result<StatusCode, StatusCode> {
+    let permanent = query.block.as_deref() == Some("permanent");
+    decline_invite_inner(&pool, &manager, session_id, auth.0, permanent).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The host withdrawing their own invite — not a block, so it must never
+/// touch `user_blocks`.
+pub async fn uninvite(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(manager): Extension<TerminalManager>,
+    Path((session_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    uninvite_inner(&pool, &manager, session_id, auth.0, user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2465,5 +2604,110 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn declining_removes_the_row_the_key_and_live_admission() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped").await.unwrap();
+
+        decline_invite_inner(&pool, &manager, session_id, stranger, false).await.unwrap();
+
+        let invitees = manager.sessions.lock().await.get(&session_id).map(|s| s.invitees.clone()).unwrap_or_default();
+        // Asserted through the admission function, not a row count: a DB-only
+        // revoke left live WebSocket access open — the Critical from #66.
+        assert!(!is_authorized_participant(&pool, stranger, host, "direct", &[], &[], None, None, &invitees).await);
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terminal_session_keys WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
+        assert_eq!(keys, 0);
+    }
+
+    #[tokio::test]
+    async fn declining_blocks_the_sender_for_seven_days_and_the_next_knock_writes_nothing() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped").await.unwrap();
+        decline_invite_inner(&pool, &manager, session_id, stranger, false).await.unwrap();
+
+        let expires: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT expires_at FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2")
+            .bind(stranger).bind(host).fetch_one(&pool).await.unwrap();
+        assert!(expires.is_some(), "a plain decline blocks temporarily, not forever");
+
+        assert_eq!(
+            grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "w").await.unwrap(),
+            GrantOutcome::Suppressed,
+        );
+    }
+
+    #[tokio::test]
+    async fn declining_with_permanent_writes_a_never_expiring_block() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped").await.unwrap();
+        decline_invite_inner(&pool, &manager, session_id, stranger, true).await.unwrap();
+
+        let expires: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT expires_at FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2")
+            .bind(stranger).bind(host).fetch_one(&pool).await.unwrap();
+        assert!(expires.is_none());
+    }
+
+    #[tokio::test]
+    async fn host_uninvite_frees_the_seat_and_is_host_only() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "wrapped").await.unwrap();
+
+        assert_eq!(uninvite_inner(&pool, &manager, session_id, stranger, stranger).await.unwrap_err(), StatusCode::FORBIDDEN);
+        uninvite_inner(&pool, &manager, session_id, host, stranger).await.unwrap();
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terminal_session_invitees WHERE session_id = $1").bind(session_id)
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0, "a pending invite must not hold a Pro host's only guest seat");
+
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM user_blocks WHERE blocker_id = $1").bind(stranger)
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(blocked, 0, "the host withdrawing is not the invitee blocking");
+    }
+
+    #[tokio::test]
+    async fn host_uninvite_of_a_suppressed_entry_clears_it_from_invitee_ids() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let (host, stranger, session_id) = direct_session_with_stranger(&pool).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(stranger)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            grant_invitee(&pool, &notifier, &manager, &knocks(), session_id, host, stranger, "w").await.unwrap(),
+            GrantOutcome::Suppressed,
+        );
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
+        assert_eq!(before, 1);
+
+        uninvite_inner(&pool, &manager, session_id, host, stranger).await.unwrap();
+
+        // A suppressed knock never wrote an invitee row, but it still occupies a
+        // seat in the host's invitee_ids (see `visible_sessions`) — un-invite must
+        // clear the suppressed_invites row too, or the seat leaks forever.
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM suppressed_invites WHERE session_id = $1 AND user_id = $2")
+            .bind(session_id).bind(stranger).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, 0);
     }
 }
