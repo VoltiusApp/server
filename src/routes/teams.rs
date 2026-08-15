@@ -1348,6 +1348,9 @@ pub async fn invite_member(
 #[derive(Serialize)]
 pub struct PendingInvitation {
     pub id: Uuid,
+    /// NOT an alias — the deliberate exception. Populated by
+    /// `COALESCE(invitee.handle, pi.email)`: an invitee with no account yet has
+    /// no handle, so the server has nothing else to send here.
     pub display_name: String,
     pub role: String,
     pub invited_by_display_name: Option<String>,

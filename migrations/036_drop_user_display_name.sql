@@ -5,4 +5,4 @@
 -- DEPLOY WARNING: irreversible, no down-migration. The old server still
 -- reads/writes display_name, so it cannot keep serving once this lands —
 -- no rolling restart across this migration.
-ALTER TABLE users DROP COLUMN display_name;
+ALTER TABLE users DROP COLUMN IF EXISTS display_name;
