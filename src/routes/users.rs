@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::handles::{validate_custom_handle, HandleError};
+use crate::routes::email_not_verified_response;
 
 const RENAME_COOLDOWN_DAYS: i64 = 30;
 
@@ -34,8 +36,13 @@ pub(crate) async fn claim_handle_inner(
         | HandleError::TooLong => StatusCode::UNPROCESSABLE_ENTITY,
     })?;
 
-    let (current, is_custom, updated_at): (String, bool, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT handle, handle_is_custom, handle_updated_at FROM users WHERE id = $1",
+    let (current, is_custom, updated_at, email_verified): (
+        String,
+        bool,
+        Option<DateTime<Utc>>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT handle, handle_is_custom, handle_updated_at, email_verified FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -45,13 +52,16 @@ pub(crate) async fn claim_handle_inner(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // The effective tier, not the stored one: an expired trial still reads
-    // `subscription_tier = 'pro'`, and a claim is permanent — `handle_is_custom`
-    // never reverts — so a stored-tier gate would hand a lapsed account a paid
-    // feature that can never be walked back.
-    let tier = crate::entitlement::effective_tier_for_user(pool, user_id).await;
-    if !matches!(tier.as_str(), "pro" | "teams" | "business") {
-        return Err(StatusCode::PAYMENT_REQUIRED);
+    // A verified email, not a tier. Claiming is free (G1): every hosted
+    // registration gets a 14-day Pro trial, so a tier gate here made anyone who
+    // claimed in their first fortnight permanently custom-handled anyway. A
+    // claim is permanent and `retired_handles` never recycles, so the only
+    // brake left on mass claiming is that each handle costs one working inbox.
+    //
+    // The ONLY 403 this function returns — `claim_handle` maps it to the
+    // EMAIL_NOT_VERIFIED body on that assumption.
+    if !email_verified {
+        return Err(StatusCode::FORBIDDEN);
     }
     if handle == current {
         return Ok(());
@@ -118,8 +128,15 @@ pub async fn claim_handle(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Json(body): Json<ClaimHandleRequest>,
-) -> Result<StatusCode, StatusCode> {
-    claim_handle_inner(&pool, auth.0, &body.handle).await?;
+) -> Result<StatusCode, Response> {
+    claim_handle_inner(&pool, auth.0, &body.handle)
+        .await
+        .map_err(|status| match status {
+            // Distinct from every other refusal so a client can say "verify
+            // your email first" instead of "invalid handle".
+            StatusCode::FORBIDDEN => email_not_verified_response(),
+            other => other.into_response(),
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -192,7 +209,10 @@ mod tests {
     use crate::test_support::unique_handle;
     use uuid::Uuid;
 
-    async fn user(pool: &sqlx::PgPool, tier: &str) -> Uuid {
+    /// Seeds on the free tier: claiming no longer reads the tier at all, so
+    /// `free` is the case every test here wants. `email_verified` is the axis
+    /// that now matters and is the only parameter.
+    async fn user(pool: &sqlx::PgPool, email_verified: bool) -> Uuid {
         // `generate_unique_handle`, like every other seeding path: the test
         // database is persistent and accumulates users, so an unchecked
         // `generate_handle` eventually collides on the unique index.
@@ -200,12 +220,12 @@ mod tests {
             .await
             .expect("generate handle");
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO users (email, account_id, auth_hash, subscription_tier, handle)
-             VALUES ($1, gen_random_uuid(), 'h', $2, $3) RETURNING id",
+            "INSERT INTO users (email, account_id, auth_hash, subscription_tier, handle, email_verified)
+             VALUES ($1, gen_random_uuid(), 'h', 'free', $2, $3) RETURNING id",
         )
         .bind(format!("{}@example.test", Uuid::new_v4()))
-        .bind(tier)
         .bind(&handle)
+        .bind(email_verified)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -213,38 +233,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn free_tier_cannot_claim_a_custom_handle() {
+    async fn an_unverified_email_cannot_claim_a_custom_handle() {
         let pool = crate::test_pool_or_skip!();
-        let id = user(&pool, "free").await;
+        let id = user(&pool, false).await;
         let err = claim_handle_inner(&pool, id, &unique_handle("kevin-p"))
             .await
             .unwrap_err();
-        assert_eq!(err, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn an_expired_trial_cannot_claim_a_custom_handle() {
+    async fn a_free_verified_user_can_claim_and_becomes_fuzzy_searchable() {
         let pool = crate::test_pool_or_skip!();
-        let id = user(&pool, "pro").await;
-        // A lapsed trial keeps `subscription_tier = 'pro'`; only the effective
-        // tier knows it is really free. A claim is permanent, so gating on the
-        // stored tier would hand out a paid feature that never reverts.
-        sqlx::query("UPDATE users SET trial_ends_at = now() - interval '1 day' WHERE id = $1")
-            .bind(id)
-            .execute(&pool)
+        let id = user(&pool, true).await;
+        let searcher = user(&pool, true).await;
+        let target = unique_handle("kevin-p");
+        claim_handle_inner(&pool, id, &target).await.unwrap();
+
+        // The whole point of G2: no entitlement check anywhere in search, so a
+        // free account that claims is discoverable on a handle substring.
+        // A substring spanning `unique_handle`'s random suffix, so the LIMIT 8
+        // cannot be crowded out by handles other tests left in the shared DB.
+        let fragment: String = target.chars().skip(target.chars().count() - 10).collect();
+        let found = crate::routes::teams::search_users_inner(&pool, searcher, &fragment)
             .await
             .unwrap();
-
-        let err = claim_handle_inner(&pool, id, &unique_handle("kevin-p"))
-            .await
-            .unwrap_err();
-        assert_eq!(err, StatusCode::PAYMENT_REQUIRED);
+        assert!(
+            found.iter().any(|u| u.user_id == id),
+            "a free user's custom handle must be fuzzy-searchable"
+        );
     }
 
     #[tokio::test]
-    async fn pro_claim_sets_custom_and_retires_the_previous_handle() {
+    async fn a_generated_handle_is_never_matched_by_a_substring() {
         let pool = crate::test_pool_or_skip!();
-        let id = user(&pool, "pro").await;
+        // G3, asserted directly: generated handles stay exact-match only, or a
+        // wordlist walk over `adjective-noun` enumerates the whole namespace.
+        let id = user(&pool, true).await;
+        let searcher = user(&pool, true).await;
+        let generated: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let middle: String = generated.chars().skip(2).take(6).collect();
+
+        let found = crate::routes::teams::search_users_inner(&pool, searcher, &middle)
+            .await
+            .unwrap();
+        assert!(
+            !found.iter().any(|u| u.user_id == id),
+            "a generated handle must not be reachable by substring"
+        );
+
+        let exact = crate::routes::teams::search_users_inner(&pool, searcher, &generated)
+            .await
+            .unwrap();
+        assert!(
+            exact.iter().any(|u| u.user_id == id),
+            "the exact generated handle must still resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_sets_custom_and_retires_the_previous_handle() {
+        let pool = crate::test_pool_or_skip!();
+        let id = user(&pool, true).await;
         let before: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
             .bind(id)
             .fetch_one(&pool)
@@ -280,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn a_retired_handle_can_never_be_claimed_again() {
         let pool = crate::test_pool_or_skip!();
-        let first = user(&pool, "pro").await;
+        let first = user(&pool, true).await;
         let target = unique_handle("kevin-p");
         let next = unique_handle("kevin-q");
         claim_handle_inner(&pool, first, &target).await.unwrap();
@@ -295,7 +349,7 @@ mod tests {
         .unwrap();
         claim_handle_inner(&pool, first, &next).await.unwrap();
 
-        let second = user(&pool, "pro").await;
+        let second = user(&pool, true).await;
         let err = claim_handle_inner(&pool, second, &target)
             .await
             .unwrap_err();
@@ -305,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn renaming_twice_inside_thirty_days_is_refused() {
         let pool = crate::test_pool_or_skip!();
-        let id = user(&pool, "pro").await;
+        let id = user(&pool, true).await;
         claim_handle_inner(&pool, id, &unique_handle("kevin-a"))
             .await
             .unwrap();
@@ -316,36 +370,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lapsed_account_keeps_its_custom_handle_but_cannot_rename() {
+    async fn an_expired_trial_can_still_claim() {
         let pool = crate::test_pool_or_skip!();
-        let id = user(&pool, "pro").await;
+        // The finding that killed the tier gate, kept as a regression: a lapsed
+        // trial is `free` on the effective tier, and claiming must not care.
+        let id = user(&pool, true).await;
+        sqlx::query("UPDATE users SET trial_ends_at = now() - interval '1 day' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let target = unique_handle("kevin-p");
         claim_handle_inner(&pool, id, &target).await.unwrap();
-        sqlx::query("UPDATE users SET subscription_tier = 'free', handle_updated_at = now() - interval '60 days' WHERE id = $1")
-            .bind(id).execute(&pool).await.unwrap();
-
-        let err = claim_handle_inner(&pool, id, &unique_handle("kevin-q"))
+        let handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
             .await
-            .unwrap_err();
-        assert_eq!(err, StatusCode::PAYMENT_REQUIRED);
-
-        let (handle, custom): (String, bool) =
-            sqlx::query_as("SELECT handle, handle_is_custom FROM users WHERE id = $1")
-                .bind(id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            handle, target,
-            "lapsing must not free a known handle for a squatter"
-        );
-        assert!(custom, "and must not remove its fuzzy searchability");
+            .unwrap();
+        assert_eq!(handle, target);
     }
 
     #[tokio::test]
-    async fn reserved_names_are_refused_before_the_tier_check_matters() {
+    async fn reserved_names_are_refused() {
         let pool = crate::test_pool_or_skip!();
-        let id = user(&pool, "pro").await;
+        let id = user(&pool, true).await;
         let err = claim_handle_inner(&pool, id, "voltius-support")
             .await
             .unwrap_err();
@@ -355,8 +404,8 @@ mod tests {
     #[tokio::test]
     async fn public_key_lookup_returns_identity_and_key_or_404() {
         let pool = crate::test_pool_or_skip!();
-        let me = user(&pool, "pro").await;
-        let them = user(&pool, "free").await;
+        let me = user(&pool, true).await;
+        let them = user(&pool, true).await;
         sqlx::query("UPDATE users SET public_key = 'pk-them' WHERE id = $1")
             .bind(them)
             .execute(&pool)

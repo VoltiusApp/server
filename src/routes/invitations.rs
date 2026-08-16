@@ -50,6 +50,57 @@ pub async fn get_invitation(
     }))
 }
 
+// ─── Admitting a member ───────────────────────────────────────────────────────
+
+/// The membership row plus its builtin role, written the same way by all three
+/// acceptance paths: the link token, the in-app pending invite, and the
+/// auto-accept at registration.
+///
+/// `invited_by` is carried across from the invitation. Leaving it NULL is what
+/// made `TeamMember.invited_by_display_name` blank on the roster for every
+/// accepted invite. The upsert only fills a NULL, so re-accepting can never
+/// rewrite who actually brought a member in.
+pub(crate) async fn admit_member(
+    conn: &mut sqlx::PgConnection,
+    team_id: Uuid,
+    user_id: Uuid,
+    invited_by: Option<Uuid>,
+    role: &str,
+) -> Result<(), StatusCode> {
+    sqlx::query(
+        "INSERT INTO team_members (team_id, user_id, invited_by) VALUES ($1, $2, $3)
+         ON CONFLICT (team_id, user_id)
+         DO UPDATE SET invited_by = COALESCE(team_members.invited_by, EXCLUDED.invited_by)",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .bind(invited_by)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to add member on invitation acceptance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
+           SELECT $1, $2, tr.id FROM team_roles tr
+           WHERE tr.team_id = $1 AND tr.name = $3 AND tr.is_builtin = TRUE
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to assign role on invitation acceptance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(())
+}
+
 // ─── Accept invitation (authed) ───────────────────────────────────────────────
 
 pub async fn accept_invitation(
@@ -58,8 +109,8 @@ pub async fn accept_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
-        r#"SELECT pi.id, pi.team_id, pi.email, pi.role
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<Uuid>)>(
+        r#"SELECT pi.id, pi.team_id, pi.email, pi.role, pi.invited_by
            FROM pending_invitations pi
            WHERE pi.token = $1
              AND pi.accepted_at IS NULL
@@ -77,7 +128,7 @@ pub async fn accept_invitation(
         StatusCode::NOT_FOUND
     })?;
 
-    let (invitation_id, team_id, invited_email, role) = row;
+    let (invitation_id, team_id, invited_email, role, invited_by) = row;
 
     let user_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
         .bind(auth.0)
@@ -103,35 +154,7 @@ pub async fn accept_invitation(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Add to team_members (no role column after migration)
-    sqlx::query(
-        "INSERT INTO team_members (team_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to add member on invitation acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Assign the builtin role stored in the invitation
-    sqlx::query(
-        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
-           SELECT $1, $2, tr.id FROM team_roles tr
-           WHERE tr.team_id = $1 AND tr.name = $3 AND tr.is_builtin = TRUE
-           ON CONFLICT DO NOTHING"#,
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .bind(&role)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to assign role on invitation acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    admit_member(&mut tx, team_id, auth.0, invited_by, &role).await?;
 
     // Mark invitation accepted
     sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
@@ -216,8 +239,8 @@ pub async fn accept_my_pending_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(invitation_id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid, String)>(
-        r#"SELECT team_id, role FROM pending_invitations
+    let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+        r#"SELECT team_id, role, invited_by FROM pending_invitations
            WHERE id = $1 AND user_id = $2
              AND accepted_at IS NULL AND expires_at > now()"#,
     )
@@ -234,40 +257,14 @@ pub async fn accept_my_pending_invitation(
         StatusCode::NOT_FOUND
     })?;
 
-    let (team_id, role) = row;
+    let (team_id, role, invited_by) = row;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for invitation acceptance");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    sqlx::query(
-        "INSERT INTO team_members (team_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to add member on invitation acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    sqlx::query(
-        r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
-           SELECT $1, $2, tr.id FROM team_roles tr
-           WHERE tr.team_id = $1 AND tr.name = $3 AND tr.is_builtin = TRUE
-           ON CONFLICT DO NOTHING"#,
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .bind(&role)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to assign role on invitation acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    admit_member(&mut tx, team_id, auth.0, invited_by, &role).await?;
 
     sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
         .bind(invitation_id)
@@ -637,5 +634,83 @@ mod authz_tests {
             Err(status) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected NOT_FOUND, got Ok"),
         }
+    }
+}
+
+#[cfg(test)]
+mod admit_tests {
+    //! `invited_by` on the membership row: it is what the roster reads back as
+    //! `TeamMember.invited_by_display_name`, and every accept path used to leave
+    //! it NULL. Requires `TEST_DATABASE_URL`; otherwise each skips.
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{seed_team, seed_user};
+
+    async fn inviter_of(pool: &PgPool, team: Uuid, user: Uuid) -> Option<Uuid> {
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT invited_by FROM team_members WHERE team_id = $1 AND user_id = $2",
+        )
+        .bind(team)
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .expect("read membership")
+    }
+
+    #[tokio::test]
+    async fn admitting_records_the_inviter_and_the_roster_can_read_the_handle() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let invitee = seed_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        admit_member(&mut conn, team, invitee, Some(owner), "member")
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
+
+        // The join the roster query performs — a NULL here is exactly what made
+        // `invited_by_display_name` blank on an accepted invite.
+        let handle: Option<String> = sqlx::query_scalar(
+            "SELECT inv.handle FROM team_members tm
+             LEFT JOIN users inv ON inv.id = tm.invited_by
+             WHERE tm.team_id = $1 AND tm.user_id = $2",
+        )
+        .bind(team)
+        .bind(invitee)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(handle.is_some(), "the roster must resolve the inviter");
+    }
+
+    #[tokio::test]
+    async fn re_admitting_backfills_a_null_but_never_rewrites_a_known_inviter() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let invitee = seed_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        // A link-only invite carries no inviter; a later accept fills it in.
+        admit_member(&mut conn, team, invitee, None, "member")
+            .await
+            .unwrap();
+        assert_eq!(inviter_of(&pool, team, invitee).await, None);
+
+        admit_member(&mut conn, team, invitee, Some(owner), "member")
+            .await
+            .unwrap();
+        assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
+
+        // …and a second invitation cannot claim credit for a member already in.
+        admit_member(&mut conn, team, invitee, Some(other), "member")
+            .await
+            .unwrap();
+        assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
     }
 }

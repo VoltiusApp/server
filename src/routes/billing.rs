@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::lemonsqueezy::{parse_ls_datetime, tier_from_variant_id};
+use crate::routes::email_not_verified_response;
 use crate::self_host;
 
 #[derive(Serialize)]
@@ -52,14 +53,6 @@ pub struct CheckoutResponse {
 
 fn status_response(status: StatusCode) -> Response {
     status.into_response()
-}
-
-fn email_not_verified_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "error": "EMAIL_NOT_VERIFIED" })),
-    )
-        .into_response()
 }
 
 #[derive(Debug, Clone)]

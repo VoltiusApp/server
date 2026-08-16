@@ -18,6 +18,12 @@ const NOUNS: &[&str] = &[
 /// create. Checked against the whole handle, so `administrator` is reserved
 /// but `administrator-fan` is not — see `VENDOR_RESERVED` for the narrower set
 /// that's also checked component-by-component.
+///
+/// Reviewed when claiming became free. Until then a claim cost a Pro
+/// subscription, so the list only had to deter someone already paying; every
+/// account can now attempt one. The additions are the names that read as "this
+/// message comes from Voltius" — mail-system roles, trust words, and the terms
+/// a billing or verification prompt would legitimately use.
 const RESERVED: &[&str] = &[
     "admin",
     "administrator",
@@ -25,8 +31,10 @@ const RESERVED: &[&str] = &[
     "help",
     "helpdesk",
     "voltius",
+    "voltiusapp",
     "security",
     "billing",
+    "payments",
     "root",
     "system",
     "staff",
@@ -34,17 +42,40 @@ const RESERVED: &[&str] = &[
     "mod",
     "official",
     "team",
+    "abuse",
+    "postmaster",
+    "webmaster",
+    "hostmaster",
+    "noreply",
+    "donotreply",
+    "notifications",
+    "account",
+    "accounts",
+    "verify",
+    "verified",
+    "trust",
+    "legal",
+    "privacy",
+    "info",
+    "contact",
+    "sales",
+    "api",
+    "owner",
 ];
 
 /// Subset of `RESERVED` also rejected as a standalone `-`/`_` component
 /// (`voltius-support`, `admin-2`). Narrower than `RESERVED` on purpose: the
 /// list exists to stop vendor impersonation, not to ban ordinary English
 /// words like "team" or "help" from appearing anywhere in a handle.
+/// `noreply` also covers `no-reply` and `donotreply` covers `do-not-reply`:
+/// `impersonation_key` strips the separators before the comparison.
 const VENDOR_RESERVED: &[&str] = &[
     "voltius",
+    "voltiusapp",
     "support",
     "security",
     "billing",
+    "payments",
     "admin",
     "root",
     "system",
@@ -52,6 +83,15 @@ const VENDOR_RESERVED: &[&str] = &[
     "staff",
     "official",
     "moderator",
+    "abuse",
+    "postmaster",
+    "webmaster",
+    "hostmaster",
+    "noreply",
+    "donotreply",
+    "notifications",
+    "verify",
+    "verified",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,6 +246,14 @@ mod tests {
             "admin-2",
             "administrator",
             "team",
+            "no-reply",
+            "voltius-noreply",
+            "do-not-reply",
+            "verified-support",
+            "v3rified",
+            "postmaster",
+            "abuse",
+            "voltiusapp",
         ] {
             assert_eq!(
                 validate_custom_handle(h),
