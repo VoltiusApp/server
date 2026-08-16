@@ -83,8 +83,8 @@ pub async fn seed_user(pool: &PgPool) -> Uuid {
         .await
         .expect("generate handle");
     sqlx::query(
-        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, handle)
-         VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User', $4)",
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, handle)
+         VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', $4)",
     )
     .bind(id)
     .bind(format!("{id}@test.local"))
@@ -106,8 +106,8 @@ pub async fn seed_user_with_credentials(pool: &PgPool, account_id: Uuid, auth_ke
         .await
         .expect("generate handle");
     sqlx::query(
-        "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, handle)
-         VALUES ($1, $2, $3, $4, 'test-pubkey', 'Test User', $5)",
+        "INSERT INTO users (id, email, account_id, auth_hash, public_key, handle)
+         VALUES ($1, $2, $3, $4, 'test-pubkey', $5)",
     )
     .bind(id)
     .bind(format!("{id}@test.local"))

@@ -184,8 +184,8 @@ pub async fn register(
         })?;
 
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, display_name, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
-         VALUES ($1, split_part($1, '@', 1), $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(&email)
     .bind(body.account_id)
@@ -574,6 +574,7 @@ pub async fn resend_verification_email(
 #[derive(Serialize)]
 pub struct MeResponse {
     pub email: String,
+    /// ALIAS for pre-0.26 clients. Value is the handle. Delete in 0.27.
     pub display_name: String,
     pub account_id: Uuid,
     pub tier: String,
@@ -585,24 +586,21 @@ pub struct MeResponse {
     pub allow_stranger_invites: bool,
 }
 
-pub async fn get_me(
-    State(pool): State<PgPool>,
-    axum::Extension(auth): axum::Extension<AuthUser>,
-) -> Result<Json<MeResponse>, StatusCode> {
+pub(crate) async fn fetch_me_inner(pool: &PgPool, user_id: Uuid) -> Result<MeResponse, StatusCode> {
     let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool)>(
-        "SELECT email, display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites FROM users WHERE id = $1",
+        "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites FROM users WHERE id = $1",
     )
-    .bind(auth.0)
-    .fetch_one(&pool)
+    .bind(user_id)
+    .fetch_one(pool)
     .await
     .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to fetch user in get_me");
+        error!(error = %e, user_id = %user_id, "Failed to fetch user in get_me");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let tier = fetch_tier(&pool, auth.0).await?;
+    let tier = fetch_tier(pool, user_id).await?;
 
-    Ok(Json(MeResponse {
+    Ok(MeResponse {
         email: row.0,
         display_name: row.1,
         account_id: row.2,
@@ -613,38 +611,14 @@ pub async fn get_me(
         handle: row.4,
         handle_is_custom: row.5,
         allow_stranger_invites: row.6,
-    }))
+    })
 }
 
-// ─── Update display name ──────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct UpdateDisplayNameRequest {
-    pub display_name: String,
-}
-
-pub async fn update_display_name(
+pub async fn get_me(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
-    Json(body): Json<UpdateDisplayNameRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let display_name = body.display_name.trim().to_string();
-    if display_name.is_empty() || display_name.len() > 50 {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
-        .bind(&display_name)
-        .bind(auth.0)
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %auth.0, "Failed to update display name");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    info!(user_id = %auth.0, display_name = %display_name, "Display name updated");
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<MeResponse>, StatusCode> {
+    Ok(Json(fetch_me_inner(&pool, auth.0).await?))
 }
 
 // ─── Update email ─────────────────────────────────────────────────────────────
@@ -1356,5 +1330,23 @@ mod handler_tests {
             Err(s) => assert_eq!(s, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected NOT_FOUND for soft-deleted account"),
         }
+    }
+
+    #[tokio::test]
+    async fn me_reports_the_handle_under_both_names() {
+        let pool = test_pool_or_skip!();
+        let user = crate::test_support::seed_user(&pool).await;
+        let handle = crate::test_support::unique_handle("merry-quartz");
+        sqlx::query("UPDATE users SET handle = $1 WHERE id = $2")
+            .bind(&handle)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let me = fetch_me_inner(&pool, user).await.unwrap();
+        assert_eq!(me.handle, handle);
+        // ALIAS for pre-0.26 clients.
+        assert_eq!(me.display_name, handle);
     }
 }

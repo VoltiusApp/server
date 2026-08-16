@@ -1803,8 +1803,8 @@ mod admin_handler_tests {
             .await
             .expect("generate handle");
         sqlx::query(
-            "INSERT INTO users (id, email, account_id, auth_hash, public_key, display_name, last_seen_on, handle)
-             VALUES ($1, $2, $3, 'test-hash', 'test-pubkey', 'Test User',
+            "INSERT INTO users (id, email, account_id, auth_hash, public_key, last_seen_on, handle)
+             VALUES ($1, $2, $3, 'test-hash', 'test-pubkey',
                      CASE WHEN $4::int IS NULL THEN NULL ELSE current_date - $4::int END, $5)",
         )
         .bind(id)
