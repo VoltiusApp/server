@@ -61,15 +61,21 @@ pub struct Grant {
     pub kind: String,
 }
 
-pub async fn insert_grant(
-    pool: &PgPool,
+/// Generic over the executor so a caller can run this inside its own
+/// transaction (e.g. alongside the session INSERT it must not outlive) or
+/// just pass a `&PgPool` for a standalone grant.
+pub async fn insert_grant<'c, E>(
+    executor: E,
     session_id: Uuid,
     kind: &str,
     secret: &str,
     expires_at: Option<DateTime<Utc>>,
     created_by: Uuid,
     redeemed_by: Option<Uuid>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
     sqlx::query(
         "INSERT INTO terminal_session_grants \
          (session_id, kind, secret_hash, expires_at, created_by, redeemed_by) \
@@ -81,7 +87,7 @@ pub async fn insert_grant(
     .bind(expires_at)
     .bind(created_by)
     .bind(redeemed_by)
-    .execute(pool)
+    .execute(executor)
     .await
     .map(|_| ())
 }
@@ -217,6 +223,40 @@ mod tests {
         assert!(
             matches,
             "migration hash expression must match the stored token"
+        );
+    }
+
+    /// The deploy-day case: an already-live session whose grant only exists
+    /// because the migration backfilled it, hashing in SQL — not through
+    /// `insert_grant`/`hash_secret`. Proves the two hashing paths agree; if
+    /// they didn't, every mid-session guest would be locked out at deploy.
+    #[tokio::test]
+    async fn a_migration_backfilled_grant_resolves_the_pre_existing_token() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let session = seed_session(&pool, host, "invite_link").await;
+        let token = format!("fake-legacy-token-{}", Uuid::new_v4());
+
+        sqlx::query("UPDATE terminal_sessions SET invite_token = $1 WHERE id = $2")
+            .bind(&token)
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO terminal_session_grants (session_id, kind, secret_hash, created_by) \
+             SELECT id, 'legacy_token', sha256(convert_to(invite_token, 'UTF8')), host_user_id \
+             FROM terminal_sessions WHERE id = $1",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            resolve_join_grant(&pool, session, &token).await.is_some(),
+            "SQL-side and Rust-side hashing must agree on deploy day"
         );
     }
 

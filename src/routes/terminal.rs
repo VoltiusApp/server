@@ -570,12 +570,19 @@ pub async fn create_session(
 
     // Generate invite token for invite_link sessions
     let invite_token: Option<String> = if visibility == "invite_link" {
-        Some(Uuid::new_v4().to_string().replace('-', ""))
+        Some(crate::session_grants::new_token_secret())
     } else {
         None
     };
 
-    // Insert session record
+    // Insert session record and its legacy join grant together: if the grant
+    // insert fails, the session row must not survive carrying a token that
+    // can never resolve.
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to start session creation transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let session_id = sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO terminal_sessions
            (host_user_id, connection_name, visibility, session_key_bytes, allowed_roles, invite_token)
@@ -588,7 +595,7 @@ pub async fn create_session(
     .bind(&body.session_key_bytes)
     .bind(&body.allowed_roles)
     .bind(&invite_token)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, "Failed to insert terminal session");
@@ -597,7 +604,7 @@ pub async fn create_session(
 
     if let Some(token) = &invite_token {
         crate::session_grants::insert_grant(
-            &pool, session_id, "legacy_token", token, None, auth.0, None,
+            &mut *tx, session_id, "legacy_token", token, None, auth.0, None,
         )
         .await
         .map_err(|e| {
@@ -605,6 +612,11 @@ pub async fn create_session(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit session creation transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Insert vault associations
     for vault_id in &body.vault_ids {
@@ -938,15 +950,10 @@ pub async fn get_my_session_key(
         }));
     }
 
-    // Invite link session: validate token, return raw key
+    // Invite link session: session must exist first (404), then the token
+    // must resolve to a live grant (403) — preserves the pre-grant status
+    // code contract for unknown/ended sessions vs. a bad credential.
     if let Some(token) = &query.invite_token {
-        if crate::session_grants::resolve_join_grant(&pool, session_id, token)
-            .await
-            .is_none()
-        {
-            return Err(StatusCode::FORBIDDEN);
-        }
-
         let row = sqlx::query_as::<_, (Option<String>, String)>(
             r#"
             SELECT ts.session_key_bytes, u.public_key
@@ -963,6 +970,13 @@ pub async fn get_my_session_key(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
+
+        if crate::session_grants::resolve_join_grant(&pool, session_id, token)
+            .await
+            .is_none()
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
 
         let (session_key_bytes, host_public_key) = row;
         let raw_key = session_key_bytes.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -3055,16 +3069,26 @@ mod tests {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
         let guest = seed_user(&pool).await;
+        let other_guest = seed_user(&pool).await;
         let session = seed_session(&pool, host, "invite_link").await;
-        let secret = format!("fake-grant-secret-{}", Uuid::new_v4());
+        let revoked_secret = format!("fake-grant-secret-{}", Uuid::new_v4());
+        let live_secret = format!("fake-grant-secret-{}", Uuid::new_v4());
 
         crate::session_grants::insert_grant(
-            &pool, session, "guest", &secret, None, host, Some(guest),
+            &pool, session, "guest", &revoked_secret, None, host, Some(guest),
         )
         .await
         .unwrap();
-        sqlx::query("UPDATE terminal_session_grants SET revoked_at = now() WHERE session_id = $1")
-            .bind(session)
+        crate::session_grants::insert_grant(
+            &pool, session, "guest", &live_secret, None, host, Some(other_guest),
+        )
+        .await
+        .unwrap();
+
+        // Revoke by secret_hash, not by session: proves the per-guest grant
+        // this design exists for, not "revoking the session locks everyone out".
+        sqlx::query("UPDATE terminal_session_grants SET revoked_at = now() WHERE secret_hash = $1")
+            .bind(crate::session_grants::hash_secret(&revoked_secret))
             .execute(&pool)
             .await
             .unwrap();
@@ -3072,11 +3096,20 @@ mod tests {
         assert!(
             !is_authorized_participant(
                 &pool, session, guest, host, "invite_link", &[], &[],
-                Some(secret.as_str()),
+                Some(revoked_secret.as_str()),
                 &std::collections::HashSet::new(),
             )
             .await,
             "revoking one guest's grant must lock that guest out"
+        );
+        assert!(
+            is_authorized_participant(
+                &pool, session, other_guest, host, "invite_link", &[], &[],
+                Some(live_secret.as_str()),
+                &std::collections::HashSet::new(),
+            )
+            .await,
+            "a different guest's grant on the same session must keep working"
         );
     }
 }
