@@ -1,9 +1,4 @@
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::IpAddr;
@@ -104,6 +99,15 @@ pub struct SearchRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct KnockRateLimiter(pub RateLimiter<Uuid>);
 
+/// Short-code mints per host. Regenerate-spam must not become a mint oracle.
+#[derive(Clone)]
+pub struct SessionCodeRateLimiter(pub RateLimiter<Uuid>);
+
+/// Code redemptions per user. Keyed by user because the endpoint is
+/// authenticated, so brute force costs accounts, not just addresses.
+#[derive(Clone)]
+pub struct RedeemRateLimiter(pub RateLimiter<Uuid>);
+
 /// Register endpoint: N registrations/day per IP.
 pub async fn register_rate_limit(
     axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,
@@ -118,6 +122,22 @@ pub async fn register_rate_limit(
     Ok(next.run(req).await)
 }
 
+/// Shared body for the per-user middlewares below: check the limiter keyed on
+/// the authenticated caller, or reject with 429.
+async fn user_keyed_limit(
+    limiter: &RateLimiter<Uuid>,
+    user: Uuid,
+    label: &str,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !limiter.check(user).await {
+        warn!(user_id = %user, limiter = label, "Rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
+
 /// Invite endpoint: N invitations/hour per user (auth_middleware must run first).
 pub async fn invite_rate_limit(
     axum::Extension(InviteRateLimiter(limiter)): axum::Extension<InviteRateLimiter>,
@@ -125,11 +145,7 @@ pub async fn invite_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if !limiter.check(auth.0).await {
-        warn!(user_id = %auth.0, "Invite rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(next.run(req).await)
+    user_keyed_limit(&limiter, auth.0, "invite", req, next).await
 }
 
 /// Sync endpoints: N requests/hour per user (auth_middleware must run first).
@@ -139,11 +155,7 @@ pub async fn sync_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if !limiter.check(auth.0).await {
-        warn!(user_id = %auth.0, "Sync rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(next.run(req).await)
+    user_keyed_limit(&limiter, auth.0, "sync", req, next).await
 }
 
 /// Auth endpoints: 10 requests/minute per IP.
@@ -175,4 +187,3 @@ pub async fn waitlist_rate_limit(
     }
     Ok(next.run(req).await)
 }
-

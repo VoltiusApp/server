@@ -994,7 +994,7 @@ pub async fn get_my_session_key(
 /// status the caller should return: `NOT_FOUND` if the session doesn't exist
 /// or has already ended, `FORBIDDEN` if `caller` isn't its host. Shared by
 /// `end_session` and `invite_to_session` — both gate on exactly this check.
-async fn require_active_session_host(
+pub(crate) async fn require_active_session_host(
     pool: &PgPool,
     session_id: Uuid,
     caller: Uuid,

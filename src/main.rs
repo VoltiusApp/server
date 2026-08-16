@@ -23,8 +23,8 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    InviteRateLimiter, KnockRateLimiter, RateLimiter, RegisterRateLimiter, SearchRateLimiter,
-    SyncRateLimiter, WaitlistRateLimiter,
+    InviteRateLimiter, KnockRateLimiter, RateLimiter, RedeemRateLimiter, RegisterRateLimiter,
+    SearchRateLimiter, SessionCodeRateLimiter, SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
 use std::net::SocketAddr;
@@ -180,6 +180,10 @@ async fn main() {
         SearchRateLimiter(RateLimiter::<uuid::Uuid>::new(search_rate, Duration::from_secs(60)));
     let knock_limiter =
         KnockRateLimiter(RateLimiter::<uuid::Uuid>::new(knock_per_hour, Duration::from_secs(3600)));
+    let session_code_limiter =
+        SessionCodeRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
+    let redeem_limiter =
+        RedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -441,6 +445,16 @@ async fn main() {
             "/v1/terminal-sessions",
             post(routes::terminal::create_session),
         )
+        // `redeem` is a literal segment registered before the `:id` routes, for
+        // the same reason the literal `me` invitee route is.
+        .route(
+            "/v1/terminal-sessions/redeem",
+            post(routes::session_codes::redeem_code),
+        )
+        .route(
+            "/v1/terminal-sessions/:id/code",
+            post(routes::session_codes::create_code),
+        )
         .route(
             "/v1/terminal-sessions/:id/my-key",
             get(routes::terminal::get_my_session_key),
@@ -494,6 +508,8 @@ async fn main() {
         .layer(Extension(sync_limiter))
         .layer(Extension(search_limiter))
         .layer(Extension(knock_limiter))
+        .layer(Extension(session_code_limiter))
+        .layer(Extension(redeem_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
