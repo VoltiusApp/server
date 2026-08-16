@@ -10,6 +10,7 @@ mod permissions;
 mod rate_limit;
 mod routes;
 mod self_host;
+mod session_grants;
 mod sync_notifier;
 mod terminal_manager;
 #[cfg(test)]
