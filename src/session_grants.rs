@@ -133,6 +133,7 @@ mod tests {
         assert!(normalize_short_code("K7M2-P9QX").is_none());
         assert!(normalize_short_code("K7M2-P9QX-3B4").is_none());
         assert!(normalize_short_code("K7M2-P9QX-3$").is_none());
+        assert!(normalize_short_code("K7M2-P9QU-3B").is_none());
         assert!(normalize_short_code("").is_none());
     }
 
