@@ -1918,20 +1918,10 @@ mod tests {
     use super::*;
     use crate::rate_limit::RateLimiter;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, default_knock_limiter as knocks, seed_team, seed_user};
+    use crate::test_support::{
+        add_member, default_knock_limiter as knocks, seed_session, seed_team, seed_user,
+    };
     use std::time::Duration;
-
-    async fn seed_session(pool: &PgPool, host: Uuid, visibility: &str) -> Uuid {
-        sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO terminal_sessions (host_user_id, connection_name, visibility) \
-             VALUES ($1, 'web-prod', $2) RETURNING id",
-        )
-        .bind(host)
-        .bind(visibility)
-        .fetch_one(pool)
-        .await
-        .expect("insert session")
-    }
 
     fn harness() -> (crate::sync_notifier::SyncNotifier, TerminalManager) {
         (
