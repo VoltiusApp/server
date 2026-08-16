@@ -377,6 +377,7 @@ pub struct UsersQuery {
 pub struct UserListRow {
     id: Uuid,
     email: String,
+    handle: String,
     subscription_tier: String,
     trial_ends_at: Option<DateTime<Utc>>,
     trial_used: bool,
@@ -434,11 +435,30 @@ pub async fn list_users(
         }
     };
 
+    // Admins paste handles both bare and as `@name`; the email pattern must keep
+    // any `@` (it is part of an address), so the handle pattern is normalized
+    // separately rather than sharing $1.
+    let handle_search = params.search.as_deref().map(crate::handles::normalize_handle);
+
+    // One clause, two queries: the page and its total must filter identically or
+    // the footer count contradicts the rows above it.
+    let where_clause = format!(
+        r#"
+            ($1::text IS NULL
+             OR u.email ILIKE '%' || $1 || '%'
+             OR u.handle ILIKE '%' || $4 || '%')
+            AND ($2::text IS NULL OR u.subscription_tier = $2)
+            AND ($3::boolean IS NULL OR u.is_banned = $3)
+            {deleted_clause}
+        "#
+    );
+
     let list_sql = format!(
         r#"
         SELECT
             u.id,
             u.email,
+            u.handle,
             u.subscription_tier,
             u.trial_ends_at,
             u.trial_used,
@@ -464,13 +484,9 @@ pub async fn list_users(
             FROM churn_events
             GROUP BY user_id
         ) ce ON ce.user_id = u.id
-        WHERE
-            ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%')
-            AND ($2::text IS NULL OR u.subscription_tier = $2)
-            AND ($3::boolean IS NULL OR u.is_banned = $3)
-            {deleted_clause}
+        WHERE {where_clause}
         ORDER BY {order_clause}
-        LIMIT $4 OFFSET $5
+        LIMIT $5 OFFSET $6
         "#
     );
 
@@ -478,6 +494,7 @@ pub async fn list_users(
         .bind(&params.search)
         .bind(&params.tier)
         .bind(params.banned)
+        .bind(&handle_search)
         .bind(limit)
         .bind(offset)
         .fetch_all(&pool)
@@ -487,21 +504,13 @@ pub async fn list_users(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let count_sql = format!(
-        r#"
-        SELECT COUNT(*) FROM users u
-        WHERE
-            ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%')
-            AND ($2::text IS NULL OR u.subscription_tier = $2)
-            AND ($3::boolean IS NULL OR u.is_banned = $3)
-            {deleted_clause}
-        "#
-    );
+    let count_sql = format!("SELECT COUNT(*) FROM users u WHERE {where_clause}");
 
     let total_row = sqlx::query_as::<_, (i64,)>(&count_sql)
         .bind(&params.search)
         .bind(&params.tier)
         .bind(params.banned)
+        .bind(&handle_search)
         .fetch_one(&pool)
         .await
         .map_err(|e| {
@@ -523,6 +532,7 @@ pub async fn list_users(
 pub struct UserDetail {
     id: Uuid,
     email: String,
+    handle: String,
     account_id: Uuid,
     subscription_tier: String,
     trial_ends_at: Option<DateTime<Utc>>,
@@ -551,7 +561,7 @@ pub async fn get_user(
 ) -> Result<Json<UserDetail>, StatusCode> {
     let user = sqlx::query_as::<_, UserDetail>(
         r#"
-        SELECT id, email, account_id, subscription_tier, trial_ends_at, trial_used,
+        SELECT id, email, handle, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
                ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
                last_seen_on, deleted_at, deletion_reason, deleted_by
@@ -1185,9 +1195,9 @@ pub async fn get_presence(
 // ─── CSV export ───────────────────────────────────────────────────────────────
 
 pub async fn export_users_csv(State(pool): State<PgPool>) -> Result<Response<Body>, StatusCode> {
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<DateTime<Utc>>, bool, bool, DateTime<Utc>, Option<String>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, String, String, Option<DateTime<Utc>>, bool, bool, DateTime<Utc>, Option<String>)>(
         r#"
-        SELECT u.id, u.email, u.subscription_tier, u.trial_ends_at, u.trial_used, u.is_banned,
+        SELECT u.id, u.email, u.handle, u.subscription_tier, u.trial_ends_at, u.trial_used, u.is_banned,
                u.created_at, u.ls_customer_id
         FROM users u
         ORDER BY u.created_at DESC
@@ -1200,18 +1210,21 @@ pub async fn export_users_csv(State(pool): State<PgPool>) -> Result<Response<Bod
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut csv = String::from("id,email,tier,trial_ends_at,trial_used,is_banned,created_at,ls_customer_id\n");
+    let mut csv = String::from(
+        "id,email,handle,tier,trial_ends_at,trial_used,is_banned,created_at,ls_customer_id\n",
+    );
     for row in rows {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{}\n",
             row.0,
             row.1,
             row.2,
-            row.3.map(|t| t.to_rfc3339()).unwrap_or_default(),
-            row.4,
+            row.3,
+            row.4.map(|t| t.to_rfc3339()).unwrap_or_default(),
             row.5,
-            row.6.to_rfc3339(),
-            row.7.unwrap_or_default(),
+            row.6,
+            row.7.to_rfc3339(),
+            row.8.unwrap_or_default(),
         ));
     }
 
@@ -1937,6 +1950,30 @@ mod admin_handler_tests {
             body["users"][0]["last_seen_on"].as_str(),
             Some(expected.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn list_users_finds_by_handle_bare_prefixed_or_uppercased() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .expect("read handle");
+
+        for term in [handle.clone(), format!("@{handle}"), handle.to_uppercase()] {
+            let body = list_users(State(pool.clone()), users_query(&term))
+                .await
+                .expect("list users")
+                .0;
+            assert_eq!(body["total"].as_i64(), Some(1), "search {term:?}");
+            assert_eq!(
+                body["users"][0]["handle"].as_str(),
+                Some(handle.as_str()),
+                "search {term:?}"
+            );
+        }
     }
 
     #[tokio::test]
