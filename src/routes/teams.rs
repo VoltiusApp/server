@@ -640,9 +640,12 @@ pub(crate) async fn search_users_inner(
     }
     let q = q.trim().to_lowercase();
     let fuzzy = format!("%{q}%");
-    let prefix = format!("{q}%");
     let exact_email = if q.contains('@') && q.contains('.') { q.clone() } else { String::new() };
+    // Handle matching runs on the normalized form so a typed "@alice" reaches
+    // the partial and prefix branches too, not only the exact one.
     let exact_handle = crate::handles::normalize_handle(&q);
+    let handle_fuzzy = format!("%{exact_handle}%");
+    let prefix = format!("{exact_handle}%");
 
     let sql = format!(
         r#"
@@ -652,7 +655,7 @@ pub(crate) async fn search_users_inner(
           AND u.deleted_at IS NULL
           AND (
                ({pair} AND LOWER(u.email) LIKE $1)
-            OR (u.handle_is_custom AND LOWER(u.handle) LIKE $1)
+            OR (u.handle_is_custom AND LOWER(u.handle) LIKE $6)
             OR LOWER(u.email) = $3
             OR LOWER(u.handle) = $4
           )
@@ -670,6 +673,7 @@ pub(crate) async fn search_users_inner(
         .bind(&exact_email)
         .bind(&exact_handle)
         .bind(&prefix)
+        .bind(&handle_fuzzy)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -2332,6 +2336,17 @@ mod search_tests {
         let hits = search_users_inner(&pool, me, &handle[..handle.len() - 1]).await.unwrap();
         assert!(hits.iter().any(|r| r.user_id == them));
         assert!(!hits.iter().any(|r| r.is_teammate));
+    }
+
+    #[tokio::test]
+    async fn a_leading_at_sign_does_not_break_partial_handle_matching() {
+        let pool = crate::test_pool_or_skip!();
+        let me = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &crate::handles::generate_unique_handle(&pool).await.unwrap(), false).await;
+        let handle = unique_handle("kevin-p");
+        let them = mk_user(&pool, &format!("{}@a.test", Uuid::new_v4()), &handle, true).await;
+
+        let hits = search_users_inner(&pool, me, &format!("@{}", &handle[..handle.len() - 1])).await.unwrap();
+        assert!(hits.iter().any(|r| r.user_id == them));
     }
 
     #[tokio::test]
