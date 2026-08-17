@@ -120,6 +120,19 @@ pub async fn seed_user_with_credentials(pool: &PgPool, account_id: Uuid, auth_ke
     id
 }
 
+/// Insert a terminal session hosted by `host` with the given `visibility`.
+pub async fn seed_session(pool: &PgPool, host: Uuid, visibility: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO terminal_sessions (host_user_id, connection_name, visibility) \
+         VALUES ($1, 'web-prod', $2) RETURNING id",
+    )
+    .bind(host)
+    .bind(visibility)
+    .fetch_one(pool)
+    .await
+    .expect("insert session")
+}
+
 /// Insert a team owned by `owner` and return its id.
 pub async fn seed_team(pool: &PgPool, owner: Uuid) -> Uuid {
     let id = Uuid::new_v4();

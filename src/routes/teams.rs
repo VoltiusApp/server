@@ -1502,7 +1502,7 @@ mod authz_tests {
             .invitees
             .clone();
         crate::routes::terminal::is_authorized_participant(
-            pool, user, host, "direct", &[], &[], None, None, &invitees,
+            pool, session_id, user, host, "direct", &[], &[], None, &invitees,
         )
         .await
     }

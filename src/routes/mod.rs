@@ -5,6 +5,7 @@ pub mod billing;
 pub mod invitations;
 pub mod meta;
 pub mod presence;
+pub mod session_codes;
 pub mod sync;
 pub mod team_sync;
 pub mod team_objects;
