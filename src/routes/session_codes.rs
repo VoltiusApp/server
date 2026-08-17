@@ -153,7 +153,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn minting_for_an_ended_session_is_not_found_not_a_crash() {
+    async fn minting_for_an_ended_session_is_not_found() {
+        // Caught by require_active_session_host, not the fetch_optional visibility
+        // lookup — that branch only fires on the row-disappears-mid-request race,
+        // which isn't worth simulating.
         let pool = test_pool_or_skip!();
         let (host, session) = seed_host_and_session(&pool).await;
         sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
