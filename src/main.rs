@@ -445,8 +445,9 @@ async fn main() {
             "/v1/terminal-sessions",
             post(routes::terminal::create_session),
         )
-        // `redeem` is a literal segment registered before the `:id` routes, for
-        // the same reason the literal `me` invitee route is.
+        // `redeem` is listed before the `:id` routes by convention, matching
+        // the literal `me` invitee route; axum's matchit prefers a static
+        // segment over a param regardless of registration order.
         .route(
             "/v1/terminal-sessions/redeem",
             post(routes::session_codes::redeem_code),

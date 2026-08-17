@@ -677,7 +677,6 @@ pub async fn create_session(
             crate::terminal_manager::SessionState {
                 vault_ids: body.vault_ids.clone(),
                 allowed_roles: body.allowed_roles.clone(),
-                invite_token: invite_token.clone(),
                 invitees: std::collections::HashSet::new(),
                 host_user_id: auth.0,
                 host_public_key,

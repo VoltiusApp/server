@@ -32,8 +32,6 @@ pub struct SessionState {
     pub vault_ids: Vec<Uuid>,
     /// Role filter — empty means all roles; non-empty means only these roles can join
     pub allowed_roles: Vec<String>,
-    /// Invite token — set for invite_link sessions; required to join/get key
-    pub invite_token: Option<String>,
     /// Users granted access individually (issue #66). Authoritative for WS
     /// authorization; lost on restart along with the session itself.
     pub invitees: std::collections::HashSet<Uuid>,
@@ -76,7 +74,6 @@ impl TerminalManager {
             SessionState {
                 vault_ids: vec![],
                 allowed_roles: vec![],
-                invite_token: None,
                 invitees: std::collections::HashSet::new(),
                 host_user_id: host,
                 host_public_key: String::new(),

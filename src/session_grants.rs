@@ -56,9 +56,7 @@ pub fn new_token_secret() -> String {
 pub const SHORT_CODE_TTL_MINUTES: i64 = 10;
 
 pub struct Grant {
-    pub id: Uuid,
     pub session_id: Uuid,
-    pub kind: String,
 }
 
 /// Generic over the executor so a caller can run this inside its own
@@ -95,8 +93,8 @@ where
 /// Kind-agnostic: a live grant is a live grant. Short codes never travel this
 /// path — they are redeemed at their own endpoint — so the secret is hashed raw.
 pub async fn resolve_join_grant(pool: &PgPool, session_id: Uuid, presented: &str) -> Option<Grant> {
-    sqlx::query_as::<_, (Uuid, Uuid, String)>(
-        "SELECT g.id, g.session_id, g.kind \
+    sqlx::query_as::<_, (Uuid,)>(
+        "SELECT g.session_id \
          FROM terminal_session_grants g \
          JOIN terminal_sessions ts ON ts.id = g.session_id \
          WHERE g.session_id = $1 AND g.secret_hash = $2 \
@@ -110,17 +108,13 @@ pub async fn resolve_join_grant(pool: &PgPool, session_id: Uuid, presented: &str
     .await
     .ok()
     .flatten()
-    .map(|(id, session_id, kind)| Grant {
-        id,
-        session_id,
-        kind,
-    })
+    .map(|(session_id,)| Grant { session_id })
 }
 
 pub async fn resolve_short_code(pool: &PgPool, code: &str) -> Option<Grant> {
     let normalized = normalize_short_code(code)?;
-    sqlx::query_as::<_, (Uuid, Uuid, String)>(
-        "SELECT g.id, g.session_id, g.kind \
+    sqlx::query_as::<_, (Uuid,)>(
+        "SELECT g.session_id \
          FROM terminal_session_grants g \
          JOIN terminal_sessions ts ON ts.id = g.session_id \
          WHERE g.secret_hash = $1 AND g.kind = 'short_code' \
@@ -132,11 +126,7 @@ pub async fn resolve_short_code(pool: &PgPool, code: &str) -> Option<Grant> {
     .await
     .ok()
     .flatten()
-    .map(|(id, session_id, kind)| Grant {
-        id,
-        session_id,
-        kind,
-    })
+    .map(|(session_id,)| Grant { session_id })
 }
 
 pub async fn rotate_short_code(

@@ -42,14 +42,16 @@ pub async fn create_code(
     // Only invite_link sessions serve raw keys through the short-code/grant
     // path (get_my_session_key, is_authorized_participant); minting for a
     // vault or direct session would hand out a grant nothing can redeem it into.
-    let visibility: String =
+    let visibility: Option<String> =
         sqlx::query_scalar("SELECT visibility FROM terminal_sessions WHERE id = $1")
             .bind(session_id)
-            .fetch_one(&pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if visibility != "invite_link" {
-        return Err(StatusCode::FORBIDDEN);
+    match visibility {
+        Some(v) if v == "invite_link" => {}
+        Some(_) => return Err(StatusCode::FORBIDDEN),
+        None => return Err(StatusCode::NOT_FOUND),
     }
 
     let (code, expires_at) = session_grants::rotate_short_code(&pool, session_id, auth.0)
@@ -80,6 +82,8 @@ pub async fn redeem_code(
     };
 
     let secret = session_grants::new_token_secret();
+    // expires_at: None — the guest grant outlives the 10-minute code; it ends
+    // only by revoke or session end, same as any other invited participant.
     session_grants::insert_grant(
         &pool,
         grant.session_id,
@@ -146,6 +150,27 @@ mod tests {
         )
         .await
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn minting_for_an_ended_session_is_not_found_not_a_crash() {
+        let pool = test_pool_or_skip!();
+        let (host, session) = seed_host_and_session(&pool).await;
+        sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = create_code(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(code_budget()),
+            Path(session),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
