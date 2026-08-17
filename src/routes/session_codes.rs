@@ -8,7 +8,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::rate_limit::{RedeemRateLimiter, SessionCodeRateLimiter};
+use crate::rate_limit::{check_user_budget, RedeemRateLimiter, SessionCodeRateLimiter};
 use crate::session_grants;
 
 #[derive(Debug, Serialize)]
@@ -34,9 +34,7 @@ pub async fn create_code(
     Extension(SessionCodeRateLimiter(limiter)): Extension<SessionCodeRateLimiter>,
     Path(session_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<CreateCodeResponse>), StatusCode> {
-    if !limiter.check(auth.0).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    check_user_budget(&limiter, auth.0, "session_code_mint").await?;
     crate::routes::terminal::require_active_session_host(&pool, session_id, auth.0).await?;
 
     // Only invite_link sessions serve raw keys through the short-code/grant
@@ -70,9 +68,7 @@ pub async fn redeem_code(
     Extension(RedeemRateLimiter(limiter)): Extension<RedeemRateLimiter>,
     Json(body): Json<RedeemRequest>,
 ) -> Result<Json<RedeemResponse>, StatusCode> {
-    if !limiter.check(auth.0).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    check_user_budget(&limiter, auth.0, "session_code_redeem").await?;
 
     // Unknown, malformed, expired and revoked all answer 404: no response
     // distinguishes a real code from a wrong one.
@@ -84,13 +80,15 @@ pub async fn redeem_code(
     let secret = session_grants::new_token_secret();
     // expires_at: None — the guest grant outlives the 10-minute code; it ends
     // only by revoke or session end, same as any other invited participant.
+    // created_by is the session's host, not the redeeming guest, so host-facing
+    // tooling filtering by created_by still finds these grants.
     session_grants::insert_grant(
         &pool,
         grant.session_id,
         "guest",
         &secret,
         None,
-        auth.0,
+        grant.host_user_id,
         Some(auth.0),
     )
     .await
@@ -133,14 +131,17 @@ mod tests {
         let (host, session) = seed_host_and_session(&pool).await;
         let (stranger, _) = seed_host_and_session(&pool).await;
 
-        assert!(create_code(
-            State(pool.clone()),
-            Extension(AuthUser(stranger)),
-            Extension(code_budget()),
-            Path(session),
-        )
-        .await
-        .is_err());
+        assert_eq!(
+            create_code(
+                State(pool.clone()),
+                Extension(AuthUser(stranger)),
+                Extension(code_budget()),
+                Path(session),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
 
         assert!(create_code(
             State(pool.clone()),
@@ -224,10 +225,47 @@ mod tests {
 
         assert_eq!(redeemed.session_id, session);
         assert!(
-            crate::session_grants::resolve_join_grant(&pool, session, &redeemed.invite_token)
-                .await
-                .is_some()
+            crate::session_grants::resolve_join_grant(&pool, session, &redeemed.invite_token).await
         );
+    }
+
+    #[tokio::test]
+    async fn a_redeemed_guest_grant_is_attributed_to_the_host_not_the_guest() {
+        // Host-facing tooling filters grants by created_by; attributing the row
+        // to the redeeming guest would make it invisible there.
+        let pool = test_pool_or_skip!();
+        let (host, session) = seed_host_and_session(&pool).await;
+        let (guest, _) = seed_host_and_session(&pool).await;
+
+        let (_, Json(minted)) = create_code(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(code_budget()),
+            Path(session),
+        )
+        .await
+        .unwrap();
+
+        let _: Json<RedeemResponse> = redeem_code(
+            State(pool.clone()),
+            Extension(AuthUser(guest)),
+            Extension(redeem_budget()),
+            Json(RedeemRequest {
+                code: minted.code.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let created_by: Uuid = sqlx::query_scalar(
+            "SELECT created_by FROM terminal_session_grants \
+             WHERE session_id = $1 AND kind = 'guest'",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(created_by, host);
     }
 
     #[tokio::test]

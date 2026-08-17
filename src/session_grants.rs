@@ -55,10 +55,6 @@ pub fn new_token_secret() -> String {
 
 pub const SHORT_CODE_TTL_MINUTES: i64 = 10;
 
-pub struct Grant {
-    pub session_id: Uuid,
-}
-
 /// Generic over the executor so a caller can run this inside its own
 /// transaction (e.g. alongside the session INSERT it must not outlive) or
 /// just pass a `&PgPool` for a standalone grant.
@@ -90,31 +86,38 @@ where
     .map(|_| ())
 }
 
-/// Kind-agnostic: a live grant is a live grant. Short codes never travel this
-/// path — they are redeemed at their own endpoint — so the secret is hashed raw.
-pub async fn resolve_join_grant(pool: &PgPool, session_id: Uuid, presented: &str) -> Option<Grant> {
-    sqlx::query_as::<_, (Uuid,)>(
-        "SELECT g.session_id \
-         FROM terminal_session_grants g \
-         JOIN terminal_sessions ts ON ts.id = g.session_id \
-         WHERE g.session_id = $1 AND g.secret_hash = $2 \
-           AND g.revoked_at IS NULL \
-           AND (g.expires_at IS NULL OR g.expires_at > now()) \
-           AND ts.ended_at IS NULL",
+/// Excludes `short_code`: that kind is only ever redeemed at its own endpoint
+/// (POST .../redeem), which mints a distinct, revocable `guest` grant and
+/// counts against its own limiter. Letting a spoken code resolve here would
+/// let a guest skip both.
+pub async fn resolve_join_grant(pool: &PgPool, session_id: Uuid, presented: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+           SELECT 1 FROM terminal_session_grants g \
+           JOIN terminal_sessions ts ON ts.id = g.session_id \
+           WHERE g.session_id = $1 AND g.secret_hash = $2 \
+             AND g.kind <> 'short_code' \
+             AND g.revoked_at IS NULL \
+             AND (g.expires_at IS NULL OR g.expires_at > now()) \
+             AND ts.ended_at IS NULL \
+         )",
     )
     .bind(session_id)
     .bind(hash_secret(presented))
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await
-    .ok()
-    .flatten()
-    .map(|(session_id,)| Grant { session_id })
+    .unwrap_or(false)
 }
 
-pub async fn resolve_short_code(pool: &PgPool, code: &str) -> Option<Grant> {
+pub struct ShortCodeGrant {
+    pub session_id: Uuid,
+    pub host_user_id: Uuid,
+}
+
+pub async fn resolve_short_code(pool: &PgPool, code: &str) -> Option<ShortCodeGrant> {
     let normalized = normalize_short_code(code)?;
-    sqlx::query_as::<_, (Uuid,)>(
-        "SELECT g.session_id \
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT g.session_id, ts.host_user_id \
          FROM terminal_session_grants g \
          JOIN terminal_sessions ts ON ts.id = g.session_id \
          WHERE g.secret_hash = $1 AND g.kind = 'short_code' \
@@ -126,7 +129,10 @@ pub async fn resolve_short_code(pool: &PgPool, code: &str) -> Option<Grant> {
     .await
     .ok()
     .flatten()
-    .map(|(session_id,)| Grant { session_id })
+    .map(|(session_id, host_user_id)| ShortCodeGrant {
+        session_id,
+        host_user_id,
+    })
 }
 
 pub async fn rotate_short_code(
@@ -139,6 +145,13 @@ pub async fn rotate_short_code(
     let expires_at = Utc::now() + Duration::minutes(SHORT_CODE_TTL_MINUTES);
 
     let mut tx = pool.begin().await?;
+    // Serializes overlapping regenerate calls for the same session: under READ
+    // COMMITTED two concurrent revoke+insert pairs can both pass the revoking
+    // UPDATE, and the loser's INSERT then trips idx_tsg_one_live_code.
+    sqlx::query("SELECT id FROM terminal_sessions WHERE id = $1 FOR UPDATE")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
     // No expiry condition: an expired-but-unrevoked row still occupies the
     // partial unique index, so it has to be swept too.
     sqlx::query(
@@ -169,51 +182,13 @@ pub async fn rotate_short_code(
 mod tests {
     use super::*;
     use crate::test_pool_or_skip;
-    use crate::test_support::{seed_session, seed_team, seed_user};
+    use crate::test_support::{seed_session, seed_user};
     use uuid::Uuid;
 
     async fn seed_host_and_session(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
         let host = seed_user(pool).await;
         let session = seed_session(pool, host, "invite_link").await;
         (host, session)
-    }
-
-    #[tokio::test]
-    async fn backfill_creates_a_legacy_grant_for_a_live_invite_link_session() {
-        let pool = test_pool_or_skip!();
-
-        let host = seed_user(&pool).await;
-        let team = seed_team(&pool, host).await;
-        // invite_token is UNIQUE; the throwaway DB persists across test runs.
-        let token = format!("fake-legacy-token-{}", Uuid::new_v4());
-
-        let session: Uuid = sqlx::query_scalar(
-            "INSERT INTO terminal_sessions (team_id, host_user_id, connection_name, visibility, invite_token) \
-             VALUES ($1, $2, 'box', 'invite_link', $3) RETURNING id",
-        )
-        .bind(team)
-        .bind(host)
-        .bind(&token)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        // The migration already ran for pre-existing rows; this row is newer, so
-        // apply the same expression the migration uses to prove it matches.
-        let matches: bool = sqlx::query_scalar(
-            "SELECT sha256(convert_to($1, 'UTF8')) = sha256(convert_to(invite_token, 'UTF8')) \
-             FROM terminal_sessions WHERE id = $2",
-        )
-        .bind(&token)
-        .bind(session)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert!(
-            matches,
-            "migration hash expression must match the stored token"
-        );
     }
 
     /// The deploy-day case: an already-live session whose grant only exists
@@ -245,7 +220,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            resolve_join_grant(&pool, session, &token).await.is_some(),
+            resolve_join_grant(&pool, session, &token).await,
             "SQL-side and Rust-side hashing must agree on deploy day"
         );
     }
@@ -319,12 +294,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resolve_join_grant(&pool, session, &secret).await.is_some());
-        assert!(
-            resolve_join_grant(&pool, session, "fake-grant-secret-wrong")
-                .await
-                .is_none()
-        );
+        assert!(resolve_join_grant(&pool, session, &secret).await);
+        assert!(!resolve_join_grant(&pool, session, "fake-grant-secret-wrong").await);
     }
 
     #[tokio::test]
@@ -360,12 +331,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resolve_join_grant(&pool, session, &expired).await.is_none());
-        assert!(resolve_join_grant(&pool, session, &revoked).await.is_none());
+        assert!(!resolve_join_grant(&pool, session, &expired).await);
+        assert!(!resolve_join_grant(&pool, session, &revoked).await);
         assert!(
-            resolve_join_grant(&pool, other_session, &live)
-                .await
-                .is_none(),
+            !resolve_join_grant(&pool, other_session, &live).await,
             "a grant must not resolve against a different session"
         );
 
@@ -375,7 +344,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            resolve_join_grant(&pool, session, &live).await.is_none(),
+            !resolve_join_grant(&pool, session, &live).await,
             "an ended session must admit nobody"
         );
     }
@@ -426,6 +395,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(live, 1, "exactly one live short code per session");
+    }
+
+    #[tokio::test]
+    async fn sequential_rotations_each_succeed_and_leave_one_live_row() {
+        // The concurrent case (two overlapping transactions racing the FOR
+        // UPDATE lock) is the live gate's job; this only proves the happy path
+        // still works and still converges to one live row.
+        let pool = test_pool_or_skip!();
+        let (host, session) = seed_host_and_session(&pool).await;
+
+        assert!(rotate_short_code(&pool, session, host).await.is_ok());
+        assert!(rotate_short_code(&pool, session, host).await.is_ok());
+
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terminal_session_grants \
+             WHERE session_id = $1 AND kind = 'short_code' AND revoked_at IS NULL",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 1);
     }
 
     #[tokio::test]

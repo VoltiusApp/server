@@ -970,10 +970,7 @@ pub async fn get_my_session_key(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-        if crate::session_grants::resolve_join_grant(&pool, session_id, token)
-            .await
-            .is_none()
-        {
+        if !crate::session_grants::resolve_join_grant(&pool, session_id, token).await {
             return Err(StatusCode::FORBIDDEN);
         }
 
@@ -1277,9 +1274,7 @@ pub(crate) async fn is_authorized_participant(
         let Some(presented) = presented_token else {
             return false;
         };
-        return crate::session_grants::resolve_join_grant(pool, session_id, presented)
-            .await
-            .is_some();
+        return crate::session_grants::resolve_join_grant(pool, session_id, presented).await;
     }
     // Vault session: user must be a member of one of the session's vaults,
     // satisfy the role filter (if any), and have JOIN_TERMINAL_SESSION permission.
@@ -1970,9 +1965,7 @@ mod authz_tests {
         assert_eq!(grant_kind, "legacy_token");
 
         assert!(
-            crate::session_grants::resolve_join_grant(&pool, body.session_id, &token)
-                .await
-                .is_some(),
+            crate::session_grants::resolve_join_grant(&pool, body.session_id, &token).await,
             "the token an old client already holds must keep resolving"
         );
     }
@@ -3110,5 +3103,131 @@ mod tests {
             .await,
             "a different guest's grant on the same session must keep working"
         );
+    }
+
+    #[tokio::test]
+    async fn a_short_code_does_not_work_as_an_invite_token() {
+        // A guest holding the spoken code must go through /redeem — resolving
+        // it directly would skip minting a guest row and bypass that
+        // endpoint's own rate limiter.
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        let session = seed_session(&pool, host, "invite_link").await;
+
+        sqlx::query("UPDATE terminal_sessions SET session_key_bytes = 'fake-key-bytes' WHERE id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (code, _) = crate::session_grants::rotate_short_code(&pool, session, host)
+            .await
+            .unwrap();
+        let normalized = crate::session_grants::normalize_short_code(&code).unwrap();
+
+        // SessionKeyResponse derives only Serialize, so unwrap_err() (which
+        // requires Ok: Debug) doesn't compile here; match on Err directly.
+        let res = get_my_session_key(
+            State(pool.clone()),
+            Extension(AuthUser(guest)),
+            axum::extract::Path(session),
+            axum::extract::Query(GetKeyQuery {
+                invite_token: Some(normalized.clone()),
+            }),
+        )
+        .await;
+        assert!(matches!(res, Err(StatusCode::FORBIDDEN)));
+
+        assert!(
+            !is_authorized_participant(
+                &pool, session, guest, host, "invite_link", &[], &[],
+                Some(normalized.as_str()),
+                &std::collections::HashSet::new(),
+            )
+            .await
+        );
+
+        // The secret minted by an actual redemption of that same code succeeds
+        // at both.
+        let Json(redeemed) = crate::routes::session_codes::redeem_code(
+            State(pool.clone()),
+            Extension(AuthUser(guest)),
+            Extension(crate::rate_limit::RedeemRateLimiter(
+                crate::rate_limit::RateLimiter::new(20, std::time::Duration::from_secs(3600)),
+            )),
+            Json(crate::routes::session_codes::RedeemRequest { code }),
+        )
+        .await
+        .unwrap();
+
+        let key = get_my_session_key(
+            State(pool.clone()),
+            Extension(AuthUser(guest)),
+            axum::extract::Path(session),
+            axum::extract::Query(GetKeyQuery {
+                invite_token: Some(redeemed.invite_token.clone()),
+            }),
+        )
+        .await
+        .expect("the redeemed secret must unlock the key endpoint");
+        assert!(key.0.raw_key.is_some());
+
+        assert!(
+            is_authorized_participant(
+                &pool, session, guest, host, "invite_link", &[], &[],
+                Some(redeemed.invite_token.as_str()),
+                &std::collections::HashSet::new(),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ended_session_is_not_found_regardless_of_the_token() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        let session = seed_session(&pool, host, "invite_link").await;
+        sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let res = get_my_session_key(
+            State(pool.clone()),
+            Extension(AuthUser(guest)),
+            axum::extract::Path(session),
+            axum::extract::Query(GetKeyQuery {
+                invite_token: Some(format!("fake-token-{}", Uuid::new_v4())),
+            }),
+        )
+        .await;
+        assert!(matches!(res, Err(StatusCode::NOT_FOUND)));
+    }
+
+    #[tokio::test]
+    async fn a_live_session_with_a_wrong_token_is_forbidden_not_not_found() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        let session = seed_session(&pool, host, "invite_link").await;
+        sqlx::query("UPDATE terminal_sessions SET session_key_bytes = 'fake-key-bytes' WHERE id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let res = get_my_session_key(
+            State(pool.clone()),
+            Extension(AuthUser(guest)),
+            axum::extract::Path(session),
+            axum::extract::Query(GetKeyQuery {
+                invite_token: Some(format!("fake-wrong-token-{}", Uuid::new_v4())),
+            }),
+        )
+        .await;
+        assert!(matches!(res, Err(StatusCode::FORBIDDEN)));
     }
 }

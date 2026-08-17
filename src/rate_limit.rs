@@ -122,6 +122,20 @@ pub async fn register_rate_limit(
     Ok(next.run(req).await)
 }
 
+/// Checks a per-user limiter, warning and returning 429 on exhaustion. The
+/// one place this shape is expressed; middlewares and handlers alike call it.
+pub async fn check_user_budget(
+    limiter: &RateLimiter<Uuid>,
+    user: Uuid,
+    label: &str,
+) -> Result<(), StatusCode> {
+    if !limiter.check(user).await {
+        warn!(user_id = %user, limiter = label, "Rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(())
+}
+
 /// Shared body for the per-user middlewares below: check the limiter keyed on
 /// the authenticated caller, or reject with 429.
 async fn user_keyed_limit(
@@ -131,10 +145,7 @@ async fn user_keyed_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if !limiter.check(user).await {
-        warn!(user_id = %user, limiter = label, "Rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    check_user_budget(limiter, user, label).await?;
     Ok(next.run(req).await)
 }
 
