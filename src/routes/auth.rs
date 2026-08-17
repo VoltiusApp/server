@@ -464,13 +464,17 @@ pub struct VerifyEmailRequest {
 #[derive(Serialize)]
 pub struct VerifyEmailResponse {
     pub email: String,
+    /// Lets the portal build `voltius://verified?u=…` so the app can refresh the
+    /// right account. This is `users.id`, not the client's `account_id` — that
+    /// one is a KDF salt and must never leave the device.
+    pub user_id: Uuid,
 }
 
 pub async fn verify_email(
     State(pool): State<PgPool>,
     Json(body): Json<VerifyEmailRequest>,
 ) -> Result<Json<VerifyEmailResponse>, StatusCode> {
-    let email = sqlx::query_scalar::<_, String>(
+    let verified = sqlx::query_as::<_, (String, Uuid)>(
         "WITH consumed AS (
            UPDATE email_verification_tokens
            SET consumed_at = now()
@@ -481,7 +485,7 @@ pub async fn verify_email(
          SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now())
          FROM consumed
          WHERE users.id = consumed.user_id
-         RETURNING users.email",
+         RETURNING users.email, users.id",
     )
     .bind(&body.token)
     .fetch_optional(&pool)
@@ -491,9 +495,9 @@ pub async fn verify_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if let Some(email) = email {
+    if let Some((email, user_id)) = verified {
         info!(email = %email, "User email verified");
-        return Ok(Json(VerifyEmailResponse { email }));
+        return Ok(Json(VerifyEmailResponse { email, user_id }));
     }
 
     let token_status = sqlx::query_as::<_, (DateTime<Utc>, Option<DateTime<Utc>>)>(
