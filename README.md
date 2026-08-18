@@ -4,6 +4,8 @@ Axum/Rust API server for Voltius. Licensed under **AGPLv3** — see [LICENSE](./
 
 ## Self-Hosting
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/voltius-server?referralCode=_euqa6&utm_medium=integration&utm_source=template&utm_campaign=voltius-server)
+
 ```bash
 cp .env.example .env
 # Edit .env with your values
