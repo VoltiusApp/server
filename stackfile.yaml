@@ -1,0 +1,26 @@
+name: server
+
+resources:
+    server:
+        build:
+            repo: https://github.com/VoltiusApp/server.git
+            branch: main
+            dockerfile: Dockerfile
+            context: .
+        ports:
+            - name: http
+              port: 8080
+              protocol: HTTP
+              public: true
+        env:
+            PORT: "8080"
+            RUST_LOG: info
+        secrets:
+            app-secrets:
+                JWT_SECRET: JWT_SECRET
+        addons:
+            voltius-db:
+                type: postgres
+                database: voltius
+                env:
+                    DATABASE_URL: "{{ url }}"
