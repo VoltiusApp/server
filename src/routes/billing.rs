@@ -213,6 +213,10 @@ async fn fetch_current_subscription_id(pool: &PgPool, user_id: Uuid) -> Result<S
     row.0.ok_or(StatusCode::NOT_FOUND)
 }
 
+// `Response` in the Err slot is the point: these handlers answer with a typed
+// JSON error body, not a bare status. Boxing it, as the lint suggests, would
+// cost the `IntoResponse` impl axum requires of a handler's error type.
+#[allow(clippy::result_large_err)]
 pub async fn create_checkout(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,

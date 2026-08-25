@@ -124,6 +124,10 @@ pub(crate) async fn claim_handle_inner(
     Ok(())
 }
 
+// `Response` in the Err slot is the point: these handlers answer with a typed
+// JSON error body, not a bare status. Boxing it, as the lint suggests, would
+// cost the `IntoResponse` impl axum requires of a handler's error type.
+#[allow(clippy::result_large_err)]
 pub async fn claim_handle(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
