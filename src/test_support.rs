@@ -145,6 +145,46 @@ pub async fn seed_team(pool: &PgPool, owner: Uuid) -> Uuid {
     id
 }
 
+/// Seed a team's builtin roles exactly as `create_team` does. `seed_team`
+/// writes only the `teams` row, so any test whose code path assigns a builtin
+/// role (invitation acceptance, grant redemption) needs these rows present.
+pub async fn seed_builtin_roles(pool: &PgPool, team: Uuid) {
+    for (name, permissions, position) in crate::permissions::BUILTIN_ROLES {
+        sqlx::query(
+            "INSERT INTO team_roles (team_id, name, permissions, is_builtin, position)
+             VALUES ($1, $2, $3, TRUE, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(team)
+        .bind(*name)
+        .bind(*permissions)
+        .bind(*position)
+        .execute(pool)
+        .await
+        .expect("seed builtin roles");
+    }
+}
+
+/// A team the way `create_team` leaves it: builtin roles seeded, the owner a
+/// member, and the owner holding the builtin `owner` role. `seed_team` alone
+/// gives none of that, so any test whose code path reads permissions or
+/// assigns a builtin role needs this instead.
+pub async fn seed_team_with_roles(pool: &PgPool, owner: Uuid) -> Uuid {
+    let team = seed_team(pool, owner).await;
+    seed_builtin_roles(pool, team).await;
+    add_member(pool, team, owner).await;
+    sqlx::query(
+        "INSERT INTO team_member_roles (team_id, user_id, role_id)
+         SELECT $1, $2, id FROM team_roles
+         WHERE team_id = $1 AND name = 'owner' AND is_builtin = TRUE",
+    )
+    .bind(team)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("assign owner role");
+    team
+}
+
 /// Insert a role with the given permission bits and return its id.
 pub async fn seed_role(pool: &PgPool, team: Uuid, name: &str, permissions: i64) -> Uuid {
     let id = Uuid::new_v4();

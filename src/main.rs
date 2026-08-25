@@ -11,6 +11,7 @@ mod rate_limit;
 mod routes;
 mod self_host;
 mod session_grants;
+mod team_join_grants;
 mod sync_notifier;
 mod terminal_manager;
 #[cfg(test)]
@@ -23,8 +24,9 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    InviteRateLimiter, KnockRateLimiter, RateLimiter, RedeemRateLimiter, RegisterRateLimiter,
-    SearchRateLimiter, SessionCodeRateLimiter, SyncRateLimiter, WaitlistRateLimiter,
+    GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
+    RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
+    SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
 use std::net::SocketAddr;
@@ -184,6 +186,10 @@ async fn main() {
         SessionCodeRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
     let redeem_limiter =
         RedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
+    let grant_mint_limiter =
+        GrantMintRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
+    let grant_redeem_limiter =
+        GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -379,6 +385,27 @@ async fn main() {
             "/v1/teams/:team_id/roles/:role_id",
             delete(routes::teams::delete_role),
         )
+        // Team join grants (link-borne membership; never vault access)
+        .route(
+            "/v1/teams/:team_id/grants",
+            post(routes::team_grants::create_grant),
+        )
+        .route(
+            "/v1/teams/:team_id/grants",
+            get(routes::team_grants::list_grants),
+        )
+        .route(
+            "/v1/teams/:team_id/grants/:grant_id",
+            delete(routes::team_grants::revoke_grant),
+        )
+        .route(
+            "/v1/grants/:grant_id/preview",
+            post(routes::team_grants::preview_grant),
+        )
+        .route(
+            "/v1/grants/:grant_id/redeem",
+            post(routes::team_grants::redeem_grant),
+        )
         // Team vault sync
         .route(
             "/v1/teams/:team_id/vault-key",
@@ -511,6 +538,8 @@ async fn main() {
         .layer(Extension(knock_limiter))
         .layer(Extension(session_code_limiter))
         .layer(Extension(redeem_limiter))
+        .layer(Extension(grant_mint_limiter))
+        .layer(Extension(grant_redeem_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
