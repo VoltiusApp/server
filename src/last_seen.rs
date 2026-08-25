@@ -111,7 +111,7 @@ mod tests {
         set_last_seen_days_ago(&pool, last_week, 10).await;
         let long_ago = seed_user(&pool).await;
         set_last_seen_days_ago(&pool, long_ago, 400).await;
-        let _unseen = seed_user(&pool).await; // last_seen_on stays NULL
+        let unseen = seed_user(&pool).await; // last_seen_on stays NULL
 
         let after = activity_counts(&pool).await.expect("counts");
 
@@ -121,9 +121,25 @@ mod tests {
             2,
             "today + 10-days-ago are 30d-active; 400-days-ago is not"
         );
+
+        // `never_seen` is the one bucket whose whole-table delta this test
+        // cannot own. LAST_SEEN_LOCK serializes everything that *writes* the
+        // column, but every `seed_user` anywhere in the suite inserts a row
+        // with `last_seen_on` NULL without holding it, and each one lands in
+        // this count. Assert the same predicate over exactly the four users
+        // seeded here, which says what the bucket means without depending on
+        // how many users the rest of the suite happens to create meanwhile.
+        let never_seen_among_ours = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FILTER (WHERE last_seen_on IS NULL) FROM users \
+             WHERE id = ANY($1) AND deleted_at IS NULL",
+        )
+        .bind(vec![today, last_week, long_ago, unseen])
+        .fetch_one(&pool)
+        .await
+        .expect("scoped never-seen count");
+
         assert_eq!(
-            after.never_seen - before.never_seen,
-            1,
+            never_seen_among_ours, 1,
             "the unstamped user counts as never seen, the 400-day one does not"
         );
     }

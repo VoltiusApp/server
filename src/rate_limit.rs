@@ -108,6 +108,17 @@ pub struct SessionCodeRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct RedeemRateLimiter(pub RateLimiter<Uuid>);
 
+/// Team join-grant mints per creator. A grant is unattended credential
+/// material, so minting is budgeted the same way short codes are.
+#[derive(Clone)]
+pub struct GrantMintRateLimiter(pub RateLimiter<Uuid>);
+
+/// Join-grant previews and redemptions per user. Kept separate from
+/// [`RedeemRateLimiter`] so exhausting one path cannot lock a user out of the
+/// other — they are different features that merely share a verb.
+#[derive(Clone)]
+pub struct GrantRedeemRateLimiter(pub RateLimiter<Uuid>);
+
 /// Register endpoint: N registrations/day per IP.
 pub async fn register_rate_limit(
     axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,

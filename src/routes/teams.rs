@@ -34,17 +34,54 @@ pub(crate) async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNo
     notify_team_members(pool, notifier, team_id, format!("team_members:{team_id}")).await;
 }
 
+// ─── Team owner and seat helpers ──────────────────────────────────────────────
+
+pub(crate) async fn team_owner(pool: &PgPool, team_id: Uuid) -> Result<Uuid, StatusCode> {
+    sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
+        .bind(team_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })
+}
+
+/// The owner's effective seat cap, or `None` when uncapped. An active trial
+/// clamps the cap to 10 however many seats were purchased.
+pub(crate) async fn owner_seat_cap(pool: &PgPool, owner_id: Uuid) -> Result<Option<i64>, StatusCode> {
+    let (seat_count, trial_ends_at) = sqlx::query_as::<_, (Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT seat_count, trial_ends_at FROM users WHERE id = $1",
+    )
+    .bind(owner_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    Ok(seat_count.map(|seats| {
+        let effective = if trial_ends_at.is_some() { seats.min(10) } else { seats };
+        effective as i64
+    }))
+}
+
+/// Distinct users occupying a seat across every team this owner owns.
+pub(crate) async fn owner_seats_used(pool: &PgPool, owner_id: Uuid) -> Result<i64, StatusCode> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT tm.user_id)
+         FROM team_members tm
+         JOIN teams t ON tm.team_id = t.id
+         WHERE t.owner_id = $1",
+    )
+    .bind(owner_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to count used seats"); StatusCode::INTERNAL_SERVER_ERROR })
+}
+
 // ─── Plan tier helper ─────────────────────────────────────────────────────────
 
 async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
     if self_host::is_self_hosted() {
         return Ok(());
     }
-    let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
-        .bind(team_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let owner_id = team_owner(pool, team_id).await?;
 
     let tier = sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
         .bind(owner_id)
@@ -1196,34 +1233,11 @@ pub async fn invite_member(
 
     let role = body.role.as_deref().unwrap_or("member").to_string();
 
-    let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
-        .bind(team_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let owner_id = team_owner(&pool, team_id).await?;
 
-    let (seat_count, trial_ends_at) = sqlx::query_as::<_, (Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT seat_count, trial_ends_at FROM users WHERE id = $1",
-    )
-    .bind(owner_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if let Some(seats) = seat_count {
-        let effective_cap = if trial_ends_at.is_some() { seats.min(10) } else { seats };
-        let used = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(DISTINCT tm.user_id)
-             FROM team_members tm
-             JOIN teams t ON tm.team_id = t.id
-             WHERE t.owner_id = $1",
-        )
-        .bind(owner_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to count used seats"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-        if used >= effective_cap as i64 {
+    if let Some(effective_cap) = owner_seat_cap(&pool, owner_id).await? {
+        let used = owner_seats_used(&pool, owner_id).await?;
+        if used >= effective_cap {
             warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached on invite");
             return Err(StatusCode::PAYMENT_REQUIRED);
         }
