@@ -44,6 +44,24 @@ async fn require_teams_tier_for_vault(pool: &PgPool, team_id: Uuid) -> Result<()
     }
 }
 
+/// Membership + Teams-tier + permission preamble shared by every team vault route.
+///
+/// `action` names the attempted operation so the non-member warning stays greppable.
+async fn require_vault_access(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+    action: &str,
+    permissions: &[i64],
+) -> Result<(), StatusCode> {
+    if !is_team_member(pool, team_id, user_id).await? {
+        warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_teams_tier_for_vault(pool, team_id).await?;
+    crate::permissions::require_all_team_permissions(pool, team_id, user_id, permissions).await
+}
+
 // ─── GET /v1/teams/:team_id/vault-key ────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -57,15 +75,11 @@ pub async fn get_my_vault_key(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<VaultKeyResponse>, StatusCode> {
-    if !is_team_member(&pool, team_id, auth.0).await? {
-        warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to get vault key");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(&pool, team_id).await?;
-    crate::permissions::require_all_team_permissions(
+    require_vault_access(
         &pool,
         team_id,
         auth.0,
+        "get_vault_key",
         &[crate::permissions::PERM_VIEW_SECRETS],
     )
     .await?;
@@ -106,15 +120,11 @@ pub async fn get_vault_key_holders(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<Uuid>>, StatusCode> {
-    if !is_team_member(&pool, team_id, auth.0).await? {
-        warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to list vault key holders");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(&pool, team_id).await?;
-    crate::permissions::require_all_team_permissions(
+    require_vault_access(
         &pool,
         team_id,
         auth.0,
+        "list_vault_key_holders",
         &[crate::permissions::PERM_VIEW_SECRETS],
     )
     .await?;
@@ -166,15 +176,11 @@ pub async fn put_vault_keys(
     Path(team_id): Path<Uuid>,
     Json(body): Json<PutVaultKeysRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    if !is_team_member(&pool, team_id, auth.0).await? {
-        warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to put vault keys");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(&pool, team_id).await?;
-    crate::permissions::require_all_team_permissions(
+    require_vault_access(
         &pool,
         team_id,
         auth.0,
+        "put_vault_keys",
         &[
             crate::permissions::PERM_VIEW_SECRETS,
             crate::permissions::PERM_COPY_SECRETS,
@@ -248,11 +254,17 @@ pub async fn get_team_blob(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<TeamBlobResponse>, StatusCode> {
-    if !is_team_member(&pool, team_id, auth.0).await? {
-        warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to get team blob");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(&pool, team_id).await?;
+    // The legacy blob carries every object AND every secret in one ciphertext, so
+    // reading it requires the same secret-level rights its writer does. Members
+    // without PERM_VIEW_SECRETS read the vault through the object routes instead.
+    require_vault_access(
+        &pool,
+        team_id,
+        auth.0,
+        "get_team_blob",
+        &[crate::permissions::PERM_VIEW_SECRETS],
+    )
+    .await?;
 
     let row = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>)>(
         "SELECT blob, updated_at FROM team_sync_blobs WHERE team_id = $1",
@@ -290,19 +302,14 @@ pub async fn put_team_blob(
     Path(team_id): Path<Uuid>,
     Json(body): Json<PutTeamBlobRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    if !is_team_member(&pool, team_id, auth.0).await? {
-        warn!(team_id = %team_id, user_id = %auth.0, "Non-member tried to put team blob");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(&pool, team_id).await?;
-
     // Legacy whole-blob writes can replace every object and secret in a team
     // vault. Keep this endpoint for migration/bootstrap, but require broad
     // rights so lower-privilege roles cannot bypass object-level routes.
-    crate::permissions::require_all_team_permissions(
+    require_vault_access(
         &pool,
         team_id,
         auth.0,
+        "put_team_blob",
         &[
             crate::permissions::PERM_EDIT_CONNECTIONS,
             crate::permissions::PERM_EDIT_IDENTITIES,
@@ -395,6 +402,7 @@ mod tests {
     // ─── GET /v1/teams/:team_id/vault-key/holders (issue #41) ────────────────
 
     use crate::auth::AuthUser;
+    use crate::permissions::PERM_CONNECT;
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, assign_role, seed_role, seed_team, seed_user};
     use axum::extract::{Path, State};
@@ -453,6 +461,60 @@ mod tests {
         let res = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
 
         assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    // ─── GET /v1/teams/:team_id/sync-blob (issue #187) ───────────────────────
+
+    async fn insert_team_blob(pool: &PgPool, team: Uuid, updated_by: Uuid) {
+        sqlx::query(
+            "INSERT INTO team_sync_blobs (team_id, blob, size_bytes, updated_by) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(team)
+        .bind(b"ciphertext".to_vec())
+        .bind(10_i32)
+        .bind(updated_by)
+        .execute(pool)
+        .await
+        .expect("insert team blob");
+    }
+
+    #[tokio::test]
+    async fn blob_forbidden_without_view_secrets_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        insert_team_blob(&pool, team, owner).await;
+
+        // connect-only: no PERM_VIEW_SECRETS, so the whole-vault ciphertext —
+        // which carries every secret — must stay out of reach.
+        let connect_only = seed_user(&pool).await;
+        add_member(&pool, team, connect_only).await;
+        let role = seed_role(&pool, team, "connect-only", PERM_CONNECT).await;
+        assign_role(&pool, team, connect_only, role).await;
+
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
+
+        // `.err()` rather than `unwrap_err()`: TeamBlobResponse has no Debug.
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn blob_readable_with_view_secrets_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        insert_team_blob(&pool, team, owner).await;
+
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("blob ok")
+            .0;
+
+        assert!(!res.blob.is_empty());
     }
 
     #[tokio::test]
