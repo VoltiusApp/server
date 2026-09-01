@@ -317,10 +317,14 @@ pub async fn register(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // `account_id` is deliberately absent: despite the name it is the KDF salt
+    // passed to derive_keys, so a log line carrying it hands anyone who can read
+    // the logs an offline precompute against that user's password. `user_id`
+    // identifies the registration, and the two are joinable in the database.
     if trial_blocked {
-        info!(user_id = %user_id, account_id = %body.account_id, "User registered on free tier (trial already used)");
+        info!(user_id = %user_id, "User registered on free tier (trial already used)");
     } else {
-        info!(user_id = %user_id, account_id = %body.account_id, "User registered with 14-day trial");
+        info!(user_id = %user_id, "User registered with 14-day trial");
     }
 
     Ok((
