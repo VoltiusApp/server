@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::permissions::{
-    require_all_team_permissions, require_team_member, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS,
-    PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS,
+    require_all_team_permissions, require_team_member, require_team_permissions, PermCheck,
+    PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
+    PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS,
 };
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
@@ -281,7 +282,16 @@ pub async fn list_secrets(
     Extension(auth): Extension<AuthUser>,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<TeamSecretResponse>>, StatusCode> {
-    require_all_team_permissions(&pool, team_id, auth.0, &[PERM_VIEW_SECRETS]).await?;
+    // Ciphertext only, and useless without the vault key, which is gated the
+    // same way. A connect-only member fetches these to *use* a credential;
+    // VIEW_SECRETS is what lets a member read one back (issue #190).
+    require_team_permissions(
+        &pool,
+        team_id,
+        auth.0,
+        PermCheck::Any(&[PERM_CONNECT, PERM_VIEW_SECRETS]),
+    )
+    .await?;
 
     let rows = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>)>(
         r#"SELECT secret_id, object_id, secret_type, ciphertext, updated_at
@@ -406,7 +416,7 @@ pub async fn delete_secret(
 mod authz_tests {
     use super::*;
     use crate::auth::AuthUser;
-    use crate::permissions::{PERM_EDIT_CONNECTIONS, PERM_VIEW_SECRETS};
+    use crate::permissions::{PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS};
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
     use crate::test_support::{member_with_role, seed_team, seed_user};
@@ -669,6 +679,41 @@ mod authz_tests {
         .await
         .expect("seed secret");
         secret_id
+    }
+
+    // ─── GET /v1/teams/:team_id/secrets (issue #190) ─────────────────────────
+
+    #[tokio::test]
+    async fn list_secrets_ok_with_only_connect_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let secret_id = seed_secret(&pool, team, &object_id).await;
+        // A connect-only member reads ciphertext to *use* a credential. Denying
+        // it left the role unable to connect to any host with a stored secret.
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team))
+            .await
+            .expect("list secrets ok")
+            .0;
+
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].secret_id, secret_id);
+    }
+
+    #[tokio::test]
+    async fn list_secrets_forbidden_without_connect_or_view_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Edit rights on snippets grant neither bit.
+        let caller = member_with_role(&pool, team, PERM_EDIT_SNIPPETS).await;
+
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
 
     async fn secret_exists(pool: &PgPool, team: Uuid, secret_id: &str) -> bool {

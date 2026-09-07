@@ -86,18 +86,48 @@ pub async fn has_team_permission(
     Ok((effective_permissions(pool, team_id, user_id).await? & permission) != 0)
 }
 
+/// How a set of permission bits is matched against a member's effective bits.
+///
+/// Most routes name one capability and want `All`. A route several distinct
+/// roles legitimately reach — the team vault key, which a connect-only member
+/// needs to *use* a stored credential and a secrets viewer to *read* it — wants
+/// `Any` (issue #190).
+#[derive(Clone, Copy)]
+pub enum PermCheck<'a> {
+    All(&'a [i64]),
+    Any(&'a [i64]),
+}
+
+impl PermCheck<'_> {
+    fn satisfied_by(self, effective: i64) -> bool {
+        match self {
+            PermCheck::All(bits) => bits.iter().all(|p| (effective & *p) != 0),
+            PermCheck::Any(bits) => bits.iter().any(|p| (effective & *p) != 0),
+        }
+    }
+}
+
+pub async fn require_team_permissions(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+    check: PermCheck<'_>,
+) -> Result<(), StatusCode> {
+    let effective = effective_permissions(pool, team_id, user_id).await?;
+    if check.satisfied_by(effective) {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
 pub async fn require_all_team_permissions(
     pool: &PgPool,
     team_id: Uuid,
     user_id: Uuid,
     permissions: &[i64],
 ) -> Result<(), StatusCode> {
-    let effective = effective_permissions(pool, team_id, user_id).await?;
-    if permissions.iter().all(|p| (effective & *p) != 0) {
-        Ok(())
-    } else {
-        Err(StatusCode::FORBIDDEN)
-    }
+    require_team_permissions(pool, team_id, user_id, PermCheck::All(permissions)).await
 }
 
 /// Returns true if the user is a member of the team.

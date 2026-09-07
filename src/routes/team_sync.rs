@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::permissions::is_team_member;
+use crate::permissions::{is_team_member, PermCheck};
 use crate::self_host;
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
@@ -52,14 +52,14 @@ async fn require_vault_access(
     team_id: Uuid,
     user_id: Uuid,
     action: &str,
-    permissions: &[i64],
+    check: PermCheck<'_>,
 ) -> Result<(), StatusCode> {
     if !is_team_member(pool, team_id, user_id).await? {
         warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
         return Err(StatusCode::FORBIDDEN);
     }
     require_teams_tier_for_vault(pool, team_id).await?;
-    crate::permissions::require_all_team_permissions(pool, team_id, user_id, permissions).await
+    crate::permissions::require_team_permissions(pool, team_id, user_id, check).await
 }
 
 // ─── GET /v1/teams/:team_id/vault-key ────────────────────────────────────────
@@ -80,7 +80,14 @@ pub async fn get_my_vault_key(
         team_id,
         auth.0,
         "get_vault_key",
-        &[crate::permissions::PERM_VIEW_SECRETS],
+        // A connect-only member needs the key to decrypt the credentials they
+        // are allowed to *use*; VIEW_SECRETS is what lets a member *read* one
+        // (issue #190). The whole-vault ciphertext stays VIEW_SECRETS-only —
+        // see `get_team_blob`.
+        PermCheck::Any(&[
+            crate::permissions::PERM_CONNECT,
+            crate::permissions::PERM_VIEW_SECRETS,
+        ]),
     )
     .await?;
 
@@ -125,7 +132,7 @@ pub async fn get_vault_key_holders(
         team_id,
         auth.0,
         "list_vault_key_holders",
-        &[crate::permissions::PERM_VIEW_SECRETS],
+        PermCheck::All(&[crate::permissions::PERM_VIEW_SECRETS]),
     )
     .await?;
 
@@ -181,10 +188,10 @@ pub async fn put_vault_keys(
         team_id,
         auth.0,
         "put_vault_keys",
-        &[
+        PermCheck::All(&[
             crate::permissions::PERM_VIEW_SECRETS,
             crate::permissions::PERM_COPY_SECRETS,
-        ],
+        ]),
     )
     .await?;
 
@@ -262,7 +269,7 @@ pub async fn get_team_blob(
         team_id,
         auth.0,
         "get_team_blob",
-        &[crate::permissions::PERM_VIEW_SECRETS],
+        PermCheck::All(&[crate::permissions::PERM_VIEW_SECRETS]),
     )
     .await?;
 
@@ -310,14 +317,14 @@ pub async fn put_team_blob(
         team_id,
         auth.0,
         "put_team_blob",
-        &[
+        PermCheck::All(&[
             crate::permissions::PERM_EDIT_CONNECTIONS,
             crate::permissions::PERM_EDIT_IDENTITIES,
             crate::permissions::PERM_EDIT_KEYS,
             crate::permissions::PERM_EDIT_FOLDERS,
             crate::permissions::PERM_VIEW_SECRETS,
             crate::permissions::PERM_COPY_SECRETS,
-        ],
+        ]),
     )
     .await?;
 
@@ -491,8 +498,7 @@ mod tests {
         // which carries every secret — must stay out of reach.
         let connect_only = seed_user(&pool).await;
         add_member(&pool, team, connect_only).await;
-        let role = seed_role(&pool, team, "connect-only", PERM_CONNECT).await;
-        assign_role(&pool, team, connect_only, role).await;
+        grant_connect_only(&pool, team, connect_only).await;
 
         let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
 
@@ -515,6 +521,86 @@ mod tests {
             .0;
 
         assert!(!res.blob.is_empty());
+    }
+
+    // ─── GET /v1/teams/:team_id/vault-key (issue #190) ───────────────────────
+
+    /// Give `user` a connect-only role: PERM_CONNECT and nothing else.
+    async fn grant_connect_only(pool: &PgPool, team: Uuid, user: Uuid) {
+        let role = seed_role(pool, team, "connect-only", PERM_CONNECT).await;
+        assign_role(pool, team, user, role).await;
+    }
+
+    #[tokio::test]
+    async fn vault_key_readable_with_connect_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+
+        // A connect-only member cannot use a stored credential without the key
+        // that decrypts it, so CONNECT alone must reach this route.
+        let connect_only = seed_user(&pool).await;
+        add_member(&pool, team, connect_only).await;
+        grant_connect_only(&pool, team, connect_only).await;
+        insert_vault_key(&pool, team, connect_only, owner).await;
+
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team))
+            .await
+            .expect("vault key ok")
+            .0;
+
+        assert_eq!(res.wrapped_key, "wrapped");
+        assert_eq!(res.wrapped_by_user_id, owner);
+    }
+
+    #[tokio::test]
+    async fn vault_key_forbidden_without_connect_or_view_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Member of the team but granted no roles → neither bit.
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        insert_vault_key(&pool, team, member, owner).await;
+
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await;
+
+        // `.err()` rather than `unwrap_err()`: VaultKeyResponse has no Debug.
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn vault_key_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
+
+        // `.err()` rather than `unwrap_err()`: VaultKeyResponse has no Debug.
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn blob_still_forbidden_for_connect_only_after_key_widening() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        insert_team_blob(&pool, team, owner).await;
+
+        // Widening the key route to CONNECT would be a whole-vault leak if the
+        // legacy blob followed it. It must not (issue #187, then #190).
+        let connect_only = seed_user(&pool).await;
+        add_member(&pool, team, connect_only).await;
+        grant_connect_only(&pool, team, connect_only).await;
+        insert_vault_key(&pool, team, connect_only, owner).await;
+
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
+
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
 
     #[tokio::test]
