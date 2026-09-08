@@ -1207,6 +1207,37 @@ mod authz_tests {
     }
 
     #[tokio::test]
+    async fn upsert_object_allowed_at_or_above_the_version_floor() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        // Exactly the floor — the boundary case worth pinning.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-version", "0.33.0".parse().unwrap());
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(Some((0, 33, 0)))),
+            headers,
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn list_objects_is_never_gated_by_version() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
