@@ -21,7 +21,13 @@ pub struct SubscriptionInfoResponse {
     pub cancelled: bool,
     pub renews_at: Option<i64>,
     pub ends_at: Option<i64>,
+    /// Seats purchased. What the buy-seats UI prices; NOT what invites enforce.
     pub seats: Option<i32>,
+    /// The cap invites actually enforce (`teams::owner_seat_cap`): an active
+    /// trial clamps it to 10 however many seats were purchased. `None` means
+    /// uncapped, so a client pre-check must not block. Kept alongside raw
+    /// `seats` so the UI can explain the gap during a trial.
+    pub effective_seats: Option<i64>,
     pub used_seats: Option<i64>,
     pub trial_ends_at: Option<i64>,
     pub has_ls_subscription: bool,
@@ -496,31 +502,21 @@ pub async fn get_subscription(
     })?;
 
     let tier = &row.0;
-    let used_seats = if tier == "teams" || tier == "business" {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(DISTINCT tm.user_id)
-             FROM team_members tm
-             JOIN teams t ON tm.team_id = t.id
-             WHERE t.owner_id = $1",
-        )
-        .bind(auth.0)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %auth.0, "Failed to count used seats");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        Some(count)
+    let is_team_tier = tier == "teams" || tier == "business";
+    // Both numbers come from the helpers the invite path enforces with, so the
+    // client pre-check and the server rejection agree.
+    let used_seats = if is_team_tier {
+        Some(crate::routes::teams::owner_seats_used(&pool, auth.0).await?)
+    } else {
+        None
+    };
+    let effective_seats = if is_team_tier {
+        crate::routes::teams::owner_seat_cap(&pool, auth.0).await?
     } else {
         None
     };
 
-    let tier = &row.0;
-    let seats = if (tier == "teams" || tier == "business") && row.2.is_none() {
-        Some(3)
-    } else {
-        row.2
-    };
+    let seats = if is_team_tier && row.2.is_none() { Some(3) } else { row.2 };
 
     Ok(Json(SubscriptionInfoResponse {
         tier: row.0,
@@ -529,6 +525,7 @@ pub async fn get_subscription(
         renews_at: row.6.map(|t| t.timestamp()),
         ends_at: row.7.map(|t| t.timestamp()),
         seats,
+        effective_seats,
         used_seats,
         trial_ends_at: row.1.map(|t| t.timestamp()),
         has_ls_subscription: row.3.is_some(),
@@ -709,7 +706,8 @@ mod tests {
             cancelled: false,
             renews_at: Some(1_780_272_000),
             ends_at: None,
-            seats: Some(3),
+            seats: Some(25),
+            effective_seats: Some(10),
             used_seats: Some(2),
             trial_ends_at: Some(1_777_680_000),
             has_ls_subscription: true,
@@ -722,9 +720,90 @@ mod tests {
         assert_eq!(serialized["cancelled"], false);
         assert_eq!(serialized["renews_at"], 1_780_272_000);
         assert_eq!(serialized["ends_at"], serde_json::Value::Null);
-        assert_eq!(serialized["seats"], 3);
+        assert_eq!(serialized["seats"], 25);
+        assert_eq!(serialized["effective_seats"], 10);
         assert_eq!(serialized["used_seats"], 2);
         assert_eq!(serialized["trial_ends_at"], 1_777_680_000);
         assert_eq!(serialized["has_ls_subscription"], true);
+    }
+}
+
+/// `/subscription-info` must report the cap the invite path enforces, not the
+/// raw purchased seat count — a trial owner who bought 25 seats is capped at 10,
+/// and a client pre-checking against 25 would send invites the server 402s.
+#[cfg(test)]
+mod seat_reporting_tests {
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{seed_team, seed_user, set_user_seats, set_user_tier, set_user_trial};
+    use axum::Extension;
+
+    async fn subscription_for(owner: Uuid, pool: PgPool) -> SubscriptionInfoResponse {
+        get_subscription(State(pool), Extension(AuthUser(owner)))
+            .await
+            .expect("subscription info")
+            .0
+    }
+
+    #[tokio::test]
+    async fn effective_seats_clamped_to_ten_during_trial() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        set_user_seats(&pool, owner, 25).await;
+        set_user_trial(&pool, owner, 7).await;
+
+        let info = subscription_for(owner, pool.clone()).await;
+
+        assert_eq!(info.seats, Some(25), "raw purchased seats stay on the wire");
+        assert_eq!(info.effective_seats, Some(10), "trial clamps the enforced cap");
+    }
+
+    #[tokio::test]
+    async fn effective_seats_matches_purchase_after_trial_ends() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        set_user_seats(&pool, owner, 25).await;
+
+        let info = subscription_for(owner, pool.clone()).await;
+
+        assert_eq!(info.effective_seats, Some(25));
+    }
+
+    #[tokio::test]
+    async fn used_seats_counts_every_team_the_owner_owns() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        set_user_seats(&pool, owner, 25).await;
+
+        // One member in each of two teams the same owner owns: two seats used.
+        for _ in 0..2 {
+            let team = seed_team(&pool, owner).await;
+            let member = seed_user(&pool).await;
+            sqlx::query("INSERT INTO team_members (team_id, user_id) VALUES ($1, $2)")
+                .bind(team)
+                .bind(member)
+                .execute(&pool)
+                .await
+                .expect("add member");
+        }
+
+        let info = subscription_for(owner, pool.clone()).await;
+
+        assert_eq!(info.used_seats, Some(2));
+    }
+
+    #[tokio::test]
+    async fn free_tier_reports_no_seat_numbers() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_seats(&pool, owner, 25).await;
+
+        let info = subscription_for(owner, pool.clone()).await;
+
+        assert_eq!(info.effective_seats, None);
+        assert_eq!(info.used_seats, None);
     }
 }

@@ -25,7 +25,7 @@ use crate::permissions::{require_all_team_permissions, PERM_INVITE_MEMBERS};
 use crate::rate_limit::{check_user_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
 use crate::routes::audit::write_audit_event;
 use crate::routes::invitations::admit_member;
-use crate::routes::teams::{notify_team_members_changed, owner_seat_cap, owner_seats_used, team_owner};
+use crate::routes::teams::{ensure_seat_available, notify_team_members_changed, team_owner};
 use crate::sync_notifier::SyncNotifier;
 use crate::team_join_grants::{self as grants, GrantRejection, GrantRow};
 
@@ -295,24 +295,18 @@ pub async fn redeem_grant(
     // other team of the same owner already occupies the seat, so those users
     // are exempt.
     let owner_id = team_owner(&pool, locked.team_id).await?;
-    if let Some(effective_cap) = owner_seat_cap(&pool, owner_id).await? {
-        let holds_a_seat = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM team_members tm JOIN teams t ON t.id = tm.team_id \
-             WHERE t.owner_id = $1 AND tm.user_id = $2)",
-        )
-        .bind(owner_id)
-        .bind(auth.0)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to check seat occupancy"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let holds_a_seat = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members tm JOIN teams t ON t.id = tm.team_id \
+         WHERE t.owner_id = $1 AND tm.user_id = $2)",
+    )
+    .bind(owner_id)
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check seat occupancy"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-        if !holds_a_seat {
-            let used = owner_seats_used(&pool, owner_id).await?;
-            if used >= effective_cap {
-                warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached on grant redemption");
-                return Err(StatusCode::PAYMENT_REQUIRED);
-            }
-        }
+    if !holds_a_seat {
+        ensure_seat_available(&pool, owner_id).await?;
     }
 
     // Validity and consumption are the same statement. Losing this race means

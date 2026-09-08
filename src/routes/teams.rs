@@ -75,6 +75,21 @@ pub(crate) async fn owner_seats_used(pool: &PgPool, owner_id: Uuid) -> Result<i6
     .map_err(|e| { error!(error = %e, "Failed to count used seats"); StatusCode::INTERNAL_SERVER_ERROR })
 }
 
+/// Reject with 402 when the owner has no seat left. The single enforcement
+/// point for every path that adds a member; `/subscription-info` reports the
+/// same cap as `effective_seats` so the client pre-check matches this one.
+pub(crate) async fn ensure_seat_available(pool: &PgPool, owner_id: Uuid) -> Result<(), StatusCode> {
+    let Some(effective_cap) = owner_seat_cap(pool, owner_id).await? else {
+        return Ok(());
+    };
+    let used = owner_seats_used(pool, owner_id).await?;
+    if used >= effective_cap {
+        warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached");
+        return Err(StatusCode::PAYMENT_REQUIRED);
+    }
+    Ok(())
+}
+
 // ─── Plan tier helper ─────────────────────────────────────────────────────────
 
 async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
@@ -395,38 +410,8 @@ pub async fn add_member(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let owner_id = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM teams WHERE id = $1")
-        .bind(team_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    let (seat_count, trial_ends_at) = sqlx::query_as::<_, (Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT seat_count, trial_ends_at FROM users WHERE id = $1",
-    )
-    .bind(owner_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if let Some(seats) = seat_count {
-        let effective_cap = if trial_ends_at.is_some() { seats.min(10) } else { seats };
-        let used = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(DISTINCT tm.user_id)
-             FROM team_members tm
-             JOIN teams t ON tm.team_id = t.id
-             WHERE t.owner_id = $1",
-        )
-        .bind(owner_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to count used seats"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-        if used >= effective_cap as i64 {
-            warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached");
-            return Err(StatusCode::PAYMENT_REQUIRED);
-        }
-    }
+    let owner_id = team_owner(&pool, team_id).await?;
+    ensure_seat_available(&pool, owner_id).await?;
 
     let role_name = body.role.as_deref().unwrap_or("member").to_string();
     const VALID_ROLES: &[&str] = &["owner", "manager", "editor", "member", "connect-only"];
@@ -1235,13 +1220,7 @@ pub async fn invite_member(
 
     let owner_id = team_owner(&pool, team_id).await?;
 
-    if let Some(effective_cap) = owner_seat_cap(&pool, owner_id).await? {
-        let used = owner_seats_used(&pool, owner_id).await?;
-        if used >= effective_cap {
-            warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached on invite");
-            return Err(StatusCode::PAYMENT_REQUIRED);
-        }
-    }
+    ensure_seat_available(&pool, owner_id).await?;
 
     let existing_user = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM users WHERE email = $1")
         .bind(&email)
