@@ -216,6 +216,85 @@ pub async fn upsert_object(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReencryptItem {
+    pub object_id: String,
+    pub metadata: serde_json::Value,
+}
+
+/// Rewrites the metadata blob of existing rows without touching `updated_at`
+/// or `updated_by`, and broadcasts once for the whole batch rather than per
+/// row. Used by the client's one-time pass that encrypts objects written
+/// before #229; a per-object loop through `upsert_object` would restamp the
+/// whole vault as edited and fan out one SSE event per object to every member.
+pub async fn reencrypt_objects(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
+    Path(team_id): Path<Uuid>,
+    Json(items): Json<Vec<ReencryptItem>>,
+) -> Result<StatusCode, StatusCode> {
+    if items.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    let ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
+
+    // The caller must be able to edit every type present in the batch. Types
+    // are read from the database, never from the request, so a caller cannot
+    // relabel a key as a connection to slip past the gate.
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = ANY($2)",
+    )
+    .bind(team_id)
+    .bind(&ids)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to read object types for re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut required: Vec<i64> = Vec::new();
+    for t in &types {
+        let perm = edit_permission_for_str(t).ok_or(StatusCode::BAD_REQUEST)?;
+        if !required.contains(&perm) {
+            required.push(perm);
+        }
+    }
+
+    require_all_team_permissions(&pool, team_id, auth.0, &required).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open re-encryption transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    for item in &items {
+        sqlx::query(
+            "UPDATE team_vault_objects SET metadata = $3 WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team_id)
+        .bind(&item.object_id)
+        .bind(&item.metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, object_id = %item.object_id, "Failed to re-encrypt object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn delete_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -877,5 +956,155 @@ mod authz_tests {
 
         assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
         assert!(!secret_exists(&pool, team, &secret_id).await);
+    }
+
+    // ── reencrypt_objects ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reencrypt_preserves_updated_at_and_updated_by() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let author = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let migrator = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(author)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before: (chrono::DateTime<chrono::Utc>, Uuid) = sqlx::query_as(
+            "SELECT updated_at, updated_by FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("obj-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(migrator)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "obj-1".to_string(),
+                metadata: serde_json::json!({ "v": 2, "enc": "Y2lwaGVy" }),
+            }]),
+        )
+        .await
+        .unwrap();
+
+        let after: (chrono::DateTime<chrono::Utc>, Uuid, serde_json::Value) = sqlx::query_as(
+            "SELECT updated_at, updated_by, metadata FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("obj-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after.0, before.0,
+            "re-encryption must not restamp updated_at"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "re-encryption must not reassign updated_by"
+        );
+        assert_eq!(after.2, serde_json::json!({ "v": 2, "enc": "Y2lwaGVy" }));
+    }
+
+    #[tokio::test]
+    async fn reencrypt_forbidden_when_batch_includes_an_uneditable_type() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Can edit connections, but NOT keys.
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        for (id, ty) in [
+            ("c1", TeamObjectType::Connection),
+            ("k1", TeamObjectType::Key),
+        ] {
+            sqlx::query(
+                "INSERT INTO team_vault_objects (team_id, object_id, object_type, vault_id, metadata, updated_by)
+                 VALUES ($1, $2, $3, $1, '{}'::jsonb, $4)",
+            )
+            .bind(team)
+            .bind(id)
+            .bind(ty.as_str())
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![
+                ReencryptItem {
+                    object_id: "c1".to_string(),
+                    metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+                },
+                ReencryptItem {
+                    object_id: "k1".to_string(),
+                    metadata: serde_json::json!({ "v": 2, "enc": "eQ==" }),
+                },
+            ]),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+
+        // And nothing was written — the batch is all-or-nothing.
+        let c1: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM team_vault_objects WHERE team_id = $1 AND object_id = 'c1'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            c1,
+            serde_json::json!({}),
+            "a rejected batch must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reencrypt_ignores_object_ids_not_in_this_team() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "does-not-exist".to_string(),
+                metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+            }]),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
     }
 }

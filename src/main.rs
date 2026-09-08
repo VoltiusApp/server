@@ -440,6 +440,10 @@ async fn main() {
             delete(routes::team_objects::delete_object),
         )
         .route(
+            "/v1/teams/:team_id/objects/reencrypt",
+            put(routes::team_objects::reencrypt_objects),
+        )
+        .route(
             "/v1/teams/:team_id/object_prefs",
             get(routes::team_object_prefs::list_object_prefs),
         )
