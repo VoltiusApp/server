@@ -1374,6 +1374,9 @@ pub struct PendingInvitation {
     pub invited_by_display_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// "pending" or "expired", derived here rather than on the client: the
+    /// client's clock is not the one the accept path checks against.
+    pub status: String,
 }
 
 pub async fn list_pending_invitations(
@@ -1401,7 +1404,6 @@ pub async fn list_pending_invitations(
            LEFT JOIN users invitee ON invitee.id = pi.user_id
            WHERE pi.team_id = $1
              AND pi.accepted_at IS NULL
-             AND pi.expires_at > now()
            ORDER BY pi.created_at DESC"#,
     )
     .bind(team_id)
@@ -1409,10 +1411,15 @@ pub async fn list_pending_invitations(
     .await
     .map_err(|e| { error!(error = %e, "Failed to list pending invitations"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
+    // Expired invitations stay in this list. Filtering them out left the admin
+    // unable to tell an invitation never sent from one that quietly lapsed;
+    // the accept path in invitations.rs still rejects them on its own.
+    let now = chrono::Utc::now();
     Ok(Json(
         rows.into_iter()
             .map(|(id, display_name, role, invited_by_display_name, created_at, expires_at)| PendingInvitation {
                 id, display_name, role, invited_by_display_name, created_at, expires_at,
+                status: if expires_at > now { "pending" } else { "expired" }.to_string(),
             })
             .collect(),
     ))
@@ -1726,6 +1733,38 @@ mod authz_tests {
         // No account means no handle, so the admin sees the address they typed.
         // This is what keeps a handle-only roster mappable back to a person.
         assert_eq!(pending[0].display_name, "nobody@example.com");
+    }
+
+    #[tokio::test]
+    async fn list_pending_invitations_includes_expired_ones() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_team_member(&pool, team, owner).await;
+
+        sqlx::query(
+            "INSERT INTO pending_invitations (team_id, email, role, invited_by, expires_at)
+             VALUES ($1, 'ana@example.com', 'member', $2, now() + interval '3 days'),
+                    ($1, 'bo@example.com',  'member', $2, now() - interval '1 day')",
+        )
+        .bind(team)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pending = list_pending_invitations(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("list pending invitations")
+            .0;
+
+        // An invitation nobody accepted used to vanish from this list, so the
+        // admin could not tell "never sent" from "sent and quietly expired".
+        assert_eq!(pending.len(), 2);
+        let ana = pending.iter().find(|p| p.display_name == "ana@example.com").unwrap();
+        let bo = pending.iter().find(|p| p.display_name == "bo@example.com").unwrap();
+        assert_eq!(ana.status, "pending");
+        assert_eq!(bo.status, "expired");
     }
 
     #[tokio::test]
