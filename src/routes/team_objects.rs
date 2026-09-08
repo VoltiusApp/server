@@ -234,6 +234,8 @@ pub async fn reencrypt_objects(
     Path(team_id): Path<Uuid>,
     Json(items): Json<Vec<ReencryptItem>>,
 ) -> Result<StatusCode, StatusCode> {
+    require_team_member(&pool, team_id, auth.0).await?;
+
     if items.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -1084,6 +1086,33 @@ mod authz_tests {
             serde_json::json!({}),
             "a rejected batch must write nothing"
         );
+    }
+
+    /// A non-member submitting only nonexistent object ids must not get a
+    /// `204` back — that would let anyone probe whether an object still
+    /// exists in a team they no longer belong to (batching makes this many
+    /// ids per request). Membership must be checked before the batch is
+    /// resolved against the database, not implied by an empty permission set.
+    #[tokio::test]
+    async fn reencrypt_forbidden_for_a_non_member_even_with_no_matching_objects() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await; // never added to team
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "does-not-exist".to_string(),
+                metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+            }]),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
