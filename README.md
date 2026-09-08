@@ -16,4 +16,6 @@ Listening on `http://0.0.0.0:14372` by default (override with `HOST_PORT` in `.e
 
 Business customers who self-host receive a **commercial license exception** alongside their subscription, allowing private modifications without AGPLv3 obligations. See [COMMERCIAL_LICENSE.md](./COMMERCIAL_LICENSE.md).
 
+All configuration knobs are documented inline in [`.env.example`](./.env.example), including `TEAM_OBJECTS_MIN_CLIENT_VERSION` — an opt-in floor below which clients are refused when *writing* team vault objects (reads are never gated). Leave it unset until your users have updated.
+
 Full self-hosting guide (env vars, reverse proxy, admin dashboard, updating) — [docs.voltius.app/self-hosting](https://docs.voltius.app/self-hosting/).

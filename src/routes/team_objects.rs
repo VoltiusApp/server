@@ -15,6 +15,7 @@ use crate::permissions::{
     PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
     PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS,
 };
+use crate::routes::client_version::{require_client_version, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -175,9 +176,13 @@ pub async fn upsert_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
     Json(body): Json<UpsertTeamObjectRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     require_all_team_permissions(
         &pool,
         team_id,
@@ -231,9 +236,13 @@ pub async fn reencrypt_objects(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
     Json(items): Json<Vec<ReencryptItem>>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     require_team_member(&pool, team_id, auth.0).await?;
 
     if items.is_empty() {
@@ -301,8 +310,12 @@ pub async fn delete_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path((team_id, object_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     let object_type = sqlx::query_scalar::<_, String>(
         "SELECT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
     )
@@ -408,9 +421,13 @@ pub async fn upsert_secret(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
     Json(body): Json<UpsertSecretRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     let object_type = sqlx::query_scalar::<_, String>(
         "SELECT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = $2 AND deleted_at IS NULL",
     )
@@ -462,8 +479,12 @@ pub async fn delete_secret(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path((team_id, secret_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     let secret_type = sqlx::query_scalar::<_, String>(
         "SELECT secret_type FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
     )
@@ -536,6 +557,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -561,6 +584,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-2".to_string(),
@@ -586,6 +611,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -634,6 +661,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: object_id.clone(),
@@ -670,6 +699,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(secret_body(&object_id)),
         )
@@ -692,6 +723,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(body),
         )
@@ -733,6 +766,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(body),
         )
@@ -755,6 +790,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -775,6 +812,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(secret_body("does-not-exist")),
         )
@@ -793,6 +832,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(body),
         )
@@ -860,6 +901,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -881,6 +924,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -911,6 +956,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -930,6 +977,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, "does-not-exist".to_string())),
         )
         .await;
@@ -952,6 +1001,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, object_id.clone())),
         )
         .await;
@@ -974,6 +1025,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(author)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -999,6 +1052,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(migrator)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "obj-1".to_string(),
@@ -1057,6 +1112,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(vec![
                 ReencryptItem {
@@ -1104,6 +1161,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(outsider)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "does-not-exist".to_string(),
@@ -1113,6 +1172,55 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // ── version floor ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_object_rejected_below_the_version_floor() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-version", "0.32.1".parse().unwrap());
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(Some((0, 33, 0)))),
+            headers,
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn list_objects_is_never_gated_by_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // A real team member — `seed_team` alone does not make `owner` one.
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        // No X-Client-Version header at all. Reads must still work so an old
+        // client shows a degraded vault rather than an empty one; note that
+        // `list_objects` takes no `MinClientVersion`/`HeaderMap` at all, so
+        // there is no way to gate it even if an operator sets a floor.
+        let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+
+        assert!(res.is_ok());
     }
 
     #[tokio::test]
@@ -1126,6 +1234,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "does-not-exist".to_string(),
