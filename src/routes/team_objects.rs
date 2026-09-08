@@ -83,7 +83,12 @@ fn edit_permission_for_str(object_type: &str) -> Option<i64> {
 pub struct UpsertTeamObjectRequest {
     pub object_id: String,
     pub object_type: TeamObjectType,
+    /// Accepted for wire compatibility with shipped clients and then discarded.
+    /// Nothing on either side reads these columns back; persisting them leaked
+    /// connection names and folder structure in plaintext (#229).
+    #[allow(dead_code)]
     pub name: Option<String>,
+    #[allow(dead_code)]
     pub folder_id: Option<String>,
     pub metadata: serde_json::Value,
 }
@@ -184,11 +189,11 @@ pub async fn upsert_object(
     sqlx::query(
         r#"INSERT INTO team_vault_objects
            (team_id, object_id, object_type, name, vault_id, folder_id, metadata, updated_by)
-           VALUES ($1, $2, $3, $4, $1, $5, $6, $7)
+           VALUES ($1, $2, $3, NULL, $1, NULL, $4, $5)
            ON CONFLICT (team_id, object_id)
            DO UPDATE SET object_type = EXCLUDED.object_type,
-                         name = EXCLUDED.name,
-                         folder_id = EXCLUDED.folder_id,
+                         name = NULL,
+                         folder_id = NULL,
                          metadata = EXCLUDED.metadata,
                          deleted_at = NULL,
                          updated_at = now(),
@@ -197,8 +202,6 @@ pub async fn upsert_object(
     .bind(team_id)
     .bind(&body.object_id)
     .bind(body.object_type.as_str())
-    .bind(&body.name)
-    .bind(&body.folder_id)
     .bind(&body.metadata)
     .bind(auth.0)
     .execute(&pool)
@@ -489,6 +492,42 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn upsert_object_does_not_persist_name_or_folder_id() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: Some("prod-db-master".to_string()),
+                folder_id: Some("folder-7".to_string()),
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (name, folder_id): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT name, folder_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("obj-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(name, None, "name must not be persisted");
+        assert_eq!(folder_id, None, "folder_id must not be persisted");
     }
 
     #[tokio::test]
