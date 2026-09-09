@@ -68,6 +68,7 @@ async fn require_vault_access(
 pub struct VaultKeyResponse {
     pub wrapped_key: String,
     pub wrapped_by_user_id: Uuid,
+    pub key_version: i32,
 }
 
 pub async fn get_my_vault_key(
@@ -91,8 +92,10 @@ pub async fn get_my_vault_key(
     )
     .await?;
 
-    let row = sqlx::query_as::<_, (String, Uuid)>(
-        "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2",
+    let row = sqlx::query_as::<_, (String, Uuid, i32)>(
+        "SELECT wrapped_key, wrapped_by, key_version FROM team_vault_keys \
+         WHERE team_id = $1 AND user_id = $2 \
+         ORDER BY key_version DESC LIMIT 1",
     )
     .bind(team_id)
     .bind(auth.0)
@@ -111,6 +114,51 @@ pub async fn get_my_vault_key(
     Ok(Json(VaultKeyResponse {
         wrapped_key: row.0,
         wrapped_by_user_id: row.1,
+        key_version: row.2,
+    }))
+}
+
+// ─── GET /v1/teams/:team_id/vault-key/:version ───────────────────────────────
+
+/// Fetch a *specific* historical epoch's wrapped key. Only used when decoding
+/// a row whose `key_version` (secrets/blob column, or `kv` inside an object's
+/// envelope) is behind the team's current epoch — the normal read path is
+/// still `get_my_vault_key`, unchanged, for the current epoch.
+pub async fn get_vault_key_at_version(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Path((team_id, version)): Path<(Uuid, i32)>,
+) -> Result<Json<VaultKeyResponse>, StatusCode> {
+    require_vault_access(
+        &pool,
+        team_id,
+        auth.0,
+        "get_vault_key_at_version",
+        PermCheck::Any(&[
+            crate::permissions::PERM_CONNECT,
+            crate::permissions::PERM_VIEW_SECRETS,
+        ]),
+    )
+    .await?;
+
+    let row = sqlx::query_as::<_, (String, Uuid)>(
+        "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = $3",
+    )
+    .bind(team_id)
+    .bind(auth.0)
+    .bind(version)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, user_id = %auth.0, version, "Failed to fetch vault key at version");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(VaultKeyResponse {
+        wrapped_key: row.0,
+        wrapped_by_user_id: row.1,
+        key_version: version,
     }))
 }
 
@@ -555,6 +603,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn my_vault_key_returns_the_current_epoch_when_multiple_rows_exist() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'old', $2, 1)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("epoch 1");
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'current', $2, 2)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("epoch 2");
+
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("vault key ok")
+            .0;
+
+        assert_eq!(res.wrapped_key, "current");
+        assert_eq!(res.key_version, 2);
+    }
+
+    #[tokio::test]
     async fn vault_key_forbidden_without_connect_or_view_secrets() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
@@ -599,6 +673,67 @@ mod tests {
         insert_vault_key(&pool, team, connect_only, owner).await;
 
         let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
+
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    // ─── GET /v1/teams/:team_id/vault-key/:version (#217) ────────────────────
+
+    #[tokio::test]
+    async fn vault_key_at_version_returns_the_requested_epoch_not_the_latest() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) \
+             VALUES ($1, $2, 'old-wrapped', $2, 1)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("epoch 1");
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) \
+             VALUES ($1, $2, 'new-wrapped', $2, 2)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("epoch 2");
+
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), Path((team, 1)))
+            .await
+            .expect("epoch 1 ok")
+            .0;
+
+        assert_eq!(res.wrapped_key, "old-wrapped");
+        assert_eq!(res.key_version, 1);
+    }
+
+    #[tokio::test]
+    async fn vault_key_at_version_404_when_this_member_has_no_row_at_that_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) \
+             VALUES ($1, $2, 'only-epoch-2', $2, 2)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 only");
+
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), Path((team, 1))).await;
+
+        assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn vault_key_at_version_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), Path((team, 1))).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }

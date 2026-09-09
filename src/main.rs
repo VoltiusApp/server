@@ -424,6 +424,10 @@ async fn main() {
             get(routes::team_sync::get_vault_key_holders),
         )
         .route(
+            "/v1/teams/:team_id/vault-key/:version",
+            get(routes::team_sync::get_vault_key_at_version),
+        )
+        .route(
             "/v1/teams/:team_id/vault-key",
             put(routes::team_sync::put_vault_keys),
         )
