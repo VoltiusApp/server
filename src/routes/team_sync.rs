@@ -185,6 +185,39 @@ pub struct RotationStatusResponse {
     pub draining: bool,
 }
 
+/// Does any ciphertext row for `team_id` still sit on an epoch behind
+/// `epoch`? Shared by `get_rotation_status` (reporting) and `rotate_vault_key`
+/// (enforcement — the spec forbids stacking a new epoch while a prior one is
+/// still draining, #217 review finding I4).
+///
+/// `team_vault_objects.metadata->>'kv'` is client-supplied JSON (any member
+/// with an edit permission can write it via `upsert_object`), so the cast only
+/// fires when the value is actually a JSON number — a non-numeric `kv` (bug
+/// or malice) falls back to epoch 1 instead of raising a Postgres cast error
+/// that would 500 this query for the whole team on every future call (#217
+/// review finding I6).
+async fn is_draining(pool: &PgPool, team_id: Uuid, epoch: i32) -> Result<bool, StatusCode> {
+    sqlx::query_scalar(
+        r#"SELECT
+             EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND key_version < $2)
+             OR EXISTS(SELECT 1 FROM team_vault_objects WHERE team_id = $1 AND deleted_at IS NULL
+                       AND (CASE WHEN jsonb_typeof(metadata->'kv') = 'number'
+                                 THEN (metadata->>'kv')::int
+                                 ELSE 1
+                            END) < $2)
+             OR EXISTS(SELECT 1 FROM team_sync_blobs WHERE team_id = $1 AND key_version < $2)
+           "#,
+    )
+    .bind(team_id)
+    .bind(epoch)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to compute rotation draining state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 pub async fn get_rotation_status(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
@@ -225,23 +258,7 @@ pub async fn get_rotation_status(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // draining: does any ciphertext row still sit on an epoch behind current?
-    let draining: bool = sqlx::query_scalar(
-        r#"SELECT
-             EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND key_version < $2)
-             OR EXISTS(SELECT 1 FROM team_vault_objects WHERE team_id = $1 AND deleted_at IS NULL
-                       AND COALESCE((metadata->>'kv')::int, 1) < $2)
-             OR EXISTS(SELECT 1 FROM team_sync_blobs WHERE team_id = $1 AND key_version < $2)
-           "#,
-    )
-    .bind(team_id)
-    .bind(epoch)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, "Failed to compute rotation draining state");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let draining = is_draining(&pool, team_id, epoch).await?;
 
     Ok(Json(RotationStatusResponse { stale, draining }))
 }
@@ -268,10 +285,16 @@ pub async fn get_vault_key_holders(
     )
     .await?;
 
+    // Must agree with `rotation-status`'s `stale` check: a member holding only
+    // an old-epoch row has not been covered by the current rotation and must
+    // not be reported here as "already has a key" (#217 review finding I3).
+    let epoch = current_epoch(&pool, team_id).await?;
+
     let holders = sqlx::query_scalar::<_, Uuid>(
-        "SELECT user_id FROM team_vault_keys WHERE team_id = $1",
+        "SELECT user_id FROM team_vault_keys WHERE team_id = $1 AND key_version = $2",
     )
     .bind(team_id)
+    .bind(epoch)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -442,7 +465,18 @@ pub async fn rotate_vault_key(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let next_version = current_epoch(&pool, team_id).await? + 1;
+    let epoch = current_epoch(&pool, team_id).await?;
+
+    // The spec forbids stacking a new epoch while the current one hasn't
+    // fully drained: minting epoch N+1 here would leave epoch-N ciphertext
+    // stranded behind two rotations instead of one. Only the client was
+    // previously asked to honor this (#217 review finding I4).
+    if is_draining(&pool, team_id, epoch).await? {
+        warn!(team_id = %team_id, user_id = %auth.0, epoch, "Rotation rejected: team is still draining a prior epoch");
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let next_version = epoch + 1;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to open rotation transaction");
@@ -541,9 +575,16 @@ pub async fn get_team_blob(
 
 // ─── PUT /v1/teams/:team_id/sync-blob ────────────────────────────────────────
 
+/// Default for `PutTeamBlobRequest::key_version` when a pre-#217 client omits
+/// the field entirely: treat it as epoch 1 rather than 422ing the request.
+fn default_key_version_one() -> i32 {
+    1
+}
+
 #[derive(Deserialize)]
 pub struct PutTeamBlobRequest {
     pub blob: String, // base64
+    #[serde(default = "default_key_version_one")]
     pub key_version: i32,
 }
 
@@ -716,6 +757,48 @@ mod tests {
 
         assert_eq!(holders, vec![owner]);
         assert!(!holders.contains(&keyless), "keyless member must be absent");
+    }
+
+    /// I3: holders must be epoch-aware so it agrees with `rotation-status`'s
+    /// `stale` check. A member holding only an old-epoch row is NOT covered by
+    /// the current rotation and must not be reported as "already has a key",
+    /// or the client's `reconcileTeamVaultKeys` would skip them forever.
+    #[tokio::test]
+    async fn holders_excludes_a_member_whose_only_row_is_an_old_epoch() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        // Team has rotated: current epoch is 2.
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 2, $2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 ledger");
+
+        // `owner` was wrapped a key at the new epoch...
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k2', $2, 2)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("owner epoch 2 key");
+
+        // ...but a second member only ever held the old epoch 1 key.
+        let stale_member = seed_user(&pool).await;
+        add_member(&pool, team, stale_member).await;
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k1', $3, 1)",
+        )
+        .bind(team).bind(stale_member).bind(owner).execute(&pool).await.expect("stale member epoch 1 key");
+
+        let holders = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("holders ok")
+            .0;
+
+        assert_eq!(holders, vec![owner], "only the current-epoch row counts as held");
+        assert!(
+            !holders.contains(&stale_member),
+            "a member covering only an old epoch must not be reported as a holder"
+        );
     }
 
     #[tokio::test]
@@ -944,6 +1027,16 @@ mod tests {
         assert_eq!(kv, 3);
     }
 
+    /// I5: a pre-#217 client's body carries no `key_version` field at all.
+    /// It must still deserialize (as epoch 1), not 422 the whole request.
+    #[test]
+    fn put_team_blob_request_defaults_key_version_when_field_is_absent() {
+        let body: PutTeamBlobRequest =
+            serde_json::from_str(r#"{"blob": "abc"}"#).expect("must deserialize without key_version");
+
+        assert_eq!(body.key_version, 1);
+    }
+
     // ─── GET /v1/teams/:team_id/vault-key/:version (#217) ────────────────────
 
     #[tokio::test]
@@ -1101,6 +1194,45 @@ mod tests {
         assert!(res.draining);
     }
 
+    /// I6: a malformed `kv` in an object's metadata (any editor can write
+    /// this shape via `upsert_object`) must not 500 the whole team's
+    /// rotation-status forever. A non-numeric `kv` falls back to epoch 1, so
+    /// with a current epoch of 2 the row still correctly counts as draining.
+    #[tokio::test]
+    async fn rotation_status_survives_a_non_numeric_kv_in_object_metadata() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        // Current epoch is 2...
+        sqlx::query("INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k2', $2, 2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 key");
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 2, $2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 ledger");
+
+        // ...but an object's metadata carries a garbage (non-numeric) `kv`.
+        sqlx::query(
+            "INSERT INTO team_vault_objects (team_id, object_id, object_type, vault_id, metadata, updated_by) \
+             VALUES ($1, 'obj-garbage', 'connection', $1, $2, $3)",
+        )
+        .bind(team)
+        .bind(serde_json::json!({ "v": 2, "enc": "x", "kv": "garbage" }))
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("seed object with malformed kv");
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team)).await;
+
+        let status = res.expect("a non-numeric kv must not error the route").0;
+        assert!(
+            status.draining,
+            "a non-numeric kv falls back to epoch 1, which is behind the current epoch of 2"
+        );
+    }
+
     #[tokio::test]
     async fn rotation_status_forbidden_for_non_member() {
         let pool = test_pool_or_skip!();
@@ -1146,6 +1278,49 @@ mod tests {
         )
         .bind(team).bind(owner).fetch_one(&pool).await.unwrap();
         assert_eq!(wrapped, "wrapped-epoch-2");
+    }
+
+    /// I4: the spec forbids stacking epoch N+1 while epoch N is still
+    /// draining. Only the client honored this before — assert the server
+    /// now rejects the mint outright and writes nothing.
+    #[tokio::test]
+    async fn rotate_rejected_while_the_current_epoch_is_still_draining() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+
+        // Current epoch is 2...
+        sqlx::query("INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k2', $2, 2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 key");
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 2, $2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 ledger");
+
+        // ...but a secret ciphertext row is still on epoch 1 — the team has
+        // not finished draining epoch 1 yet.
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, 'sec-1', 'obj-1', 'connection_password', 'cipher', $2, 1)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("draining secret");
+
+        let res = rotate_vault_key(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(RotateVaultKeyRequest {
+                keys: vec![WrappedKeyEntry { user_id: owner, wrapped_key: "wrapped-epoch-3".to_string() }],
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::CONFLICT));
+
+        let max_epoch: i32 = sqlx::query_scalar("SELECT MAX(key_version) FROM team_key_epochs WHERE team_id = $1")
+            .bind(team).fetch_one(&pool).await.unwrap();
+        assert_eq!(max_epoch, 2, "a rejected rotation must not insert a new epoch row");
     }
 
     #[tokio::test]
