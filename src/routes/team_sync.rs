@@ -496,6 +496,7 @@ pub async fn rotate_vault_key(
 pub struct TeamBlobResponse {
     pub blob: String, // base64
     pub updated_at: DateTime<Utc>,
+    pub key_version: i32,
 }
 
 pub async fn get_team_blob(
@@ -515,8 +516,8 @@ pub async fn get_team_blob(
     )
     .await?;
 
-    let row = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>)>(
-        "SELECT blob, updated_at FROM team_sync_blobs WHERE team_id = $1",
+    let row = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>, i32)>(
+        "SELECT blob, updated_at, key_version FROM team_sync_blobs WHERE team_id = $1",
     )
     .bind(team_id)
     .fetch_optional(&pool)
@@ -534,6 +535,7 @@ pub async fn get_team_blob(
     Ok(Json(TeamBlobResponse {
         blob: base64::engine::general_purpose::STANDARD.encode(&row.0),
         updated_at: row.1,
+        key_version: row.2,
     }))
 }
 
@@ -542,6 +544,7 @@ pub async fn get_team_blob(
 #[derive(Deserialize)]
 pub struct PutTeamBlobRequest {
     pub blob: String, // base64
+    pub key_version: i32,
 }
 
 pub async fn put_team_blob(
@@ -592,17 +595,19 @@ pub async fn put_team_blob(
 
     sqlx::query(
         r#"
-        INSERT INTO team_sync_blobs (team_id, blob, size_bytes, updated_by)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO team_sync_blobs (team_id, blob, size_bytes, updated_by, key_version)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (team_id)
         DO UPDATE SET blob = EXCLUDED.blob, size_bytes = EXCLUDED.size_bytes,
-                      updated_by = EXCLUDED.updated_by, updated_at = now()
+                      updated_by = EXCLUDED.updated_by, updated_at = now(),
+                      key_version = EXCLUDED.key_version
         "#,
     )
     .bind(team_id)
     .bind(&blob_bytes)
     .bind(size_bytes)
     .bind(auth.0)
+    .bind(body.key_version)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -882,6 +887,61 @@ mod tests {
         let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn get_team_blob_returns_its_key_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        sqlx::query(
+            "INSERT INTO team_sync_blobs (team_id, blob, size_bytes, updated_by, key_version) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(team).bind(b"ciphertext".to_vec()).bind(10_i32).bind(owner).bind(2_i32)
+        .execute(&pool).await.expect("insert blob at epoch 2");
+
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("blob ok")
+            .0;
+
+        assert_eq!(res.key_version, 2);
+    }
+
+    #[tokio::test]
+    async fn put_team_blob_persists_the_provided_key_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+        // put_team_blob also requires EDIT_* — grant the full set the route checks.
+        let role = seed_role(&pool, team, "blob-writer", crate::permissions::PERM_EDIT_CONNECTIONS
+            | crate::permissions::PERM_EDIT_IDENTITIES | crate::permissions::PERM_EDIT_KEYS
+            | crate::permissions::PERM_EDIT_FOLDERS | crate::permissions::PERM_VIEW_SECRETS
+            | crate::permissions::PERM_COPY_SECRETS).await;
+        assign_role(&pool, team, owner, role).await;
+
+        use base64::Engine;
+        let body_b64 = base64::engine::general_purpose::STANDARD.encode(b"new-ciphertext");
+
+        let res = put_team_blob(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(PutTeamBlobRequest { blob: body_b64, key_version: 3 }),
+        )
+        .await;
+
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+
+        let kv: i32 = sqlx::query_scalar("SELECT key_version FROM team_sync_blobs WHERE team_id = $1")
+            .bind(team).fetch_one(&pool).await.unwrap();
+        assert_eq!(kv, 3);
     }
 
     // ─── GET /v1/teams/:team_id/vault-key/:version (#217) ────────────────────
