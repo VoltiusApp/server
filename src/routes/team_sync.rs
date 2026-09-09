@@ -617,3 +617,89 @@ mod tests {
         assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }
+
+#[cfg(test)]
+mod epoch_migration_tests {
+    use crate::test_pool_or_skip;
+    use crate::test_support::{seed_team, seed_user};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn team_vault_keys_allows_two_epochs_for_the_same_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) \
+             VALUES ($1, $2, 'k1', $2, 1)",
+        )
+        .bind(team)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("insert epoch 1");
+
+        // Would violate the old (team_id, user_id) primary key; must succeed now.
+        let second = sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) \
+             VALUES ($1, $2, 'k2', $2, 2)",
+        )
+        .bind(team)
+        .bind(owner)
+        .execute(&pool)
+        .await;
+
+        assert!(second.is_ok(), "expected a second epoch row to insert, got {:?}", second.err());
+    }
+
+    #[tokio::test]
+    async fn existing_rows_default_to_key_version_one() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by) \
+             VALUES ($1, 'sec-1', 'obj-1', 'connection_password', 'cipher', $2)",
+        )
+        .bind(team)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("insert secret without key_version");
+
+        let kv: i32 = sqlx::query_scalar(
+            "SELECT key_version FROM team_vault_secrets WHERE team_id = $1 AND secret_id = 'sec-1'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .expect("read key_version");
+
+        assert_eq!(kv, 1);
+    }
+
+    #[tokio::test]
+    async fn team_key_epochs_rejects_duplicate_version_for_same_team() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 1, $2)")
+            .bind(team)
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .expect("insert epoch 1 row");
+
+        let dup = sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 1, $2)")
+            .bind(team)
+            .bind(owner)
+            .execute(&pool)
+            .await;
+
+        assert!(dup.is_err(), "duplicate (team_id, key_version) must be rejected by the primary key");
+        let _ = Uuid::new_v4(); // keep uuid import used if the above changes
+    }
+}
