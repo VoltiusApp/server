@@ -221,6 +221,12 @@ pub async fn upsert_object(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Upper bound on one re-encryption batch. The client sends 50 at a time, but
+/// the server must not depend on that: every item in a batch is one row locked
+/// for the life of a single transaction, so an unbounded batch lets a member
+/// hold their whole team's rows while it commits.
+pub const MAX_REENCRYPT_BATCH: usize = 500;
+
 #[derive(Debug, Deserialize)]
 pub struct ReencryptItem {
     pub object_id: String,
@@ -247,6 +253,9 @@ pub async fn reencrypt_objects(
 
     if items.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
+    }
+    if items.len() > MAX_REENCRYPT_BATCH {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     let ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
@@ -1252,6 +1261,34 @@ mod authz_tests {
         let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
 
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reencrypt_rejects_a_batch_over_the_cap() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let items: Vec<ReencryptItem> = (0..=MAX_REENCRYPT_BATCH)
+            .map(|i| ReencryptItem {
+                object_id: format!("obj-{i}"),
+                metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+            })
+            .collect();
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(items),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
