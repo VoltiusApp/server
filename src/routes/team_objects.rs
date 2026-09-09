@@ -6,7 +6,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -112,6 +112,7 @@ pub struct UpsertSecretRequest {
     pub object_id: String,
     pub secret_type: String,
     pub ciphertext: String,
+    pub key_version: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +121,7 @@ pub struct TeamSecretResponse {
     pub object_id: String,
     pub secret_type: String,
     pub ciphertext: String,
+    pub key_version: i32,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -233,6 +235,41 @@ pub struct ReencryptItem {
     pub metadata: serde_json::Value,
 }
 
+/// Resolves the union of edit permissions needed to touch every object named
+/// by `object_ids` (via each secret's own `object_id` for the secrets case),
+/// then requires the caller hold all of them. Types are read from the
+/// database, never the request, so a caller cannot relabel an object to slip
+/// past the gate. An `object_ids` set matching zero rows requires nothing —
+/// see `require_team_member` below for why that alone is not a hole.
+async fn require_edit_permission_for_object_ids(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+    object_ids: &[String],
+) -> Result<(), StatusCode> {
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = ANY($2)",
+    )
+    .bind(team_id)
+    .bind(object_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to read object types for re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut required: Vec<i64> = Vec::new();
+    for t in &types {
+        let perm = edit_permission_for_str(t).ok_or(StatusCode::BAD_REQUEST)?;
+        if !required.contains(&perm) {
+            required.push(perm);
+        }
+    }
+
+    require_all_team_permissions(pool, team_id, user_id, &required).await
+}
+
 /// Rewrites the metadata blob of existing rows without touching `updated_at`
 /// or `updated_by`, and broadcasts once for the whole batch rather than per
 /// row. Used by the client's one-time pass that encrypts objects written
@@ -260,30 +297,7 @@ pub async fn reencrypt_objects(
 
     let ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
 
-    // The caller must be able to edit every type present in the batch. Types
-    // are read from the database, never from the request, so a caller cannot
-    // relabel a key as a connection to slip past the gate.
-    let types: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = ANY($2)",
-    )
-    .bind(team_id)
-    .bind(&ids)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, "Failed to read object types for re-encryption");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let mut required: Vec<i64> = Vec::new();
-    for t in &types {
-        let perm = edit_permission_for_str(t).ok_or(StatusCode::BAD_REQUEST)?;
-        if !required.contains(&perm) {
-            required.push(perm);
-        }
-    }
-
-    require_all_team_permissions(&pool, team_id, auth.0, &required).await?;
+    require_edit_permission_for_object_ids(&pool, team_id, auth.0, &ids).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to open re-encryption transaction");
@@ -307,6 +321,103 @@ pub async fn reencrypt_objects(
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to commit re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReencryptSecretItem {
+    pub secret_id: String,
+    pub ciphertext: String,
+    pub key_version: i32,
+}
+
+/// Secrets sibling of `reencrypt_objects`: rewrites ciphertext + key_version
+/// only, no audit stamp, one broadcast per batch. Secrets are gated by their
+/// owning object's edit permission (`object_id` join), same as `upsert_secret`.
+pub async fn reencrypt_secrets(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
+    Path(team_id): Path<Uuid>,
+    Json(items): Json<Vec<ReencryptSecretItem>>,
+) -> Result<StatusCode, StatusCode> {
+    require_team_member(&pool, team_id, auth.0).await?;
+
+    if items.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if items.len() > MAX_REENCRYPT_BATCH {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let secret_ids: Vec<String> = items.iter().map(|i| i.secret_id.clone()).collect();
+    let distinct_requested: std::collections::HashSet<&String> = secret_ids.iter().collect();
+
+    // A single join, not "get object_ids then check permissions for those
+    // object_ids": that two-step let an orphaned secret (object_id matching
+    // no live row) resolve to an empty permission set, which
+    // `require_all_team_permissions` then satisfied vacuously — any bare
+    // member could rewrite that secret's ciphertext (#217 review finding
+    // I7). Joining here means an orphaned secret simply never appears in
+    // `resolved` at all, so it can be caught below before touching permissions.
+    let resolved: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tvs.secret_id, tvo.object_id
+           FROM team_vault_secrets tvs
+           JOIN team_vault_objects tvo
+             ON tvo.team_id = tvs.team_id AND tvo.object_id = tvs.object_id AND tvo.deleted_at IS NULL
+           WHERE tvs.team_id = $1 AND tvs.secret_id = ANY($2)"#,
+    )
+    .bind(team_id)
+    .bind(&secret_ids)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to resolve objects for secret re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let resolved_secret_ids: std::collections::HashSet<&String> =
+        resolved.iter().map(|(secret_id, _)| secret_id).collect();
+    if resolved_secret_ids.len() < distinct_requested.len() {
+        warn!(
+            team_id = %team_id, user_id = %auth.0,
+            requested = distinct_requested.len(), resolved = resolved_secret_ids.len(),
+            "Secret re-encryption batch rejected: a requested secret has no live object",
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let object_ids: Vec<String> = resolved.into_iter().map(|(_, object_id)| object_id).collect();
+    require_edit_permission_for_object_ids(&pool, team_id, auth.0, &object_ids).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open secret re-encryption transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    for item in &items {
+        sqlx::query(
+            "UPDATE team_vault_secrets SET ciphertext = $3, key_version = $4 WHERE team_id = $1 AND secret_id = $2",
+        )
+        .bind(team_id)
+        .bind(&item.secret_id)
+        .bind(&item.ciphertext)
+        .bind(item.key_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, secret_id = %item.secret_id, "Failed to re-encrypt secret");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit secret re-encryption");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -399,8 +510,8 @@ pub async fn list_secrets(
     )
     .await?;
 
-    let rows = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>)>(
-        r#"SELECT secret_id, object_id, secret_type, ciphertext, updated_at
+    let rows = sqlx::query_as::<_, (String, String, String, String, i32, DateTime<Utc>)>(
+        r#"SELECT secret_id, object_id, secret_type, ciphertext, key_version, updated_at
            FROM team_vault_secrets
            WHERE team_id = $1
            ORDER BY updated_at ASC"#,
@@ -420,7 +531,8 @@ pub async fn list_secrets(
                 object_id: row.1,
                 secret_type: row.2,
                 ciphertext: row.3,
-                updated_at: row.4,
+                key_version: row.4,
+                updated_at: row.5,
             })
             .collect(),
     ))
@@ -455,14 +567,15 @@ pub async fn upsert_secret(
 
     sqlx::query(
         r#"INSERT INTO team_vault_secrets
-           (team_id, secret_id, object_id, secret_type, ciphertext, updated_by)
-           VALUES ($1, $2, $3, $4, $5, $6)
+           (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            ON CONFLICT (team_id, secret_id)
            DO UPDATE SET object_id = EXCLUDED.object_id,
                          secret_type = EXCLUDED.secret_type,
                          ciphertext = EXCLUDED.ciphertext,
                          updated_at = now(),
-                         updated_by = EXCLUDED.updated_by"#,
+                         updated_by = EXCLUDED.updated_by,
+                         key_version = EXCLUDED.key_version"#,
     )
     .bind(team_id)
     .bind(&body.secret_id)
@@ -470,6 +583,7 @@ pub async fn upsert_secret(
     .bind(&body.secret_type)
     .bind(&body.ciphertext)
     .bind(auth.0)
+    .bind(body.key_version)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -692,6 +806,7 @@ mod authz_tests {
             object_id: object_id.to_string(),
             secret_type: "connection_password".to_string(),
             ciphertext: "cipher".to_string(),
+            key_version: 1,
         }
     }
 
@@ -768,6 +883,7 @@ mod authz_tests {
             object_id: object_id.clone(),
             secret_type: "connection_passphrase".to_string(),
             ciphertext: "cipher".to_string(),
+            key_version: 1,
         };
         let secret_id = body.secret_id.clone();
 
@@ -831,6 +947,97 @@ mod authz_tests {
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
     }
 
+    // ── upsert_secret stamps key_version (final review C1) ─────────────────────
+
+    /// Fresh insert: a secret written with `key_version: 2` must persist that
+    /// epoch, not silently fall back to the column default of 1.
+    #[tokio::test]
+    async fn upsert_secret_stamps_key_version_on_insert() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let mut body = secret_body(&object_id);
+        body.key_version = 2;
+        let secret_id = body.secret_id.clone();
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(body),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        let kv: i32 = sqlx::query_scalar(
+            "SELECT key_version FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kv, 2, "fresh insert must persist the request's key_version");
+    }
+
+    /// Update path: re-upserting an existing secret at a new epoch must move
+    /// its `key_version` forward — this is what lets `draining` clear after a
+    /// rotation completes.
+    #[tokio::test]
+    async fn upsert_secret_stamps_key_version_on_update() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let mut body = secret_body(&object_id);
+        body.key_version = 1;
+        let secret_id = body.secret_id.clone();
+
+        upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(body),
+        )
+        .await
+        .unwrap();
+
+        let mut update = secret_body(&object_id);
+        update.secret_id = secret_id.clone();
+        update.key_version = 3;
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(update),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        let kv: i32 = sqlx::query_scalar(
+            "SELECT key_version FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kv, 3, "re-upsert must move key_version forward on conflict");
+    }
+
     // ── delete_secret ────────────────────────────────────────────────────────
 
     async fn seed_secret(pool: &PgPool, team: Uuid, object_id: &str) -> String {
@@ -871,6 +1078,41 @@ mod authz_tests {
 
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].secret_id, secret_id);
+    }
+
+    /// C2: without `key_version` on the wire, a client cannot tell which
+    /// epoch a secret's ciphertext is under, so it can't route a stale row to
+    /// the historical-key fetch. Seed two secrets at different epochs directly
+    /// (bypassing `upsert_secret`, which stamps whatever the request says) and
+    /// confirm each comes back tagged with its own epoch, not epoch 1 for both.
+    #[tokio::test]
+    async fn list_secrets_exposes_key_version_per_row() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, 'sec-old', $2, 'connection_password', 'old-cipher', $3, 1)",
+        )
+        .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed epoch-1 secret");
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, 'sec-new', $2, 'connection_password', 'new-cipher', $3, 3)",
+        )
+        .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed epoch-3 secret");
+
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team))
+            .await
+            .expect("list secrets ok")
+            .0;
+
+        let old = res.iter().find(|s| s.secret_id == "sec-old").expect("old secret present");
+        let new = res.iter().find(|s| s.secret_id == "sec-new").expect("new secret present");
+        assert_eq!(old.key_version, 1);
+        assert_eq!(new.key_version, 3);
     }
 
     #[tokio::test]
@@ -1313,5 +1555,174 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    // ── reencrypt_secrets ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reencrypt_secrets_updates_ciphertext_and_key_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, 'sec-1', $2, 'connection_password', 'old-cipher', $3, 1)",
+        )
+        .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed old secret");
+
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(editor)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "sec-1".to_string(),
+                ciphertext: "new-cipher".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+
+        let (cipher, kv): (String, i32) = sqlx::query_as(
+            "SELECT ciphertext, key_version FROM team_vault_secrets WHERE team_id = $1 AND secret_id = 'sec-1'",
+        )
+        .bind(team).fetch_one(&pool).await.unwrap();
+        assert_eq!(cipher, "new-cipher");
+        assert_eq!(kv, 2);
+    }
+
+    #[tokio::test]
+    async fn reencrypt_secrets_forbidden_without_the_object_edit_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await; // no EDIT_CONNECTIONS
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by) \
+             VALUES ($1, 'sec-1', $2, 'connection_password', 'old-cipher', $3)",
+        )
+        .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed old secret");
+
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "sec-1".to_string(),
+                ciphertext: "new-cipher".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
+    }
+
+    /// I7: `require_edit_permission_for_object_ids` resolves required
+    /// permissions from `team_vault_objects` rows matching the given
+    /// object_ids. A secret whose `object_id` matches no live object row
+    /// (orphaned — deleted object, or a bug) used to resolve to an *empty*
+    /// permission set, which `require_all_team_permissions` satisfied
+    /// vacuously — any bare member could overwrite that secret's ciphertext.
+    /// Simulate the orphan directly via SQL, bypassing the normal
+    /// object-then-secret creation order, since the live write paths cannot
+    /// produce this state on their own.
+    #[tokio::test]
+    async fn reencrypt_secrets_rejects_a_batch_with_an_orphaned_secret() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // A bare member: on the team, but with no permission bits at all.
+        let caller = member_with_role(&pool, team, 0).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by) \
+             VALUES ($1, 'sec-orphan', 'no-such-object', 'connection_password', 'old-cipher', $2)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("seed orphaned secret");
+
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "sec-orphan".to_string(),
+                ciphertext: "attacker-cipher".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::BAD_REQUEST));
+
+        let ciphertext: String = sqlx::query_scalar(
+            "SELECT ciphertext FROM team_vault_secrets WHERE team_id = $1 AND secret_id = 'sec-orphan'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ciphertext, "old-cipher", "a rejected batch must not touch the orphaned secret's ciphertext");
+    }
+
+    #[tokio::test]
+    async fn reencrypt_secrets_forbidden_for_non_member_even_with_no_matching_rows() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await; // never added to team
+
+        // Regression guard for the same class of bug d7ead25 fixed for objects:
+        // an empty permission set from zero matching rows must not pass vacuously.
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "does-not-exist".to_string(),
+                ciphertext: "x".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn reencrypt_objects_still_forbidden_for_non_member_after_the_refactor() {
+        // Characterization test: the extraction in this task must not change
+        // reencrypt_objects's existing membership-check behavior (the exact bug
+        // d7ead25 fixed upstream of this branch).
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "does-not-exist".to_string(),
+                metadata: serde_json::json!({}),
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
     }
 }

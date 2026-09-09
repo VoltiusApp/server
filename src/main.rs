@@ -424,8 +424,20 @@ async fn main() {
             get(routes::team_sync::get_vault_key_holders),
         )
         .route(
+            "/v1/teams/:team_id/vault-key/:version",
+            get(routes::team_sync::get_vault_key_at_version),
+        )
+        .route(
+            "/v1/teams/:team_id/vault-key/rotation-status",
+            get(routes::team_sync::get_rotation_status),
+        )
+        .route(
             "/v1/teams/:team_id/vault-key",
             put(routes::team_sync::put_vault_keys),
+        )
+        .route(
+            "/v1/teams/:team_id/vault-key/rotate",
+            post(routes::team_sync::rotate_vault_key),
         )
         .route(
             "/v1/teams/:team_id/sync-blob",
@@ -474,6 +486,10 @@ async fn main() {
         .route(
             "/v1/teams/:team_id/secrets/:secret_id",
             delete(routes::team_objects::delete_secret),
+        )
+        .route(
+            "/v1/teams/:team_id/secrets/reencrypt",
+            put(routes::team_objects::reencrypt_secrets),
         )
         // Terminal sessions (REST) — Pro-gated at handler level via claims
         .route(
