@@ -385,6 +385,111 @@ pub async fn put_vault_keys(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── POST /v1/teams/:team_id/vault-key/rotate ────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RotateVaultKeyRequest {
+    pub keys: Vec<WrappedKeyEntry>,
+}
+
+/// Atomically mints a new key epoch: validates the caller wrapped the new DEK
+/// for every current member who has a public key (no more, no fewer — a set
+/// that misses one locks them out; requiring them to be a *current* member
+/// only, never mind the extras, keeps this simple since callers build the
+/// list from a fresh member fetch), inserts the epoch ledger row and every
+/// wrapped-key row in one transaction.
+pub async fn rotate_vault_key(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(sync_notifier): axum::Extension<SyncNotifier>,
+    Path(team_id): Path<Uuid>,
+    Json(body): Json<RotateVaultKeyRequest>,
+) -> Result<StatusCode, StatusCode> {
+    require_vault_access(
+        &pool,
+        team_id,
+        auth.0,
+        "rotate_vault_key",
+        PermCheck::All(&[
+            crate::permissions::PERM_VIEW_SECRETS,
+            crate::permissions::PERM_COPY_SECRETS,
+        ]),
+    )
+    .await?;
+
+    let required_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"SELECT tm.user_id FROM team_members tm
+           JOIN users u ON u.id = tm.user_id
+           WHERE tm.team_id = $1 AND u.public_key IS NOT NULL"#,
+    )
+    .bind(team_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to fetch keyed members for rotation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let required_set: std::collections::HashSet<Uuid> = required_ids.into_iter().collect();
+    let provided_set: std::collections::HashSet<Uuid> = body.keys.iter().map(|k| k.user_id).collect();
+
+    if required_set != provided_set {
+        warn!(
+            team_id = %team_id, user_id = %auth.0,
+            required = required_set.len(), provided = provided_set.len(),
+            "Rotation rejected: provided key set does not match current keyed membership",
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let next_version = current_epoch(&pool, team_id).await? + 1;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open rotation transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, $2, $3)")
+        .bind(team_id)
+        .bind(next_version)
+        .bind(auth.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, "Failed to insert key epoch");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    for entry in &body.keys {
+        sqlx::query(
+            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(team_id)
+        .bind(entry.user_id)
+        .bind(&entry.wrapped_key)
+        .bind(auth.0)
+        .bind(next_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, target_user_id = %entry.user_id, "Failed to insert rotated key");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit rotation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!(team_id = %team_id, rotated_by = %auth.0, new_epoch = next_version, member_count = body.keys.len(), "Team vault key rotated");
+    for user_id in vault_key_notification_targets(auth.0, &body.keys) {
+        sync_notifier.notify_membership_changed(user_id);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── GET /v1/teams/:team_id/sync-blob ────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -548,7 +653,7 @@ mod tests {
     use crate::auth::AuthUser;
     use crate::permissions::PERM_CONNECT;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, assign_role, seed_role, seed_team, seed_user};
+    use crate::test_support::{add_member, assign_role, member_with_role, seed_role, seed_team, seed_user};
     use axum::extract::{Path, State};
     use axum::Extension;
 
@@ -946,6 +1051,116 @@ mod tests {
         let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    // ─── POST /v1/teams/:team_id/vault-key/rotate (#217) ─────────────────────
+
+    #[tokio::test]
+    async fn rotate_creates_a_new_epoch_and_ledger_row() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await; // epoch 1
+
+        let res = rotate_vault_key(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(RotateVaultKeyRequest {
+                keys: vec![WrappedKeyEntry { user_id: owner, wrapped_key: "wrapped-epoch-2".to_string() }],
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+
+        let epoch: i32 = sqlx::query_scalar("SELECT MAX(key_version) FROM team_key_epochs WHERE team_id = $1")
+            .bind(team).fetch_one(&pool).await.unwrap();
+        assert_eq!(epoch, 2);
+
+        let wrapped: String = sqlx::query_scalar(
+            "SELECT wrapped_key FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = 2",
+        )
+        .bind(team).bind(owner).fetch_one(&pool).await.unwrap();
+        assert_eq!(wrapped, "wrapped-epoch-2");
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_a_set_that_omits_a_current_keyed_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await;
+
+        let other = seed_user(&pool).await;
+        add_member(&pool, team, other).await;
+        sqlx::query("UPDATE users SET public_key = 'other-pubkey' WHERE id = $1").bind(other).execute(&pool).await.unwrap();
+
+        // Omits `other`, who has a public key and must be covered.
+        let res = rotate_vault_key(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(RotateVaultKeyRequest {
+                keys: vec![WrappedKeyEntry { user_id: owner, wrapped_key: "w2".to_string() }],
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn rotate_ignores_a_member_with_no_public_key() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await;
+
+        let keyless = seed_user(&pool).await;
+        add_member(&pool, team, keyless).await;
+        sqlx::query("UPDATE users SET public_key = NULL WHERE id = $1").bind(keyless).execute(&pool).await.unwrap();
+
+        // Does not include `keyless` — must still succeed, since they cannot be wrapped for.
+        let res = rotate_vault_key(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(RotateVaultKeyRequest {
+                keys: vec![WrappedKeyEntry { user_id: owner, wrapped_key: "w2".to_string() }],
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn rotate_forbidden_without_copy_secrets() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, crate::permissions::PERM_VIEW_SECRETS).await; // no COPY_SECRETS
+
+        let res = rotate_vault_key(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(RotateVaultKeyRequest { keys: vec![] }),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
     }
 
     // ─── PUT /v1/teams/:team_id/vault-key (multi-epoch migration fix) ────────

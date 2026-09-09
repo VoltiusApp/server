@@ -436,6 +436,10 @@ async fn main() {
             put(routes::team_sync::put_vault_keys),
         )
         .route(
+            "/v1/teams/:team_id/vault-key/rotate",
+            post(routes::team_sync::rotate_vault_key),
+        )
+        .route(
             "/v1/teams/:team_id/sync-blob",
             get(routes::team_sync::get_team_blob),
         )
