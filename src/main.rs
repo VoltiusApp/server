@@ -88,6 +88,14 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
+    // Opt-in floor for clients WRITING team vault objects. Unset by default so
+    // self-hosted deployments keep working until their operator opts in. See
+    // routes::client_version for why this is not a security control.
+    let min_client_version = routes::client_version::MinClientVersion::from_env_value(
+        std::env::var("TEAM_OBJECTS_MIN_CLIENT_VERSION")
+            .ok()
+            .as_deref(),
+    );
     // Expire lapsed trials immediately on boot so the DB and admin metrics are
     // truthful right after deploy, then keep them so via the daily sweep below.
     expire_lapsed_trials(&retention_pool).await;
@@ -440,6 +448,10 @@ async fn main() {
             delete(routes::team_objects::delete_object),
         )
         .route(
+            "/v1/teams/:team_id/objects/reencrypt",
+            put(routes::team_objects::reencrypt_objects),
+        )
+        .route(
             "/v1/teams/:team_id/object_prefs",
             get(routes::team_object_prefs::list_object_prefs),
         )
@@ -544,7 +556,8 @@ async fn main() {
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
         .layer(Extension(presence_map.clone()))
-        .layer(Extension(usage_map.clone()));
+        .layer(Extension(usage_map.clone()))
+        .layer(Extension(min_client_version));
 
     // Admin routes — auth + admin check, no rate limit (internal tool)
     let admin_routes = Router::new()

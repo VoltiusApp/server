@@ -15,6 +15,7 @@ use crate::permissions::{
     PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
     PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS,
 };
+use crate::routes::client_version::{require_client_version, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -83,7 +84,12 @@ fn edit_permission_for_str(object_type: &str) -> Option<i64> {
 pub struct UpsertTeamObjectRequest {
     pub object_id: String,
     pub object_type: TeamObjectType,
+    /// Accepted for wire compatibility with shipped clients and then discarded.
+    /// Nothing on either side reads these columns back; persisting them leaked
+    /// connection names and folder structure in plaintext (#229).
+    #[allow(dead_code)]
     pub name: Option<String>,
+    #[allow(dead_code)]
     pub folder_id: Option<String>,
     pub metadata: serde_json::Value,
 }
@@ -170,9 +176,13 @@ pub async fn upsert_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
     Json(body): Json<UpsertTeamObjectRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     require_all_team_permissions(
         &pool,
         team_id,
@@ -184,11 +194,11 @@ pub async fn upsert_object(
     sqlx::query(
         r#"INSERT INTO team_vault_objects
            (team_id, object_id, object_type, name, vault_id, folder_id, metadata, updated_by)
-           VALUES ($1, $2, $3, $4, $1, $5, $6, $7)
+           VALUES ($1, $2, $3, NULL, $1, NULL, $4, $5)
            ON CONFLICT (team_id, object_id)
            DO UPDATE SET object_type = EXCLUDED.object_type,
-                         name = EXCLUDED.name,
-                         folder_id = EXCLUDED.folder_id,
+                         name = NULL,
+                         folder_id = NULL,
                          metadata = EXCLUDED.metadata,
                          deleted_at = NULL,
                          updated_at = now(),
@@ -197,8 +207,6 @@ pub async fn upsert_object(
     .bind(team_id)
     .bind(&body.object_id)
     .bind(body.object_type.as_str())
-    .bind(&body.name)
-    .bind(&body.folder_id)
     .bind(&body.metadata)
     .bind(auth.0)
     .execute(&pool)
@@ -213,12 +221,110 @@ pub async fn upsert_object(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Upper bound on one re-encryption batch. The client sends 50 at a time, but
+/// the server must not depend on that: every item in a batch is one row locked
+/// for the life of a single transaction, so an unbounded batch lets a member
+/// hold their whole team's rows while it commits.
+pub const MAX_REENCRYPT_BATCH: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct ReencryptItem {
+    pub object_id: String,
+    pub metadata: serde_json::Value,
+}
+
+/// Rewrites the metadata blob of existing rows without touching `updated_at`
+/// or `updated_by`, and broadcasts once for the whole batch rather than per
+/// row. Used by the client's one-time pass that encrypts objects written
+/// before #229; a per-object loop through `upsert_object` would restamp the
+/// whole vault as edited and fan out one SSE event per object to every member.
+pub async fn reencrypt_objects(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
+    Path(team_id): Path<Uuid>,
+    Json(items): Json<Vec<ReencryptItem>>,
+) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
+    require_team_member(&pool, team_id, auth.0).await?;
+
+    if items.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if items.len() > MAX_REENCRYPT_BATCH {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
+
+    // The caller must be able to edit every type present in the batch. Types
+    // are read from the database, never from the request, so a caller cannot
+    // relabel a key as a connection to slip past the gate.
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = ANY($2)",
+    )
+    .bind(team_id)
+    .bind(&ids)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to read object types for re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut required: Vec<i64> = Vec::new();
+    for t in &types {
+        let perm = edit_permission_for_str(t).ok_or(StatusCode::BAD_REQUEST)?;
+        if !required.contains(&perm) {
+            required.push(perm);
+        }
+    }
+
+    require_all_team_permissions(&pool, team_id, auth.0, &required).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open re-encryption transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    for item in &items {
+        sqlx::query(
+            "UPDATE team_vault_objects SET metadata = $3 WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team_id)
+        .bind(&item.object_id)
+        .bind(&item.metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, object_id = %item.object_id, "Failed to re-encrypt object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn delete_object(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path((team_id, object_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     let object_type = sqlx::query_scalar::<_, String>(
         "SELECT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
     )
@@ -324,9 +430,13 @@ pub async fn upsert_secret(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
     Json(body): Json<UpsertSecretRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     let object_type = sqlx::query_scalar::<_, String>(
         "SELECT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = $2 AND deleted_at IS NULL",
     )
@@ -378,8 +488,12 @@ pub async fn delete_secret(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(sync_notifier): Extension<SyncNotifier>,
+    Extension(min_client_version): Extension<MinClientVersion>,
+    headers: axum::http::HeaderMap,
     Path((team_id, secret_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    require_client_version(&min_client_version, &headers)?;
+
     let secret_type = sqlx::query_scalar::<_, String>(
         "SELECT secret_type FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
     )
@@ -452,6 +566,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -477,6 +593,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-2".to_string(),
@@ -489,6 +607,44 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "expected Ok, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn upsert_object_does_not_persist_name_or_folder_id() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: Some("prod-db-master".to_string()),
+                folder_id: Some("folder-7".to_string()),
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (name, folder_id): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT name, folder_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("obj-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(name, None, "name must not be persisted");
+        assert_eq!(folder_id, None, "folder_id must not be persisted");
     }
 
     #[tokio::test]
@@ -514,6 +670,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: object_id.clone(),
@@ -550,6 +708,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(secret_body(&object_id)),
         )
@@ -572,6 +732,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(body),
         )
@@ -613,6 +775,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(body),
         )
@@ -635,6 +799,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -655,6 +821,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(secret_body("does-not-exist")),
         )
@@ -673,6 +841,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(body),
         )
@@ -740,6 +910,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -761,6 +933,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -791,6 +965,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -810,6 +986,8 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, "does-not-exist".to_string())),
         )
         .await;
@@ -832,11 +1010,308 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
             Path((team, object_id.clone())),
         )
         .await;
 
         assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
         assert!(!secret_exists(&pool, team, &secret_id).await);
+    }
+
+    // ── reencrypt_objects ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reencrypt_preserves_updated_at_and_updated_by() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let author = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let migrator = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(author)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before: (chrono::DateTime<chrono::Utc>, Uuid) = sqlx::query_as(
+            "SELECT updated_at, updated_by FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("obj-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(migrator)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "obj-1".to_string(),
+                metadata: serde_json::json!({ "v": 2, "enc": "Y2lwaGVy" }),
+            }]),
+        )
+        .await
+        .unwrap();
+
+        let after: (chrono::DateTime<chrono::Utc>, Uuid, serde_json::Value) = sqlx::query_as(
+            "SELECT updated_at, updated_by, metadata FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("obj-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after.0, before.0,
+            "re-encryption must not restamp updated_at"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "re-encryption must not reassign updated_by"
+        );
+        assert_eq!(after.2, serde_json::json!({ "v": 2, "enc": "Y2lwaGVy" }));
+    }
+
+    #[tokio::test]
+    async fn reencrypt_forbidden_when_batch_includes_an_uneditable_type() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // Can edit connections, but NOT keys.
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        for (id, ty) in [
+            ("c1", TeamObjectType::Connection),
+            ("k1", TeamObjectType::Key),
+        ] {
+            sqlx::query(
+                "INSERT INTO team_vault_objects (team_id, object_id, object_type, vault_id, metadata, updated_by)
+                 VALUES ($1, $2, $3, $1, '{}'::jsonb, $4)",
+            )
+            .bind(team)
+            .bind(id)
+            .bind(ty.as_str())
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(vec![
+                ReencryptItem {
+                    object_id: "c1".to_string(),
+                    metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+                },
+                ReencryptItem {
+                    object_id: "k1".to_string(),
+                    metadata: serde_json::json!({ "v": 2, "enc": "eQ==" }),
+                },
+            ]),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+
+        // And nothing was written — the batch is all-or-nothing.
+        let c1: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM team_vault_objects WHERE team_id = $1 AND object_id = 'c1'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            c1,
+            serde_json::json!({}),
+            "a rejected batch must write nothing"
+        );
+    }
+
+    /// A non-member submitting only nonexistent object ids must not get a
+    /// `204` back — that would let anyone probe whether an object still
+    /// exists in a team they no longer belong to (batching makes this many
+    /// ids per request). Membership must be checked before the batch is
+    /// resolved against the database, not implied by an empty permission set.
+    #[tokio::test]
+    async fn reencrypt_forbidden_for_a_non_member_even_with_no_matching_objects() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await; // never added to team
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "does-not-exist".to_string(),
+                metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+            }]),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // ── version floor ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_object_rejected_below_the_version_floor() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-version", "0.32.1".parse().unwrap());
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(Some((0, 33, 0)))),
+            headers,
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn upsert_object_allowed_at_or_above_the_version_floor() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        // Exactly the floor — the boundary case worth pinning.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-version", "0.33.0".parse().unwrap());
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(Some((0, 33, 0)))),
+            headers,
+            Path(team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "obj-1".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({ "host": "10.0.0.1" }),
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn list_objects_is_never_gated_by_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        // A real team member — `seed_team` alone does not make `owner` one.
+        let caller = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        // No X-Client-Version header at all. Reads must still work so an old
+        // client shows a degraded vault rather than an empty one; note that
+        // `list_objects` takes no `MinClientVersion`/`HeaderMap` at all, so
+        // there is no way to gate it even if an operator sets a floor.
+        let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reencrypt_rejects_a_batch_over_the_cap() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let items: Vec<ReencryptItem> = (0..=MAX_REENCRYPT_BATCH)
+            .map(|i| ReencryptItem {
+                object_id: format!("obj-{i}"),
+                metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+            })
+            .collect();
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(items),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn reencrypt_ignores_object_ids_not_in_this_team() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "does-not-exist".to_string(),
+                metadata: serde_json::json!({ "v": 2, "enc": "eA==" }),
+            }]),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
     }
 }
