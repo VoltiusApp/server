@@ -106,12 +106,21 @@ pub struct TeamObjectResponse {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+/// Absent-key_version defaults to epoch 1 so a client that predates DEK
+/// rotation (#217) — which never sent this field before it existed — keeps
+/// working. Safe unconditionally today: no team has ever rotated, so every
+/// team's current epoch is still 1.
+fn default_key_version_one() -> i32 {
+    1
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpsertSecretRequest {
     pub secret_id: String,
     pub object_id: String,
     pub secret_type: String,
     pub ciphertext: String,
+    #[serde(default = "default_key_version_one")]
     pub key_version: i32,
 }
 
@@ -650,6 +659,18 @@ mod authz_tests {
     use crate::test_support::{member_with_role, seed_team, seed_user};
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
+
+    #[test]
+    fn upsert_secret_request_defaults_key_version_when_field_is_absent() {
+        // Any client that predates #217 has never sent key_version at all —
+        // this must not 422 it, or every currently-released client breaks
+        // the instant it tries to save a team vault secret.
+        let body: UpsertSecretRequest = serde_json::from_str(
+            r#"{"secret_id":"s1","object_id":"o1","secret_type":"connection_password","ciphertext":"c"}"#,
+        )
+        .expect("body without key_version must still deserialize");
+        assert_eq!(body.key_version, 1);
+    }
 
     #[tokio::test]
     async fn list_objects_forbidden_for_non_member() {
