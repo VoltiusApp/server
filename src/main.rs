@@ -428,6 +428,10 @@ async fn main() {
             get(routes::team_sync::get_vault_key_at_version),
         )
         .route(
+            "/v1/teams/:team_id/vault-key/rotation-status",
+            get(routes::team_sync::get_rotation_status),
+        )
+        .route(
             "/v1/teams/:team_id/vault-key",
             put(routes::team_sync::put_vault_keys),
         )

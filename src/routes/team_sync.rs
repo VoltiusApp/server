@@ -78,6 +78,15 @@ async fn require_vault_access(
     crate::permissions::require_team_permissions(pool, team_id, user_id, check).await
 }
 
+/// A connect-only member needs the vault key to decrypt the credentials they
+/// are allowed to *use*; VIEW_SECRETS is what lets a member *read* one
+/// (issue #190). Shared by every route that gates on this pair — the
+/// whole-vault ciphertext stays VIEW_SECRETS-only, see `get_team_blob`.
+const CONNECT_OR_VIEW_SECRETS: PermCheck<'static> = PermCheck::Any(&[
+    crate::permissions::PERM_CONNECT,
+    crate::permissions::PERM_VIEW_SECRETS,
+]);
+
 // ─── GET /v1/teams/:team_id/vault-key ────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -97,14 +106,7 @@ pub async fn get_my_vault_key(
         team_id,
         auth.0,
         "get_vault_key",
-        // A connect-only member needs the key to decrypt the credentials they
-        // are allowed to *use*; VIEW_SECRETS is what lets a member *read* one
-        // (issue #190). The whole-vault ciphertext stays VIEW_SECRETS-only —
-        // see `get_team_blob`.
-        PermCheck::Any(&[
-            crate::permissions::PERM_CONNECT,
-            crate::permissions::PERM_VIEW_SECRETS,
-        ]),
+        CONNECT_OR_VIEW_SECRETS,
     )
     .await?;
 
@@ -150,10 +152,7 @@ pub async fn get_vault_key_at_version(
         team_id,
         auth.0,
         "get_vault_key_at_version",
-        PermCheck::Any(&[
-            crate::permissions::PERM_CONNECT,
-            crate::permissions::PERM_VIEW_SECRETS,
-        ]),
+        CONNECT_OR_VIEW_SECRETS,
     )
     .await?;
 
@@ -176,6 +175,75 @@ pub async fn get_vault_key_at_version(
         wrapped_by_user_id: row.1,
         key_version: version,
     }))
+}
+
+// ─── GET /v1/teams/:team_id/vault-key/rotation-status ────────────────────────
+
+#[derive(Serialize)]
+pub struct RotationStatusResponse {
+    pub stale: bool,
+    pub draining: bool,
+}
+
+pub async fn get_rotation_status(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Path(team_id): Path<Uuid>,
+) -> Result<Json<RotationStatusResponse>, StatusCode> {
+    require_vault_access(
+        &pool,
+        team_id,
+        auth.0,
+        "get_rotation_status",
+        CONNECT_OR_VIEW_SECRETS,
+    )
+    .await?;
+
+    let epoch = current_epoch(&pool, team_id).await?;
+
+    // stale: does a team member with a public key on file lack a row at the
+    // current epoch? A member with no public key can never be covered (they
+    // cannot receive a wrapped key), so they are excluded entirely.
+    let stale: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(
+             SELECT 1 FROM team_members tm
+             JOIN users u ON u.id = tm.user_id
+             WHERE tm.team_id = $1
+               AND u.public_key IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM team_vault_keys tvk
+                 WHERE tvk.team_id = tm.team_id AND tvk.user_id = tm.user_id AND tvk.key_version = $2
+               )
+           )"#,
+    )
+    .bind(team_id)
+    .bind(epoch)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to compute rotation staleness");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // draining: does any ciphertext row still sit on an epoch behind current?
+    let draining: bool = sqlx::query_scalar(
+        r#"SELECT
+             EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND key_version < $2)
+             OR EXISTS(SELECT 1 FROM team_vault_objects WHERE team_id = $1 AND deleted_at IS NULL
+                       AND COALESCE((metadata->>'kv')::int, 1) < $2)
+             OR EXISTS(SELECT 1 FROM team_sync_blobs WHERE team_id = $1 AND key_version < $2)
+           "#,
+    )
+    .bind(team_id)
+    .bind(epoch)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to compute rotation draining state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(RotationStatusResponse { stale, draining }))
 }
 
 // ─── GET /v1/teams/:team_id/vault-key/holders ────────────────────────────────
@@ -768,6 +836,114 @@ mod tests {
         let outsider = seed_user(&pool).await;
 
         let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), Path((team, 1))).await;
+
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    // ─── GET /v1/teams/:team_id/vault-key/rotation-status (#217) ─────────────
+
+    #[tokio::test]
+    async fn rotation_status_not_stale_when_every_keyed_member_holds_the_current_epoch() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await; // key_version defaults to 1
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("status ok")
+            .0;
+
+        assert!(!res.stale);
+        assert!(!res.draining);
+    }
+
+    #[tokio::test]
+    async fn rotation_status_stale_when_a_member_has_no_row_at_the_current_epoch() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await;
+
+        // A second member joined but has never been wrapped a key at all.
+        let newcomer = seed_user(&pool).await;
+        add_member(&pool, team, newcomer).await;
+        sqlx::query("UPDATE users SET public_key = 'newcomer-pubkey' WHERE id = $1")
+            .bind(newcomer).execute(&pool).await.expect("give newcomer a public key");
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("status ok")
+            .0;
+
+        assert!(res.stale);
+    }
+
+    #[tokio::test]
+    async fn rotation_status_ignores_members_with_no_public_key() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await;
+
+        // A member with no public key on file can never receive a wrapped key,
+        // so their absence from team_vault_keys must not force stale=true forever.
+        let keyless = seed_user(&pool).await;
+        add_member(&pool, team, keyless).await;
+        sqlx::query("UPDATE users SET public_key = NULL WHERE id = $1")
+            .bind(keyless).execute(&pool).await.expect("clear public key");
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("status ok")
+            .0;
+
+        assert!(!res.stale, "a keyless member must not count against coverage");
+    }
+
+    #[tokio::test]
+    async fn rotation_status_draining_when_a_secret_row_is_behind_the_current_epoch() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+
+        // Current epoch is 2 (both a key row and an epoch ledger row at 2)...
+        sqlx::query("INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k2', $2, 2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 key");
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 2, $2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 ledger");
+
+        // ...but a secret row is still on epoch 1.
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, 'sec-1', 'obj-1', 'connection_password', 'cipher', $2, 1)",
+        )
+        .bind(team).bind(owner).execute(&pool).await.expect("stale secret");
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("status ok")
+            .0;
+
+        assert!(res.draining);
+    }
+
+    #[tokio::test]
+    async fn rotation_status_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
