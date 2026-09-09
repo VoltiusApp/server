@@ -233,6 +233,41 @@ pub struct ReencryptItem {
     pub metadata: serde_json::Value,
 }
 
+/// Resolves the union of edit permissions needed to touch every object named
+/// by `object_ids` (via each secret's own `object_id` for the secrets case),
+/// then requires the caller hold all of them. Types are read from the
+/// database, never the request, so a caller cannot relabel an object to slip
+/// past the gate. An `object_ids` set matching zero rows requires nothing —
+/// see `require_team_member` below for why that alone is not a hole.
+async fn require_edit_permission_for_object_ids(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+    object_ids: &[String],
+) -> Result<(), StatusCode> {
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = ANY($2)",
+    )
+    .bind(team_id)
+    .bind(object_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to read object types for re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut required: Vec<i64> = Vec::new();
+    for t in &types {
+        let perm = edit_permission_for_str(t).ok_or(StatusCode::BAD_REQUEST)?;
+        if !required.contains(&perm) {
+            required.push(perm);
+        }
+    }
+
+    require_all_team_permissions(pool, team_id, user_id, &required).await
+}
+
 /// Rewrites the metadata blob of existing rows without touching `updated_at`
 /// or `updated_by`, and broadcasts once for the whole batch rather than per
 /// row. Used by the client's one-time pass that encrypts objects written
@@ -260,30 +295,7 @@ pub async fn reencrypt_objects(
 
     let ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
 
-    // The caller must be able to edit every type present in the batch. Types
-    // are read from the database, never from the request, so a caller cannot
-    // relabel a key as a connection to slip past the gate.
-    let types: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = ANY($2)",
-    )
-    .bind(team_id)
-    .bind(&ids)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, "Failed to read object types for re-encryption");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let mut required: Vec<i64> = Vec::new();
-    for t in &types {
-        let perm = edit_permission_for_str(t).ok_or(StatusCode::BAD_REQUEST)?;
-        if !required.contains(&perm) {
-            required.push(perm);
-        }
-    }
-
-    require_all_team_permissions(&pool, team_id, auth.0, &required).await?;
+    require_edit_permission_for_object_ids(&pool, team_id, auth.0, &ids).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to open re-encryption transaction");
@@ -307,6 +319,77 @@ pub async fn reencrypt_objects(
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to commit re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReencryptSecretItem {
+    pub secret_id: String,
+    pub ciphertext: String,
+    pub key_version: i32,
+}
+
+/// Secrets sibling of `reencrypt_objects`: rewrites ciphertext + key_version
+/// only, no audit stamp, one broadcast per batch. Secrets are gated by their
+/// owning object's edit permission (`object_id` join), same as `upsert_secret`.
+pub async fn reencrypt_secrets(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(sync_notifier): Extension<SyncNotifier>,
+    Path(team_id): Path<Uuid>,
+    Json(items): Json<Vec<ReencryptSecretItem>>,
+) -> Result<StatusCode, StatusCode> {
+    require_team_member(&pool, team_id, auth.0).await?;
+
+    if items.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if items.len() > MAX_REENCRYPT_BATCH {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let secret_ids: Vec<String> = items.iter().map(|i| i.secret_id.clone()).collect();
+    let object_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT object_id FROM team_vault_secrets WHERE team_id = $1 AND secret_id = ANY($2)",
+    )
+    .bind(team_id)
+    .bind(&secret_ids)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to read object ids for secret re-encryption");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    require_edit_permission_for_object_ids(&pool, team_id, auth.0, &object_ids).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open secret re-encryption transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    for item in &items {
+        sqlx::query(
+            "UPDATE team_vault_secrets SET ciphertext = $3, key_version = $4 WHERE team_id = $1 AND secret_id = $2",
+        )
+        .bind(team_id)
+        .bind(&item.secret_id)
+        .bind(&item.ciphertext)
+        .bind(item.key_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, secret_id = %item.secret_id, "Failed to re-encrypt secret");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit secret re-encryption");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -1313,5 +1396,126 @@ mod authz_tests {
         .await;
 
         assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    // ── reencrypt_secrets ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reencrypt_secrets_updates_ciphertext_and_key_version() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, 'sec-1', $2, 'connection_password', 'old-cipher', $3, 1)",
+        )
+        .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed old secret");
+
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(editor)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "sec-1".to_string(),
+                ciphertext: "new-cipher".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+
+        let (cipher, kv): (String, i32) = sqlx::query_as(
+            "SELECT ciphertext, key_version FROM team_vault_secrets WHERE team_id = $1 AND secret_id = 'sec-1'",
+        )
+        .bind(team).fetch_one(&pool).await.unwrap();
+        assert_eq!(cipher, "new-cipher");
+        assert_eq!(kv, 2);
+    }
+
+    #[tokio::test]
+    async fn reencrypt_secrets_forbidden_without_the_object_edit_permission() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_VIEW_SECRETS).await; // no EDIT_CONNECTIONS
+
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by) \
+             VALUES ($1, 'sec-1', $2, 'connection_password', 'old-cipher', $3)",
+        )
+        .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed old secret");
+
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "sec-1".to_string(),
+                ciphertext: "new-cipher".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn reencrypt_secrets_forbidden_for_non_member_even_with_no_matching_rows() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await; // never added to team
+
+        // Regression guard for the same class of bug d7ead25 fixed for objects:
+        // an empty permission set from zero matching rows must not pass vacuously.
+        let res = reencrypt_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(vec![ReencryptSecretItem {
+                secret_id: "does-not-exist".to_string(),
+                ciphertext: "x".to_string(),
+                key_version: 2,
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn reencrypt_objects_still_forbidden_for_non_member_after_the_refactor() {
+        // Characterization test: the extraction in this task must not change
+        // reencrypt_objects's existing membership-check behavior (the exact bug
+        // d7ead25 fixed upstream of this branch).
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = reencrypt_objects(
+            State(pool.clone()),
+            Extension(AuthUser(outsider)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(vec![ReencryptItem {
+                object_id: "does-not-exist".to_string(),
+                metadata: serde_json::json!({}),
+            }]),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
     }
 }
