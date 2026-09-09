@@ -44,6 +44,22 @@ async fn require_teams_tier_for_vault(pool: &PgPool, team_id: Uuid) -> Result<()
     }
 }
 
+/// `MAX(key_version)` for a team, defaulting to 1 for a team that has never
+/// rotated (no `team_key_epochs` row — every team predates this feature).
+async fn current_epoch(pool: &PgPool, team_id: Uuid) -> Result<i32, StatusCode> {
+    let max: Option<i32> = sqlx::query_scalar(
+        "SELECT MAX(key_version) FROM team_key_epochs WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to compute current key epoch");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(max.unwrap_or(1))
+}
+
 /// Membership + Teams-tier + permission preamble shared by every team vault route.
 ///
 /// `action` names the attempted operation so the non-member warning stays greppable.
@@ -267,13 +283,17 @@ pub async fn put_vault_keys(
         }
     }
 
+    // put_vault_keys never creates a new epoch — only rotate_vault_key does —
+    // so every write here targets the team's current epoch.
+    let version = current_epoch(&pool, team_id).await?;
+
     // Upsert each wrapped key entry
     for entry in &body.keys {
         sqlx::query(
             r#"
-            INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (team_id, user_id)
+            INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (team_id, user_id, key_version)
             DO UPDATE SET wrapped_key = EXCLUDED.wrapped_key, wrapped_by = EXCLUDED.wrapped_by
             "#,
         )
@@ -281,6 +301,7 @@ pub async fn put_vault_keys(
         .bind(entry.user_id)
         .bind(&entry.wrapped_key)
         .bind(auth.0)
+        .bind(version)
         .execute(&pool)
         .await
         .map_err(|e| {
@@ -466,6 +487,19 @@ mod tests {
     /// Give `user` a role granting PERM_VIEW_SECRETS in `team`.
     async fn grant_view_secrets(pool: &PgPool, team: Uuid, user: Uuid) {
         let role = seed_role(pool, team, "viewer", crate::permissions::PERM_VIEW_SECRETS).await;
+        assign_role(pool, team, user, role).await;
+    }
+
+    /// Give `user` a role granting PERM_VIEW_SECRETS | PERM_COPY_SECRETS in `team`
+    /// — the pair `put_vault_keys` requires of the caller distributing keys.
+    async fn grant_view_secrets_and_copy(pool: &PgPool, team: Uuid, user: Uuid) {
+        let role = seed_role(
+            pool,
+            team,
+            "key-distributor",
+            crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS,
+        )
+        .await;
         assign_role(pool, team, user, role).await;
     }
 
@@ -736,6 +770,51 @@ mod tests {
         let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), Path((team, 1))).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    // ─── PUT /v1/teams/:team_id/vault-key (multi-epoch migration fix) ────────
+
+    #[tokio::test]
+    async fn put_vault_keys_still_works_after_the_multi_epoch_migration() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+
+        let res = put_vault_keys(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(PutVaultKeysRequest {
+                keys: vec![WrappedKeyEntry { user_id: owner, wrapped_key: "wrapped".to_string() }],
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+
+        let (wrapped, kv): (String, i32) = sqlx::query_as(
+            "SELECT wrapped_key, key_version FROM team_vault_keys WHERE team_id = $1 AND user_id = $2",
+        )
+        .bind(team).bind(owner).fetch_one(&pool).await.unwrap();
+        assert_eq!(wrapped, "wrapped");
+        assert_eq!(kv, 1); // no rotation has happened yet, so current epoch is 1
+
+        // Calling it again (re-distribution) must still succeed — the ON CONFLICT
+        // target must actually match the real constraint now.
+        let res2 = put_vault_keys(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(PutVaultKeysRequest {
+                keys: vec![WrappedKeyEntry { user_id: owner, wrapped_key: "wrapped-2".to_string() }],
+            }),
+        )
+        .await;
+        assert_eq!(res2, Ok(StatusCode::NO_CONTENT));
     }
 
     #[tokio::test]
