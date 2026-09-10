@@ -483,6 +483,31 @@ pub async fn add_member(
     Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
 }
 
+async fn request_team_rotation(
+    conn: &mut sqlx::PgConnection,
+    team_id: Uuid,
+) -> Result<(), StatusCode> {
+    let epoch: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(key_version), 1) FROM team_key_epochs WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read current epoch for rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    sqlx::query(
+        "INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, $2) \
+         ON CONFLICT (team_id, requested_at_epoch) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(epoch)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to record rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    Ok(())
+}
+
 // ─── Remove member ────────────────────────────────────────────────────────────
 
 pub async fn remove_member(
@@ -541,23 +566,7 @@ pub async fn remove_member(
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team vault key"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    // Remaining members already hold a current-epoch key, so nothing here is
-    // "under-covered" — flag the removal explicitly so #217 still rotates.
-    let epoch: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(key_version), 1) FROM team_key_epochs WHERE team_id = $1")
-        .bind(team_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to read current epoch for rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    sqlx::query(
-        "INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, $2) \
-         ON CONFLICT (team_id, requested_at_epoch) DO NOTHING",
-    )
-    .bind(team_id)
-    .bind(epoch)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to record rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    request_team_rotation(&mut tx, team_id).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit remove_member transaction");
@@ -1351,6 +1360,20 @@ pub async fn set_member_permissions(
         .execute(&pool)
         .await
         .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    }
+
+    const READ_CLASS: i64 = crate::permissions::PERM_VIEW_SECRETS
+        | crate::permissions::PERM_COPY_SECRETS
+        | crate::permissions::PERM_CONNECT;
+
+    // Only bits newly denied here trigger a rotation; an unchanged resubmit must not.
+    let newly_denied = body.deny & !previous.1;
+    if (newly_denied & READ_CLASS) != 0 {
+        let mut conn = pool.acquire().await.map_err(|e| {
+            error!(error = %e, "Failed to acquire connection for rotation request");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        request_team_rotation(&mut conn, team_id).await?;
     }
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
@@ -2924,5 +2947,81 @@ mod override_response_tests {
             .unwrap_err(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_queues_rotation_only_for_newly_denied_bits() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+
+        let rotations = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+            )
+            .bind(team)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rotations().await, 1);
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rotations().await, 1);
+    }
+
+    #[tokio::test]
+    async fn denying_a_read_class_bit_records_a_rotation_request() {
+        let pool = test_pool_or_skip!();
+        let team = seed_team(&pool, seed_user(&pool).await).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        super::request_team_rotation(&mut conn, team).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+
+        // Idempotent within an epoch.
+        let mut conn = pool.acquire().await.unwrap();
+        super::request_team_rotation(&mut conn, team).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 }
