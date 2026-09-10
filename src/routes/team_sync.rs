@@ -236,7 +236,10 @@ pub async fn get_rotation_status(
 
     // stale: does a team member with a public key on file lack a row at the
     // current epoch? A member with no public key can never be covered (they
-    // cannot receive a wrapped key), so they are excluded entirely.
+    // cannot receive a wrapped key), so they are excluded entirely. Also
+    // stale if `remove_member` left an unresolved rotation request — a
+    // removal never creates an under-covered member, so it can't be caught
+    // above.
     let stale: bool = sqlx::query_scalar(
         r#"SELECT EXISTS(
              SELECT 1 FROM team_members tm
@@ -247,6 +250,9 @@ pub async fn get_rotation_status(
                  SELECT 1 FROM team_vault_keys tvk
                  WHERE tvk.team_id = tm.team_id AND tvk.user_id = tm.user_id AND tvk.key_version = $2
                )
+           ) OR EXISTS(
+             SELECT 1 FROM team_rotation_requests r
+             WHERE r.team_id = $1 AND r.requested_at_epoch >= $2
            )"#,
     )
     .bind(team_id)
@@ -1139,6 +1145,55 @@ mod tests {
             .0;
 
         assert!(res.stale);
+    }
+
+    #[tokio::test]
+    async fn rotation_status_stale_when_a_member_was_removed() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await; // owner fully covered at epoch 1
+
+        // No under-covered member exists — this is the case that a plain
+        // removal (member + their key row deleted, nothing else touched)
+        // could never make stale without the marker below.
+        sqlx::query("INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, 1)")
+            .bind(team).execute(&pool).await.expect("insert rotation request");
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("status ok")
+            .0;
+
+        assert!(res.stale);
+    }
+
+    #[tokio::test]
+    async fn rotation_status_clears_a_removal_marker_once_a_rotation_lands() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        insert_vault_key(&pool, team, owner, owner).await;
+
+        sqlx::query("INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, 1)")
+            .bind(team).execute(&pool).await.expect("insert rotation request");
+
+        // A rotation lands (epoch 1 -> 2), covering the owner at the new epoch.
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 2, $2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("insert epoch 2");
+        sqlx::query("INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k2', $2, 2)")
+            .bind(team).bind(owner).execute(&pool).await.expect("insert vault key at epoch 2");
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+            .await
+            .expect("status ok")
+            .0;
+
+        assert!(!res.stale, "a request stamped behind the current epoch must not keep reporting stale forever");
     }
 
     #[tokio::test]
