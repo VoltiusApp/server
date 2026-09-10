@@ -2721,10 +2721,14 @@ mod override_response_tests {
         assert!(validate_override_masks(-1, 0).is_err());
     }
 
-    use super::override_guardrails;
+    use super::{override_guardrails, set_member_permissions, SetMemberPermissionsRequest};
+    use crate::auth::AuthUser;
     use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
+    use crate::sync_notifier::SyncNotifier;
     use crate::test_support::{assign_role, seed_builtin_roles, seed_role};
+    use axum::extract::{Path, State};
     use axum::http::StatusCode;
+    use axum::{Extension, Json};
 
     #[tokio::test]
     async fn guardrail_rejects_editing_your_own_overrides() {
@@ -2768,6 +2772,12 @@ mod override_response_tests {
         assign_role(&pool, team, owner, owner_role).await;
         add_member(&pool, team, manager).await;
         assign_role(&pool, team, manager, manager_role).await;
+
+        sqlx::query("UPDATE team_roles SET position = 5 WHERE id = $1")
+            .bind(owner_role)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             override_guardrails(&pool, team, manager, owner, 0).await.unwrap_err(),
@@ -2841,6 +2851,45 @@ mod override_response_tests {
 
         assert_eq!(
             override_guardrails(&pool, team, actor, target, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_allows_editing_a_target_holding_no_roles() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let actor_role = seed_role(&pool, team, "actor", PERM_MANAGE_MEMBERS).await;
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+
+        assert!(override_guardrails(&pool, team, actor, target, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_rejects_self_edit() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let role = seed_role(&pool, team, "admin", PERM_MANAGE_MEMBERS).await;
+        add_member(&pool, team, owner).await;
+        assign_role(&pool, team, owner, role).await;
+
+        assert_eq!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(owner)),
+                Extension(SyncNotifier::new()),
+                Path((team, owner)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .unwrap_err(),
             StatusCode::FORBIDDEN
         );
     }
