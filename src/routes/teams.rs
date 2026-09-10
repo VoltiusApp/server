@@ -535,6 +535,24 @@ pub async fn remove_member(
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team vault key"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
+    // Remaining members already hold a current-epoch key, so nothing here is
+    // "under-covered" — flag the removal explicitly so #217 still rotates.
+    let epoch: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(key_version), 1) FROM team_key_epochs WHERE team_id = $1")
+        .bind(team_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to read current epoch for rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    sqlx::query(
+        "INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, $2) \
+         ON CONFLICT (team_id, requested_at_epoch) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(epoch)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to record rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit remove_member transaction");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1453,7 +1471,8 @@ mod authz_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
-        seed_user, set_user_seats, set_user_tier, set_user_trial, unique_handle,
+        seed_team_with_roles, seed_user, set_user_seats, set_user_tier, set_user_trial,
+        unique_handle,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -1784,6 +1803,33 @@ mod authz_tests {
         .await;
 
         assert!(res.is_ok(), "self-removal should succeed, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn remove_member_leaves_a_rotation_request_at_the_current_epoch() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let victim = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
+            Path((team, victim)),
+        )
+        .await;
+
+        assert!(res.is_ok(), "remove_member failed: {:?}", res.err());
+        let requested_epoch: i32 = sqlx::query_scalar(
+            "SELECT requested_at_epoch FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .expect("remove_member must record a rotation request");
+        assert_eq!(requested_epoch, 1, "team never rotated before, so the current epoch defaults to 1");
     }
 
     #[tokio::test]
