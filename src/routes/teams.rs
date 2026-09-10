@@ -2893,4 +2893,36 @@ mod override_response_tests {
             StatusCode::FORBIDDEN
         );
     }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_rejects_a_lower_ranked_caller() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "lower", PERM_MANAGE_MEMBERS).await;
+        let target_role = seed_role(&pool, team, "higher", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 4 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        assert_eq!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                Path((team, target)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
 }
