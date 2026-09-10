@@ -351,6 +351,10 @@ async fn main() {
             "/v1/teams/:team_id/members/:user_id/roles/:role_id",
             delete(routes::teams::remove_member_role),
         )
+        .route(
+            "/v1/teams/:team_id/members/:user_id/permissions",
+            put(routes::teams::set_member_permissions),
+        )
         .route("/v1/users/search", get(routes::teams::search_users))
         .route(
             "/v1/users/:user_id/public-key",

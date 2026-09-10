@@ -1206,6 +1206,117 @@ pub async fn remove_member_role(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Set per-member permission overrides ──────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SetMemberPermissionsRequest {
+    pub allow: i64,
+    pub deny: i64,
+}
+
+fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
+    let known = crate::permissions::ALL_PERMISSIONS;
+    if allow < 0 || deny < 0 || (allow & !known) != 0 || (deny & !known) != 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if (allow & deny) != 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+pub async fn set_member_permissions(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
+    Json(body): Json<SetMemberPermissionsRequest>,
+) -> Result<StatusCode, StatusCode> {
+    validate_override_masks(body.allow, body.deny)?;
+
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
+    )
+    .await?;
+    if !can_manage {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check target membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if !is_member {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let previous = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides \
+         WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read existing overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or((0, 0));
+
+    if body.allow == 0 && body.deny == 0 {
+        sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
+            .bind(team_id)
+            .bind(target_user_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| { error!(error = %e, "Failed to clear member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    } else {
+        sqlx::query(
+            "INSERT INTO team_member_permission_overrides \
+                 (team_id, user_id, allow_mask, deny_mask, updated_at, updated_by) \
+             VALUES ($1, $2, $3, $4, now(), $5) \
+             ON CONFLICT (team_id, user_id) DO UPDATE \
+             SET allow_mask = $3, deny_mask = $4, updated_at = now(), updated_by = $5",
+        )
+        .bind(team_id)
+        .bind(target_user_id)
+        .bind(body.allow)
+        .bind(body.deny)
+        .bind(auth.0)
+        .execute(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    }
+
+    let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
+        .bind(target_user_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+
+    info!(team_id = %team_id, target_user_id = %target_user_id, allow = body.allow, deny = body.deny, "Member permission overrides set");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.permissions_changed",
+        Some("user"),
+        Some(target_user_id.to_string()),
+        target_display_name,
+        Some(json!({
+            "previous_allow": previous.0,
+            "previous_deny": previous.1,
+            "allow": body.allow,
+            "deny": body.deny,
+        })),
+    ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── Invite member (email-based) ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2529,5 +2640,22 @@ mod override_response_tests {
         .unwrap();
 
         assert_eq!(rows, (PERM_CONNECT, PERM_VIEW_SECRETS));
+    }
+
+    #[test]
+    fn validates_masks_against_the_known_permission_bits() {
+        use super::validate_override_masks;
+        use crate::permissions::ALL_PERMISSIONS;
+
+        assert!(validate_override_masks(PERM_CONNECT, PERM_VIEW_SECRETS).is_ok());
+        assert!(validate_override_masks(0, 0).is_ok());
+        assert!(validate_override_masks(ALL_PERMISSIONS, 0).is_ok());
+        // A bit outside the known set.
+        assert!(validate_override_masks(1 << 40, 0).is_err());
+        assert!(validate_override_masks(0, 1 << 40).is_err());
+        // The same bit in both masks is ambiguous.
+        assert!(validate_override_masks(PERM_CONNECT, PERM_CONNECT).is_err());
+        // Negative masks cannot come from a well-formed client.
+        assert!(validate_override_masks(-1, 0).is_err());
     }
 }
