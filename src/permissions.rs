@@ -85,6 +85,14 @@ async fn effective_permissions(
         })
 }
 
+pub async fn effective_permissions_for(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+) -> Result<i64, StatusCode> {
+    effective_permissions(pool, team_id, user_id).await
+}
+
 /// Returns true if any of (team_id, user_id)'s roles grant `permission`.
 pub async fn has_team_permission(
     pool: &PgPool,

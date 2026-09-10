@@ -1225,6 +1225,66 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
+async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Option<i32>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT MIN(tr.position) FROM team_member_roles tmr \
+         JOIN team_roles tr ON tr.id = tmr.role_id \
+         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+}
+
+async fn override_guardrails(
+    pool: &PgPool,
+    team_id: Uuid,
+    actor_id: Uuid,
+    target_user_id: Uuid,
+    allow: i64,
+) -> Result<(), StatusCode> {
+    if actor_id == target_user_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let target_is_owner = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+             SELECT 1 FROM team_member_roles tmr \
+             JOIN team_roles tr ON tr.id = tmr.role_id \
+             WHERE tmr.team_id = $1 AND tmr.user_id = $2 \
+               AND tr.is_builtin AND tr.name = 'owner')",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check target owner role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if target_is_owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let actor_effective = crate::permissions::effective_permissions_for(pool, team_id, actor_id).await?;
+    if (allow & !actor_effective) != 0 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let actor_position = role_position(pool, team_id, actor_id)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to read actor role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let target_position = role_position(pool, team_id, target_user_id)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to read target role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    // Position ascends as authority falls; owner is 0. A roleless actor has no position and outranks nobody.
+    match (actor_position, target_position) {
+        (Some(actor_pos), Some(target_pos)) if actor_pos < target_pos => Ok(()),
+        (Some(_), None) => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
 pub async fn set_member_permissions(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
@@ -1254,6 +1314,8 @@ pub async fn set_member_permissions(
     if !is_member {
         return Err(StatusCode::NOT_FOUND);
     }
+
+    override_guardrails(&pool, team_id, auth.0, target_user_id, body.allow).await?;
 
     let previous = sqlx::query_as::<_, (i64, i64)>(
         "SELECT allow_mask, deny_mask FROM team_member_permission_overrides \
@@ -2657,5 +2719,127 @@ mod override_response_tests {
         assert!(validate_override_masks(PERM_CONNECT, PERM_CONNECT).is_err());
         // Negative masks cannot come from a well-formed client.
         assert!(validate_override_masks(-1, 0).is_err());
+    }
+
+    use super::override_guardrails;
+    use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
+    use crate::test_support::{assign_role, seed_builtin_roles, seed_role};
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn guardrail_rejects_editing_your_own_overrides() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, owner, owner, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_targeting_an_owner() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let manager = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        seed_builtin_roles(&pool, team).await;
+
+        let owner_role = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM team_roles WHERE team_id = $1 AND name = 'owner'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let manager_role = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM team_roles WHERE team_id = $1 AND name = 'manager'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        add_member(&pool, team, owner).await;
+        assign_role(&pool, team, owner, owner_role).await;
+        add_member(&pool, team, manager).await;
+        assign_role(&pool, team, manager, manager_role).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, manager, owner, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_granting_a_permission_the_actor_lacks() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "actor", PERM_MANAGE_MEMBERS).await;
+        let target_role = seed_role(&pool, team, "target", PERM_CONNECT).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        // The actor does not hold MANAGE_ROLES, so cannot hand it out.
+        assert_eq!(
+            override_guardrails(&pool, team, actor, target, PERM_MANAGE_ROLES).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // Granting something the actor does hold is fine.
+        assert!(override_guardrails(&pool, team, actor, target, PERM_MANAGE_MEMBERS).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_targeting_someone_at_or_above_the_actors_position() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "actor", PERM_MANAGE_MEMBERS).await;
+        let target_role = seed_role(&pool, team, "target", PERM_CONNECT).await;
+        sqlx::query("UPDATE team_roles SET position = 3 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, actor, target, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_an_actor_holding_no_roles() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let target_role = seed_role(&pool, team, "target", PERM_CONNECT).await;
+
+        add_member(&pool, team, actor).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, actor, target, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
     }
 }
