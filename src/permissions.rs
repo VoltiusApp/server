@@ -200,7 +200,7 @@ mod db_tests {
     //! Requires `TEST_DATABASE_URL`; otherwise each test skips.
     use super::*;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, assign_role, seed_role, seed_team, seed_user};
+    use crate::test_support::{add_member, assign_role, seed_role, seed_team, seed_user, set_member_overrides};
 
     #[tokio::test]
     async fn has_team_permission_reflects_granted_bit() {
@@ -320,5 +320,32 @@ mod db_tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn overrides_cascade_when_member_is_removed() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let member = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, member).await;
+        set_member_overrides(&pool, team, member, PERM_VIEW_SECRETS, 0).await;
+
+        sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+            .bind(team)
+            .bind(member)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+        )
+        .bind(team)
+        .bind(member)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

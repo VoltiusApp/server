@@ -223,6 +223,22 @@ pub async fn assign_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) {
         .expect("assign role");
 }
 
+/// Set permission overrides for `user` within `team`.
+pub async fn set_member_overrides(pool: &PgPool, team: Uuid, user: Uuid, allow: i64, deny: i64) {
+    sqlx::query(
+        "INSERT INTO team_member_permission_overrides (team_id, user_id, allow_mask, deny_mask, updated_by) \
+         VALUES ($1, $2, $3, $4, $2) \
+         ON CONFLICT (team_id, user_id) DO UPDATE SET allow_mask = $3, deny_mask = $4",
+    )
+    .bind(team)
+    .bind(user)
+    .bind(allow)
+    .bind(deny)
+    .execute(pool)
+    .await
+    .expect("set member overrides");
+}
+
 /// Seed a user, grant them a single role with exactly `perms`, add them to
 /// `team`, and assign the role. Returns the new member's id. The common setup
 /// for handler authorization tests.
