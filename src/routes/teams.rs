@@ -1326,13 +1326,18 @@ pub async fn set_member_permissions(
 
     override_guardrails(&pool, team_id, auth.0, target_user_id, body.allow).await?;
 
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin set_member_permissions transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let previous = sqlx::query_as::<_, (i64, i64)>(
         "SELECT allow_mask, deny_mask FROM team_member_permission_overrides \
          WHERE team_id = $1 AND user_id = $2",
     )
     .bind(team_id)
     .bind(target_user_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| { error!(error = %e, "Failed to read existing overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
     .unwrap_or((0, 0));
@@ -1341,7 +1346,7 @@ pub async fn set_member_permissions(
         sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
             .bind(team_id)
             .bind(target_user_id)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| { error!(error = %e, "Failed to clear member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
     } else {
@@ -1357,7 +1362,7 @@ pub async fn set_member_permissions(
         .bind(body.allow)
         .bind(body.deny)
         .bind(auth.0)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
     }
@@ -1369,12 +1374,13 @@ pub async fn set_member_permissions(
     // Only bits newly denied here trigger a rotation; an unchanged resubmit must not.
     let newly_denied = body.deny & !previous.1;
     if (newly_denied & READ_CLASS) != 0 {
-        let mut conn = pool.acquire().await.map_err(|e| {
-            error!(error = %e, "Failed to acquire connection for rotation request");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        request_team_rotation(&mut conn, team_id).await?;
+        request_team_rotation(&mut tx, team_id).await?;
     }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit set_member_permissions transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -2993,6 +2999,41 @@ mod override_response_tests {
         .await
         .unwrap();
         assert_eq!(rotations().await, 1);
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_does_not_queue_rotation_for_non_read_class_denies() {
+        use crate::permissions::PERM_EDIT_CONNECTIONS;
+
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_EDIT_CONNECTIONS }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
