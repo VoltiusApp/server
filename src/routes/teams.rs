@@ -200,6 +200,8 @@ pub struct TeamWithRole {
     pub owner_tier: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub role_ids: Vec<Uuid>,
+    pub permission_allow: i64,
+    pub permission_deny: i64,
 }
 
 pub async fn list_teams(
@@ -207,13 +209,15 @@ pub async fn list_teams(
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<TeamWithRole>>, StatusCode> {
     // Returns one row per (team, role) — aggregated in Rust
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>, i64, i64)>(
         r#"
-        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id
+        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id,
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
         JOIN users u ON u.id = t.owner_id
         LEFT JOIN team_member_roles tmr ON tmr.team_id = t.id AND tmr.user_id = $1
+        LEFT JOIN team_member_permission_overrides o ON o.team_id = t.id AND o.user_id = $1
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
     )
@@ -226,7 +230,7 @@ pub async fn list_teams(
     })?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
-    for (id, name, owner_id, owner_tier, created_at, role_id) in rows {
+    for (id, name, owner_id, owner_tier, created_at, role_id, permission_allow, permission_deny) in rows {
         match teams.last_mut() {
             Some(last) if last.id == id => {
                 if let Some(rid) = role_id {
@@ -241,6 +245,8 @@ pub async fn list_teams(
                     owner_tier,
                     created_at,
                     role_ids: role_id.into_iter().collect(),
+                    permission_allow,
+                    permission_deny,
                 });
             }
         }
@@ -303,23 +309,20 @@ pub async fn list_members(
     let rows = sqlx::query_as::<
         _,
         (
-            Uuid,
-            Uuid,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-            String,
-            String,
-            Option<String>,
-            Option<Uuid>,
+            Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>,
+            String, String, Option<String>, Option<Uuid>, i64, i64,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.handle AS invited_by_display_name, tm.joined_at,
-               u.handle AS display_name, u.handle, u.public_key, tmr.role_id
+               u.handle AS display_name, u.handle, u.public_key, tmr.role_id,
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
         LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
+        LEFT JOIN team_member_permission_overrides o
+               ON o.team_id = tm.team_id AND o.user_id = tm.user_id
         WHERE tm.team_id = $1
         ORDER BY tm.joined_at ASC, tmr.role_id ASC NULLS LAST
         "#,
@@ -333,7 +336,8 @@ pub async fn list_members(
     })?;
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
-    for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key, role_id) in rows
+    for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key,
+         role_id, permission_allow, permission_deny) in rows
     {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
@@ -353,6 +357,8 @@ pub async fn list_members(
                         invited_by_display_name,
                         joined_at,
                         role_ids: role_id.into_iter().collect(),
+                        permission_allow,
+                        permission_deny,
                     },
                 });
             }
@@ -2491,5 +2497,37 @@ mod search_tests {
         let json = serde_json::to_string(&hits).unwrap();
         assert!(!json.contains("public_key"), "search must never carry key material: {json}");
         assert!(hits.iter().any(|r| r.user_id == them));
+    }
+}
+
+#[cfg(test)]
+mod override_response_tests {
+    use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_user, set_member_overrides};
+
+    #[tokio::test]
+    async fn member_masks_are_read_back_from_the_database() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let member = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, member).await;
+        set_member_overrides(&pool, team, member, PERM_CONNECT, PERM_VIEW_SECRETS).await;
+
+        let rows = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0) \
+             FROM team_members tm \
+             LEFT JOIN team_member_permission_overrides o \
+                    ON o.team_id = tm.team_id AND o.user_id = tm.user_id \
+             WHERE tm.team_id = $1 AND tm.user_id = $2",
+        )
+        .bind(team)
+        .bind(member)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows, (PERM_CONNECT, PERM_VIEW_SECRETS));
     }
 }

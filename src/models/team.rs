@@ -36,4 +36,6 @@ pub struct TeamMember {
     pub invited_by_display_name: Option<String>,
     pub joined_at: DateTime<Utc>,
     pub role_ids: Vec<Uuid>,
+    pub permission_allow: i64,
+    pub permission_deny: i64,
 }
