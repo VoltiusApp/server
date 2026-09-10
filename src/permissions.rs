@@ -51,6 +51,12 @@ pub const BUILTIN_ROLES: &[(&str, i64, i32)] = &[
     ("connect-only", 28676,                       4), // no edit perms today
 ];
 
+const PERMISSION_JOINS: &str = r#"
+    FROM team_members tm
+    LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
+    LEFT JOIN team_roles tr ON tr.id = tmr.role_id
+"#;
+
 /// Union of all role permission bits granted to (team_id, user_id).
 /// Returns 0 if the user has no roles in the team (or is not a member).
 async fn effective_permissions(
@@ -58,22 +64,20 @@ async fn effective_permissions(
     team_id: Uuid,
     user_id: Uuid,
 ) -> Result<i64, StatusCode> {
-    sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COALESCE(bit_or(tr.permissions), 0)
-        FROM team_member_roles tmr
-        JOIN team_roles tr ON tr.id = tmr.role_id
-        WHERE tmr.team_id = $1 AND tmr.user_id = $2
-        "#,
-    )
-    .bind(team_id)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permission");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    let sql = format!(
+        "SELECT COALESCE(bit_or(tr.permissions), 0) {PERMISSION_JOINS} \
+         WHERE tm.team_id = $1 AND tm.user_id = $2"
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .bind(team_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map(|v| v.unwrap_or(0))
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permission");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// Returns true if any of (team_id, user_id)'s roles grant `permission`.
@@ -171,22 +175,20 @@ pub async fn has_any_team_permission(
     if team_ids.is_empty() {
         return Ok(false);
     }
-    let effective = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COALESCE(bit_or(tr.permissions), 0)
-        FROM team_member_roles tmr
-        JOIN team_roles tr ON tr.id = tmr.role_id
-        WHERE tmr.team_id = ANY($1) AND tmr.user_id = $2
-        "#,
-    )
-    .bind(team_ids)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %user_id, "Failed to check any-team permission");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let sql = format!(
+        "SELECT COALESCE(bit_or(tr.permissions), 0) {PERMISSION_JOINS} \
+         WHERE tm.team_id = ANY($1) AND tm.user_id = $2"
+    );
+    let effective = sqlx::query_scalar::<_, i64>(&sql)
+        .bind(team_ids)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map(|v| v.unwrap_or(0))
+        .map_err(|e| {
+            error!(error = %e, user_id = %user_id, "Failed to check any-team permission");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok((effective & permission) != 0)
 }
