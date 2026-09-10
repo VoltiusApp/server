@@ -409,7 +409,7 @@ pub async fn put_vault_keys(
 
     info!(team_id = %team_id, upserter = %auth.0, key_count = body.keys.len(), "Vault keys upserted");
     for user_id in vault_key_notification_targets(auth.0, &body.keys) {
-        sync_notifier.notify_membership_changed(user_id);
+        sync_notifier.notify_vault_key_changed(user_id);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -525,7 +525,7 @@ pub async fn rotate_vault_key(
 
     info!(team_id = %team_id, rotated_by = %auth.0, new_epoch = next_version, member_count = body.keys.len(), "Team vault key rotated");
     for user_id in vault_key_notification_targets(auth.0, &body.keys) {
-        sync_notifier.notify_membership_changed(user_id);
+        sync_notifier.notify_vault_key_changed(user_id);
     }
     Ok(StatusCode::NO_CONTENT)
 }

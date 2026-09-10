@@ -583,7 +583,7 @@ pub async fn remove_member(
         removed_display_name,
         None,
     ));
-    notifier.notify_membership_changed(user_id);
+    notifier.notify_membership_changed(user_id, team_id, false);
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -629,7 +629,7 @@ pub async fn delete_team(
 
     info!(team_id = %team_id, deleted_by = %auth.0, "Team deleted by owner");
     for member_id in member_ids {
-        notifier.notify_membership_changed(member_id);
+        notifier.notify_membership_changed(member_id, team_id, false);
     }
     Ok(StatusCode::NO_CONTENT)
 }

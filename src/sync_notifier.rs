@@ -8,7 +8,9 @@ pub enum SyncEvent {
     /// Another device pushed a blob for this user.
     BlobPushed { user_id: Uuid, device_id: String },
     /// The user's team membership changed (added to or removed from a team).
-    MembershipChanged { user_id: Uuid },
+    MembershipChanged { user_id: Uuid, team_id: Uuid, added: bool },
+    /// A vault key was (re)wrapped for a user who was already a member.
+    VaultKeyChanged { user_id: Uuid },
     /// A teammate's online/offline status changed. `recipient` is who should receive it.
     PresenceChanged {
         recipient: Uuid,
@@ -52,8 +54,13 @@ impl SyncNotifier {
         });
     }
 
-    pub fn notify_membership_changed(&self, user_id: Uuid) {
-        let _ = self.0.tx.send(SyncEvent::MembershipChanged { user_id });
+    pub fn notify_membership_changed(&self, user_id: Uuid, team_id: Uuid, added: bool) {
+        let _ = self.0.tx.send(SyncEvent::MembershipChanged { user_id, team_id, added });
+    }
+
+    /// Not a membership change — see `SyncEvent::VaultKeyChanged`.
+    pub fn notify_vault_key_changed(&self, user_id: Uuid) {
+        let _ = self.0.tx.send(SyncEvent::VaultKeyChanged { user_id });
     }
 
     /// Tell this user's own devices to refetch `/my/pending-invitations`, after

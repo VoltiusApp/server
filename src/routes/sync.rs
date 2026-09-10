@@ -310,8 +310,12 @@ pub async fn sync_stream(
             Ok(SyncEvent::BlobPushed { user_id: uid, device_id }) if uid == user_id => {
                 Some(Ok(Event::default().data(device_id)))
             }
-            Ok(SyncEvent::MembershipChanged { user_id: uid }) if uid == user_id => {
-                Some(Ok(Event::default().data("membership_changed")))
+            Ok(SyncEvent::MembershipChanged { user_id: uid, team_id, added }) if uid == user_id => {
+                let kind = if added { "added" } else { "removed" };
+                Some(Ok(Event::default().data(format!("membership_changed:{}:{}", kind, team_id))))
+            }
+            Ok(SyncEvent::VaultKeyChanged { user_id: uid }) if uid == user_id => {
+                Some(Ok(Event::default().data("vault_key_changed")))
             }
             Ok(SyncEvent::PresenceChanged { recipient, subject, online }) if recipient == user_id => {
                 let status = if online { "online" } else { "offline" };

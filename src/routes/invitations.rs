@@ -182,7 +182,7 @@ pub async fn accept_invitation(
         Some(user_email.clone()),
         Some(json!({ "role": role, "via": "invitation" })),
     ));
-    notifier.notify_membership_changed(auth.0);
+    notifier.notify_membership_changed(auth.0, team_id, true);
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -298,7 +298,7 @@ pub async fn accept_my_pending_invitation(
         user_email,
         Some(json!({ "role": role, "via": "in_app_invite" })),
     ));
-    notifier.notify_membership_changed(auth.0);
+    notifier.notify_membership_changed(auth.0, team_id, true);
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
