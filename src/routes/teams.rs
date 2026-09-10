@@ -2731,7 +2731,9 @@ mod override_response_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
+        let role = seed_role(&pool, team, "admin", PERM_MANAGE_MEMBERS).await;
         add_member(&pool, team, owner).await;
+        assign_role(&pool, team, owner, role).await;
 
         assert_eq!(
             override_guardrails(&pool, team, owner, owner, 0).await.unwrap_err(),
