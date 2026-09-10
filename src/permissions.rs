@@ -181,21 +181,25 @@ pub async fn has_any_team_permission(
         return Ok(false);
     }
     let sql = format!(
-        "SELECT COALESCE(bit_or(tr.permissions), 0) {PERMISSION_JOINS} \
-         WHERE tm.team_id = ANY($1) AND tm.user_id = $2"
+        "SELECT COALESCE(bool_or(granted), false) FROM ( \
+             SELECT (({EFFECTIVE_EXPR}) & $3) <> 0 AS granted \
+             {PERMISSION_JOINS} \
+             WHERE tm.team_id = ANY($1) AND tm.user_id = $2 \
+             GROUP BY tm.team_id \
+         ) per_team"
     );
-    let effective = sqlx::query_scalar::<_, i64>(&sql)
+    let granted = sqlx::query_scalar::<_, bool>(&sql)
         .bind(team_ids)
         .bind(user_id)
-        .fetch_optional(pool)
+        .bind(permission)
+        .fetch_one(pool)
         .await
-        .map(|v| v.unwrap_or(0))
         .map_err(|e| {
             error!(error = %e, user_id = %user_id, "Failed to check any-team permission");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok((effective & permission) != 0)
+    Ok(granted)
 }
 
 #[cfg(test)]
@@ -424,5 +428,68 @@ mod db_tests {
         .await;
 
         assert!(!has_team_permission(&pool, team, user, PERM_VIEW_SECRETS).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deny_in_one_team_does_not_suppress_a_grant_in_another() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team_a = seed_team(&pool, user).await;
+        let team_b = seed_team(&pool, user).await;
+
+        let role_a = seed_role(&pool, team_a, "a", PERM_VIEW_AUDIT_LOG).await;
+        add_member(&pool, team_a, user).await;
+        assign_role(&pool, team_a, user, role_a).await;
+        crate::test_support::set_member_overrides(&pool, team_a, user, 0, PERM_VIEW_AUDIT_LOG).await;
+
+        let role_b = seed_role(&pool, team_b, "b", PERM_VIEW_AUDIT_LOG).await;
+        add_member(&pool, team_b, user).await;
+        assign_role(&pool, team_b, user, role_b).await;
+
+        assert!(
+            has_any_team_permission(&pool, &[team_a, team_b], user, PERM_VIEW_AUDIT_LOG)
+                .await
+                .unwrap(),
+            "team_b still grants the bit; team_a's deny must not reach across teams"
+        );
+        assert!(
+            !has_team_permission(&pool, team_a, user, PERM_VIEW_AUDIT_LOG).await.unwrap(),
+            "team_a's own deny still applies inside team_a"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_override_applies_to_multi_team_checks() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team = seed_team(&pool, user).await;
+        let role = seed_role(&pool, team, "r", PERM_VIEW_AUDIT_LOG).await;
+        add_member(&pool, team, user).await;
+        assign_role(&pool, team, user, role).await;
+        crate::test_support::set_member_overrides(&pool, team, user, 0, PERM_VIEW_AUDIT_LOG).await;
+
+        assert!(
+            !has_any_team_permission(&pool, &[team], user, PERM_VIEW_AUDIT_LOG)
+                .await
+                .unwrap(),
+            "a deny override must be honoured on the multi-team path, not only the single-team one"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_override_applies_to_multi_team_checks() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let member = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, member).await;
+        crate::test_support::set_member_overrides(&pool, team, member, PERM_VIEW_AUDIT_LOG, 0).await;
+
+        assert!(
+            has_any_team_permission(&pool, &[team], member, PERM_VIEW_AUDIT_LOG)
+                .await
+                .unwrap(),
+            "an allow override must grant on the multi-team path"
+        );
     }
 }
