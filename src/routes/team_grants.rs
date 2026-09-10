@@ -385,7 +385,7 @@ pub async fn redeem_grant(
     // The joiner's own devices refetch their team list; every member — the
     // joiner included — gets `team_members:<team_id>`, which is the event an
     // online key-holder's reconcileTeamVaultKeys listens for.
-    notifier.notify_membership_changed(auth.0);
+    notifier.notify_membership_changed(auth.0, locked.team_id, true);
     notify_team_members_changed(&pool, &notifier, locked.team_id).await;
 
     Ok(Json(response))
@@ -1023,7 +1023,7 @@ mod tests {
                 {
                     roster_events.push(user_id)
                 }
-                SyncEvent::MembershipChanged { user_id } => membership_events.push(user_id),
+                SyncEvent::MembershipChanged { user_id, .. } => membership_events.push(user_id),
                 _ => {}
             }
         }
