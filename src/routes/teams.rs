@@ -566,6 +566,13 @@ pub async fn remove_member(
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team vault key"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
+    sqlx::query("DELETE FROM team_member_roles WHERE team_id = $1 AND user_id = $2")
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to remove team member roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
     request_team_rotation(&mut tx, team_id).await?;
 
     tx.commit().await.map_err(|e| {
@@ -2038,6 +2045,34 @@ mod authz_tests {
         .await
         .expect("remove_member must record a rotation request");
         assert_eq!(requested_epoch, 1, "team never rotated before, so the current epoch defaults to 1");
+    }
+
+    #[tokio::test]
+    async fn remove_member_deletes_their_role_rows_so_re_invite_cannot_restore_them() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let victim = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
+            Path((team, victim)),
+        )
+        .await;
+        assert!(res.is_ok(), "remove_member failed: {:?}", res.err());
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_member_roles WHERE team_id = $1 AND user_id = $2",
+        )
+        .bind(team)
+        .bind(victim)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "role rows must not survive removal, or re-invite restores them");
     }
 
     #[tokio::test]
