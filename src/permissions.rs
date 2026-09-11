@@ -64,7 +64,7 @@ const EFFECTIVE_EXPR: &str = "(COALESCE(bit_or(tr.permissions), 0) | COALESCE(MA
                               & ~COALESCE(MAX(o.deny_mask), 0)";
 
 /// `(roleUnion | allow) & ~deny`. Returns 0 if the user is not a member.
-async fn effective_permissions(
+pub async fn effective_permissions(
     pool: &PgPool,
     team_id: Uuid,
     user_id: Uuid,
@@ -83,14 +83,6 @@ async fn effective_permissions(
             error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permission");
             StatusCode::INTERNAL_SERVER_ERROR
         })
-}
-
-pub async fn effective_permissions_for(
-    pool: &PgPool,
-    team_id: Uuid,
-    user_id: Uuid,
-) -> Result<i64, StatusCode> {
-    effective_permissions(pool, team_id, user_id).await
 }
 
 /// Returns true if any of (team_id, user_id)'s roles grant `permission`.

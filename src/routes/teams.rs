@@ -1291,7 +1291,7 @@ async fn override_guardrails(
     .map_err(|e| { error!(error = %e, "Failed to read previous overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
     .unwrap_or(0);
 
-    let actor_effective = crate::permissions::effective_permissions_for(pool, team_id, actor_id).await?;
+    let actor_effective = crate::permissions::effective_permissions(pool, team_id, actor_id).await?;
     // A target's authority can come entirely from an allow override, so the actor
     // must hold every bit they revoke, not only every bit they grant.
     let removing = previous_allow & !allow;
