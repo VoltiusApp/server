@@ -1399,14 +1399,13 @@ pub async fn set_member_permissions(
         .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
     }
 
-    // Bits get_my_vault_key's CONNECT_OR_VIEW_SECRETS gate keys epoch-key access on
-    // (team_sync.rs) — rotation only helps if it revokes one of these.
+    // Mirrors get_my_vault_key's CONNECT_OR_VIEW_SECRETS gate (team_sync.rs), which is
+    // Any: only crossing from holding one of these to holding neither revokes key access.
     const KEY_GATING: i64 = crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_CONNECT;
 
     let prev_effective = (role_union | previous.0) & !previous.1;
     let next_effective = (role_union | body.allow) & !body.deny;
-    let lost = prev_effective & !next_effective & KEY_GATING;
-    if lost != 0 {
+    if (prev_effective & KEY_GATING) != 0 && (next_effective & KEY_GATING) == 0 {
         request_team_rotation(&mut tx, team_id).await?;
     }
 
@@ -3151,6 +3150,47 @@ mod override_response_tests {
         .await
         .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_does_not_queue_rotation_while_connect_still_gates() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+
+        let target_role = seed_role(&pool, team, "reader", PERM_VIEW_SECRETS | PERM_CONNECT).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "CONNECT still satisfies the Any key gate, so the member keeps key access and rotation buys nothing"
+        );
     }
 
     #[tokio::test]
