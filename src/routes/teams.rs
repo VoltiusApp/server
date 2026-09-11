@@ -1349,6 +1349,17 @@ pub async fn set_member_permissions(
     .map_err(|e| { error!(error = %e, "Failed to read existing overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
     .unwrap_or((0, 0));
 
+    let role_union: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
+         JOIN team_roles tr ON tr.id = tmr.role_id \
+         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read target role union"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
     if body.allow == 0 && body.deny == 0 {
         sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
             .bind(team_id)
@@ -1374,13 +1385,14 @@ pub async fn set_member_permissions(
         .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
     }
 
-    const READ_CLASS: i64 = crate::permissions::PERM_VIEW_SECRETS
-        | crate::permissions::PERM_COPY_SECRETS
-        | crate::permissions::PERM_CONNECT;
+    // Bits get_my_vault_key's CONNECT_OR_VIEW_SECRETS gate keys epoch-key access on
+    // (team_sync.rs) — rotation only helps if it revokes one of these.
+    const KEY_GATING: i64 = crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_CONNECT;
 
-    // Only bits newly denied here trigger a rotation; an unchanged resubmit must not.
-    let newly_denied = body.deny & !previous.1;
-    if (newly_denied & READ_CLASS) != 0 {
+    let prev_effective = (role_union | previous.0) & !previous.1;
+    let next_effective = (role_union | body.allow) & !body.deny;
+    let lost = prev_effective & !next_effective & KEY_GATING;
+    if lost != 0 {
         request_team_rotation(&mut tx, team_id).await?;
     }
 
@@ -2789,7 +2801,7 @@ mod override_response_tests {
     use crate::auth::AuthUser;
     use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
     use crate::sync_notifier::SyncNotifier;
-    use crate::test_support::{assign_role, seed_builtin_roles, seed_role};
+    use crate::test_support::{assign_role, seed_builtin_roles, seed_role, seed_team_with_roles};
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
@@ -2991,7 +3003,7 @@ mod override_response_tests {
     }
 
     #[tokio::test]
-    async fn set_member_permissions_handler_queues_rotation_only_for_newly_denied_bits() {
+    async fn set_member_permissions_handler_queues_rotation_when_a_role_granted_bit_is_denied() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -2999,9 +3011,13 @@ mod override_response_tests {
         let team = seed_team(&pool, owner).await;
 
         let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
         add_member(&pool, team, actor).await;
         assign_role(&pool, team, actor, actor_role).await;
+        let target_role = seed_role(&pool, team, "viewer", PERM_VIEW_SECRETS).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
         add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
 
         let rotations = || async {
             sqlx::query_scalar::<_, i64>(
@@ -3069,6 +3085,74 @@ mod override_response_tests {
         .await
         .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_does_not_queue_rotation_for_a_copy_secrets_only_deny() {
+        use crate::permissions::PERM_COPY_SECRETS;
+
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        let target_role = seed_role(&pool, team, "copier", PERM_COPY_SECRETS).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "COPY_SECRETS alone does not gate get_my_vault_key, so rotation buys nothing");
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_queues_rotation_when_clearing_the_only_allow_grant() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let contractor = seed_user(&pool).await;
+        add_member(&pool, team, contractor).await;
+        crate::test_support::set_member_overrides(&pool, team, contractor, PERM_VIEW_SECRETS, 0).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path((team, contractor)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "clearing a roleless member's only read-class allow must still revoke key access");
     }
 
     #[tokio::test]
