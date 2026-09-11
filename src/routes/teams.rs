@@ -1281,8 +1281,21 @@ async fn override_guardrails(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let previous_allow: i64 = sqlx::query_scalar(
+        "SELECT allow_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read previous overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or(0);
+
     let actor_effective = crate::permissions::effective_permissions_for(pool, team_id, actor_id).await?;
-    if (allow & !actor_effective) != 0 {
+    // A target's authority can come entirely from an allow override, so the actor
+    // must hold every bit they revoke, not only every bit they grant.
+    let removing = previous_allow & !allow;
+    if ((allow | removing) & !actor_effective) != 0 {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -2886,6 +2899,58 @@ mod override_response_tests {
         );
         // Granting something the actor does hold is fine.
         assert!(override_guardrails(&pool, team, actor, target, PERM_MANAGE_MEMBERS).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_rejects_stripping_an_allow_override_the_actor_lacks() {
+        use crate::permissions::PERM_MANAGE_VAULT;
+
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        // A roleless contractor whose sole authority is an owner-granted allow.
+        let contractor = seed_user(&pool).await;
+        add_member(&pool, team, contractor).await;
+        set_member_overrides(&pool, team, contractor, PERM_MANAGE_VAULT, 0).await;
+
+        let weak_manager_role = seed_role(&pool, team, "weak-manager", PERM_MANAGE_MEMBERS).await;
+        let weak_manager = seed_user(&pool).await;
+        add_member(&pool, team, weak_manager).await;
+        assign_role(&pool, team, weak_manager, weak_manager_role).await;
+
+        assert_eq!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(weak_manager)),
+                Extension(SyncNotifier::new()),
+                Path((team, contractor)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN,
+            "a manager without MANAGE_VAULT must not be able to strip it via an allow override"
+        );
+
+        let strong_manager_role =
+            seed_role(&pool, team, "strong-manager", PERM_MANAGE_MEMBERS | PERM_MANAGE_VAULT).await;
+        let strong_manager = seed_user(&pool).await;
+        add_member(&pool, team, strong_manager).await;
+        assign_role(&pool, team, strong_manager, strong_manager_role).await;
+
+        assert!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(strong_manager)),
+                Extension(SyncNotifier::new()),
+                Path((team, contractor)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .is_ok(),
+            "a manager holding MANAGE_VAULT can strip it"
+        );
     }
 
     #[tokio::test]
