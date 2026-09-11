@@ -1306,7 +1306,8 @@ async fn override_guardrails(
         .await
         .map_err(|e| { error!(error = %e, "Failed to read target role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    // Position ascends as authority falls; owner is 0. A roleless actor has no position and outranks nobody.
+    // Position ascends as authority falls; owner is 0. `MIN()` over zero role rows is
+    // NULL, so a roleless actor has no position and outranks nobody.
     match (actor_position, target_position) {
         (Some(actor_pos), Some(target_pos)) if actor_pos < target_pos => Ok(()),
         (Some(_), None) => Ok(()),
