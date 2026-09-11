@@ -824,14 +824,17 @@ async fn visible_sessions(
                 FROM terminal_session_vaults tsv
                 JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
                 WHERE tsv.session_id = ts.id
-                  AND EXISTS (
-                    SELECT 1
-                    FROM team_member_roles tmr_perm
-                    JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
-                    WHERE tmr_perm.team_id = tsv.team_id
-                      AND tmr_perm.user_id = $1
-                      AND (tr_perm.permissions & $2) != 0
-                  )
+                  AND (
+                    SELECT (COALESCE(bit_or(tr_perm.permissions), 0) | COALESCE(MAX(o.allow_mask), 0))
+                           & ~COALESCE(MAX(o.deny_mask), 0) & $2
+                    FROM team_members tm2
+                    LEFT JOIN team_member_roles tmr_perm
+                           ON tmr_perm.team_id = tm2.team_id AND tmr_perm.user_id = tm2.user_id
+                    LEFT JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
+                    LEFT JOIN team_member_permission_overrides o
+                           ON o.team_id = tm2.team_id AND o.user_id = tm2.user_id
+                    WHERE tm2.team_id = tsv.team_id AND tm2.user_id = $1
+                  ) <> 0
                   AND (
                     array_length(ts.allowed_roles, 1) IS NULL
                     OR cardinality(ts.allowed_roles) = 0
@@ -1977,7 +1980,8 @@ mod tests {
     use crate::rate_limit::RateLimiter;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        add_member, default_knock_limiter as knocks, seed_session, seed_team, seed_user,
+        add_member, assign_role, default_knock_limiter as knocks, seed_role, seed_session,
+        seed_team, seed_user, set_member_overrides,
     };
     use std::time::Duration;
 
@@ -2270,6 +2274,66 @@ mod tests {
             .iter().find(|r| r.id == session_id).unwrap().connection_name.is_some());
         assert!(visible_sessions(&pool, host).await.unwrap()
             .iter().find(|r| r.id == session_id).unwrap().connection_name.is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_session_visibility_honours_view_terminal_sessions_overrides() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let role = seed_role(&pool, team, "viewer", crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+
+        let denied = seed_user(&pool).await;
+        add_member(&pool, team, denied).await;
+        assign_role(&pool, team, denied, role).await;
+        set_member_overrides(&pool, team, denied, 0, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+
+        let teammate = seed_user(&pool).await;
+        add_member(&pool, team, teammate).await;
+        assign_role(&pool, team, teammate, role).await;
+
+        let host = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "vault").await;
+        sqlx::query("INSERT INTO terminal_session_vaults (session_id, team_id) VALUES ($1, $2)")
+            .bind(session_id)
+            .bind(team)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            visible_sessions(&pool, denied).await.unwrap().iter().all(|r| r.id != session_id),
+            "a deny override on VIEW_TERMINAL_SESSIONS must hide the vault session"
+        );
+        assert!(
+            visible_sessions(&pool, teammate).await.unwrap().iter().any(|r| r.id == session_id),
+            "a teammate without the override still sees it via their role"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_session_visibility_honours_a_roleless_allow_override() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let contractor = seed_user(&pool).await;
+        add_member(&pool, team, contractor).await;
+        set_member_overrides(&pool, team, contractor, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS, 0).await;
+
+        let host = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "vault").await;
+        sqlx::query("INSERT INTO terminal_session_vaults (session_id, team_id) VALUES ($1, $2)")
+            .bind(session_id)
+            .bind(team)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            visible_sessions(&pool, contractor).await.unwrap().iter().any(|r| r.id == session_id),
+            "an allow override must grant visibility even with no role rows"
+        );
     }
 
     #[tokio::test]
