@@ -67,16 +67,20 @@ impl CheckoutRequest {
     }
 }
 
+/// Plans billed per seat, and the seat floor they share.
+const PER_SEAT_PLANS: [&str; 2] = ["teams", "business"];
+const MIN_SEATS: u32 = 3;
+
 /// Variant id for a plan/interval pair, or `None` when the plan is unknown or
-/// its variant is unconfigured. Business is sold monthly only, so a yearly
-/// request resolves the same variant rather than failing.
+/// its variant is unconfigured.
 fn variant_id_for(plan: &str, yearly: bool) -> Option<String> {
     let key = match (plan, yearly) {
         ("pro", false) => "LS_VARIANT_PRO_MONTHLY",
         ("pro", true) => "LS_VARIANT_PRO_YEARLY",
         ("teams", false) => "LS_VARIANT_TEAMS_MONTHLY",
         ("teams", true) => "LS_VARIANT_TEAMS_YEARLY",
-        ("business", _) => "LS_VARIANT_BUSINESS_MONTHLY",
+        ("business", false) => "LS_VARIANT_BUSINESS_MONTHLY",
+        ("business", true) => "LS_VARIANT_BUSINESS_YEARLY",
         _ => return None,
     };
     std::env::var(key).ok().filter(|v| !v.is_empty())
@@ -280,10 +284,11 @@ pub async fn create_checkout(
         return Err(status_response(StatusCode::SERVICE_UNAVAILABLE));
     }
 
-    // Teams requires at least 3 seats; default to 3 if not specified
-    let seats = if body.plan == "teams" {
-        let s = body.seats.unwrap_or(3);
-        if s < 3 {
+    // Per-seat plans bill on quantity and share a 3-seat floor, so Business can
+    // never undercut Teams. Pro is single-seat and sends no quantity at all.
+    let seats = if PER_SEAT_PLANS.contains(&body.plan.as_str()) {
+        let s = body.seats.unwrap_or(MIN_SEATS);
+        if s < MIN_SEATS {
             return Err(status_response(StatusCode::UNPROCESSABLE_ENTITY));
         }
         Some(s)
@@ -622,14 +627,26 @@ mod tests {
     }
 
     #[test]
-    fn business_is_monthly_only_and_unconfigured_until_its_variant_exists() {
+    fn business_resolves_both_intervals_once_configured() {
         let _env = set_variant_env();
         assert_eq!(variant_id_for("business", false), None);
+        assert_eq!(variant_id_for("business", true), None);
         std::env::set_var("LS_VARIANT_BUSINESS_MONTHLY", "301");
+        std::env::set_var("LS_VARIANT_BUSINESS_YEARLY", "302");
         assert_eq!(variant_id_for("business", false).as_deref(), Some("301"));
-        // A yearly request resolves the same variant rather than failing.
-        assert_eq!(variant_id_for("business", true).as_deref(), Some("301"));
+        assert_eq!(variant_id_for("business", true).as_deref(), Some("302"));
         std::env::remove_var("LS_VARIANT_BUSINESS_MONTHLY");
+        std::env::remove_var("LS_VARIANT_BUSINESS_YEARLY");
+    }
+
+    #[test]
+    fn every_per_seat_plan_shares_the_three_seat_floor() {
+        // Business must never undercut Teams: both floor at 3 seats, so the
+        // cheapest Business plan is always dearer than the cheapest Teams plan.
+        assert_eq!(MIN_SEATS, 3);
+        assert!(PER_SEAT_PLANS.contains(&"teams"));
+        assert!(PER_SEAT_PLANS.contains(&"business"));
+        assert!(!PER_SEAT_PLANS.contains(&"pro"));
     }
 
     fn set_variant_env() -> std::sync::MutexGuard<'static, ()> {
