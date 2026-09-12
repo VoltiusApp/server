@@ -200,6 +200,8 @@ pub struct TeamWithRole {
     pub owner_tier: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub role_ids: Vec<Uuid>,
+    pub permission_allow: i64,
+    pub permission_deny: i64,
 }
 
 pub async fn list_teams(
@@ -207,13 +209,15 @@ pub async fn list_teams(
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<TeamWithRole>>, StatusCode> {
     // Returns one row per (team, role) — aggregated in Rust
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>, i64, i64)>(
         r#"
-        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id
+        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id,
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
         JOIN users u ON u.id = t.owner_id
         LEFT JOIN team_member_roles tmr ON tmr.team_id = t.id AND tmr.user_id = $1
+        LEFT JOIN team_member_permission_overrides o ON o.team_id = t.id AND o.user_id = $1
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
     )
@@ -226,7 +230,7 @@ pub async fn list_teams(
     })?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
-    for (id, name, owner_id, owner_tier, created_at, role_id) in rows {
+    for (id, name, owner_id, owner_tier, created_at, role_id, permission_allow, permission_deny) in rows {
         match teams.last_mut() {
             Some(last) if last.id == id => {
                 if let Some(rid) = role_id {
@@ -241,6 +245,8 @@ pub async fn list_teams(
                     owner_tier,
                     created_at,
                     role_ids: role_id.into_iter().collect(),
+                    permission_allow,
+                    permission_deny,
                 });
             }
         }
@@ -303,23 +309,20 @@ pub async fn list_members(
     let rows = sqlx::query_as::<
         _,
         (
-            Uuid,
-            Uuid,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-            String,
-            String,
-            Option<String>,
-            Option<Uuid>,
+            Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>,
+            String, String, Option<String>, Option<Uuid>, i64, i64,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.handle AS invited_by_display_name, tm.joined_at,
-               u.handle AS display_name, u.handle, u.public_key, tmr.role_id
+               u.handle AS display_name, u.handle, u.public_key, tmr.role_id,
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
         LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
+        LEFT JOIN team_member_permission_overrides o
+               ON o.team_id = tm.team_id AND o.user_id = tm.user_id
         WHERE tm.team_id = $1
         ORDER BY tm.joined_at ASC, tmr.role_id ASC NULLS LAST
         "#,
@@ -333,7 +336,8 @@ pub async fn list_members(
     })?;
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
-    for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key, role_id) in rows
+    for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key,
+         role_id, permission_allow, permission_deny) in rows
     {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
@@ -353,6 +357,8 @@ pub async fn list_members(
                         invited_by_display_name,
                         joined_at,
                         role_ids: role_id.into_iter().collect(),
+                        permission_allow,
+                        permission_deny,
                     },
                 });
             }
@@ -477,6 +483,31 @@ pub async fn add_member(
     Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
 }
 
+async fn request_team_rotation(
+    conn: &mut sqlx::PgConnection,
+    team_id: Uuid,
+) -> Result<(), StatusCode> {
+    let epoch: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(key_version), 1) FROM team_key_epochs WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read current epoch for rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    sqlx::query(
+        "INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, $2) \
+         ON CONFLICT (team_id, requested_at_epoch) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(epoch)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to record rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    Ok(())
+}
+
 // ─── Remove member ────────────────────────────────────────────────────────────
 
 pub async fn remove_member(
@@ -535,23 +566,14 @@ pub async fn remove_member(
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team vault key"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    // Remaining members already hold a current-epoch key, so nothing here is
-    // "under-covered" — flag the removal explicitly so #217 still rotates.
-    let epoch: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(key_version), 1) FROM team_key_epochs WHERE team_id = $1")
+    sqlx::query("DELETE FROM team_member_roles WHERE team_id = $1 AND user_id = $2")
         .bind(team_id)
-        .fetch_one(&mut *tx)
+        .bind(user_id)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| { error!(error = %e, "Failed to read current epoch for rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| { error!(error = %e, "Failed to remove team member roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    sqlx::query(
-        "INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, $2) \
-         ON CONFLICT (team_id, requested_at_epoch) DO NOTHING",
-    )
-    .bind(team_id)
-    .bind(epoch)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to record rotation request"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    request_team_rotation(&mut tx, team_id).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit remove_member transaction");
@@ -1200,6 +1222,224 @@ pub async fn remove_member_role(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Set per-member permission overrides ──────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SetMemberPermissionsRequest {
+    pub allow: i64,
+    pub deny: i64,
+}
+
+fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
+    let known = crate::permissions::ALL_PERMISSIONS;
+    if allow < 0 || deny < 0 || (allow & !known) != 0 || (deny & !known) != 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if (allow & deny) != 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Option<i32>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT MIN(tr.position) FROM team_member_roles tmr \
+         JOIN team_roles tr ON tr.id = tmr.role_id \
+         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+}
+
+async fn override_guardrails(
+    pool: &PgPool,
+    team_id: Uuid,
+    actor_id: Uuid,
+    target_user_id: Uuid,
+    allow: i64,
+) -> Result<(), StatusCode> {
+    if actor_id == target_user_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let target_is_owner = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+             SELECT 1 FROM team_member_roles tmr \
+             JOIN team_roles tr ON tr.id = tmr.role_id \
+             WHERE tmr.team_id = $1 AND tmr.user_id = $2 \
+               AND tr.is_builtin AND tr.name = 'owner')",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check target owner role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if target_is_owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let previous_allow: i64 = sqlx::query_scalar(
+        "SELECT allow_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read previous overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or(0);
+
+    let actor_effective = crate::permissions::effective_permissions(pool, team_id, actor_id).await?;
+    // A target's authority can come entirely from an allow override, so the actor
+    // must hold every bit they revoke, not only every bit they grant.
+    let removing = previous_allow & !allow;
+    if ((allow | removing) & !actor_effective) != 0 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let actor_position = role_position(pool, team_id, actor_id)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to read actor role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let target_position = role_position(pool, team_id, target_user_id)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to read target role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    // Position ascends as authority falls; owner is 0. `MIN()` over zero role rows is
+    // NULL, so a roleless actor has no position and outranks nobody.
+    match (actor_position, target_position) {
+        (Some(actor_pos), Some(target_pos)) if actor_pos < target_pos => Ok(()),
+        (Some(_), None) => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+pub async fn set_member_permissions(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
+    Json(body): Json<SetMemberPermissionsRequest>,
+) -> Result<StatusCode, StatusCode> {
+    validate_override_masks(body.allow, body.deny)?;
+
+    let can_manage = crate::permissions::has_team_permission(
+        &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
+    )
+    .await?;
+    if !can_manage {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to check target membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if !is_member {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    override_guardrails(&pool, team_id, auth.0, target_user_id, body.allow).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin set_member_permissions transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let previous = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides \
+         WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read existing overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or((0, 0));
+
+    let role_union: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
+         JOIN team_roles tr ON tr.id = tmr.role_id \
+         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read target role union"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if body.allow == 0 && body.deny == 0 {
+        sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
+            .bind(team_id)
+            .bind(target_user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| { error!(error = %e, "Failed to clear member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    } else {
+        sqlx::query(
+            "INSERT INTO team_member_permission_overrides \
+                 (team_id, user_id, allow_mask, deny_mask, updated_at, updated_by) \
+             VALUES ($1, $2, $3, $4, now(), $5) \
+             ON CONFLICT (team_id, user_id) DO UPDATE \
+             SET allow_mask = $3, deny_mask = $4, updated_at = now(), updated_by = $5",
+        )
+        .bind(team_id)
+        .bind(target_user_id)
+        .bind(body.allow)
+        .bind(body.deny)
+        .bind(auth.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    }
+
+    // Mirrors get_my_vault_key's CONNECT_OR_VIEW_SECRETS gate (team_sync.rs), which is
+    // Any: only crossing from holding one of these to holding neither revokes key access.
+    const KEY_GATING: i64 = crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_CONNECT;
+
+    let prev_effective = (role_union | previous.0) & !previous.1;
+    let next_effective = (role_union | body.allow) & !body.deny;
+    if (prev_effective & KEY_GATING) != 0 && (next_effective & KEY_GATING) == 0 {
+        request_team_rotation(&mut tx, team_id).await?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit set_member_permissions transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
+        .bind(target_user_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+
+    info!(team_id = %team_id, target_user_id = %target_user_id, allow = body.allow, deny = body.deny, "Member permission overrides set");
+    tokio::spawn(write_audit_event(
+        pool.clone(),
+        team_id,
+        auth.0,
+        "member.permissions_changed",
+        Some("user"),
+        Some(target_user_id.to_string()),
+        target_display_name,
+        Some(json!({
+            "previous_allow": previous.0,
+            "previous_deny": previous.1,
+            "allow": body.allow,
+            "deny": body.deny,
+        })),
+    ));
+    notify_team_members_changed(&pool, &notifier, team_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── Invite member (email-based) ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1830,6 +2070,34 @@ mod authz_tests {
         .await
         .expect("remove_member must record a rotation request");
         assert_eq!(requested_epoch, 1, "team never rotated before, so the current epoch defaults to 1");
+    }
+
+    #[tokio::test]
+    async fn remove_member_deletes_their_role_rows_so_re_invite_cannot_restore_them() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let victim = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+
+        let res = remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
+            Path((team, victim)),
+        )
+        .await;
+        assert!(res.is_ok(), "remove_member failed: {:?}", res.err());
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_member_roles WHERE team_id = $1 AND user_id = $2",
+        )
+        .bind(team)
+        .bind(victim)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "role rows must not survive removal, or re-invite restores them");
     }
 
     #[tokio::test]
@@ -2491,5 +2759,535 @@ mod search_tests {
         let json = serde_json::to_string(&hits).unwrap();
         assert!(!json.contains("public_key"), "search must never carry key material: {json}");
         assert!(hits.iter().any(|r| r.user_id == them));
+    }
+}
+
+#[cfg(test)]
+mod override_response_tests {
+    use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_user, set_member_overrides};
+
+    #[tokio::test]
+    async fn member_masks_are_read_back_from_the_database() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let member = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, member).await;
+        set_member_overrides(&pool, team, member, PERM_CONNECT, PERM_VIEW_SECRETS).await;
+
+        let rows = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0) \
+             FROM team_members tm \
+             LEFT JOIN team_member_permission_overrides o \
+                    ON o.team_id = tm.team_id AND o.user_id = tm.user_id \
+             WHERE tm.team_id = $1 AND tm.user_id = $2",
+        )
+        .bind(team)
+        .bind(member)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows, (PERM_CONNECT, PERM_VIEW_SECRETS));
+    }
+
+    #[test]
+    fn validates_masks_against_the_known_permission_bits() {
+        use super::validate_override_masks;
+        use crate::permissions::ALL_PERMISSIONS;
+
+        assert!(validate_override_masks(PERM_CONNECT, PERM_VIEW_SECRETS).is_ok());
+        assert!(validate_override_masks(0, 0).is_ok());
+        assert!(validate_override_masks(ALL_PERMISSIONS, 0).is_ok());
+        // A bit outside the known set.
+        assert!(validate_override_masks(1 << 40, 0).is_err());
+        assert!(validate_override_masks(0, 1 << 40).is_err());
+        // The same bit in both masks is ambiguous.
+        assert!(validate_override_masks(PERM_CONNECT, PERM_CONNECT).is_err());
+        // Negative masks cannot come from a well-formed client.
+        assert!(validate_override_masks(-1, 0).is_err());
+    }
+
+    use super::{override_guardrails, set_member_permissions, SetMemberPermissionsRequest};
+    use crate::auth::AuthUser;
+    use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_support::{assign_role, seed_builtin_roles, seed_role, seed_team_with_roles};
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+
+    #[tokio::test]
+    async fn guardrail_rejects_editing_your_own_overrides() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let role = seed_role(&pool, team, "admin", PERM_MANAGE_MEMBERS).await;
+        add_member(&pool, team, owner).await;
+        assign_role(&pool, team, owner, role).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, owner, owner, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_targeting_an_owner() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let manager = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        seed_builtin_roles(&pool, team).await;
+
+        let owner_role = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM team_roles WHERE team_id = $1 AND name = 'owner'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let manager_role = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM team_roles WHERE team_id = $1 AND name = 'manager'",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        add_member(&pool, team, owner).await;
+        assign_role(&pool, team, owner, owner_role).await;
+        add_member(&pool, team, manager).await;
+        assign_role(&pool, team, manager, manager_role).await;
+
+        sqlx::query("UPDATE team_roles SET position = 5 WHERE id = $1")
+            .bind(owner_role)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            override_guardrails(&pool, team, manager, owner, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_granting_a_permission_the_actor_lacks() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "actor", PERM_MANAGE_MEMBERS).await;
+        let target_role = seed_role(&pool, team, "target", PERM_CONNECT).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        // The actor does not hold MANAGE_ROLES, so cannot hand it out.
+        assert_eq!(
+            override_guardrails(&pool, team, actor, target, PERM_MANAGE_ROLES).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // Granting something the actor does hold is fine.
+        assert!(override_guardrails(&pool, team, actor, target, PERM_MANAGE_MEMBERS).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_rejects_stripping_an_allow_override_the_actor_lacks() {
+        use crate::permissions::PERM_MANAGE_VAULT;
+
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        // A roleless contractor whose sole authority is an owner-granted allow.
+        let contractor = seed_user(&pool).await;
+        add_member(&pool, team, contractor).await;
+        set_member_overrides(&pool, team, contractor, PERM_MANAGE_VAULT, 0).await;
+
+        let weak_manager_role = seed_role(&pool, team, "weak-manager", PERM_MANAGE_MEMBERS).await;
+        let weak_manager = seed_user(&pool).await;
+        add_member(&pool, team, weak_manager).await;
+        assign_role(&pool, team, weak_manager, weak_manager_role).await;
+
+        assert_eq!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(weak_manager)),
+                Extension(SyncNotifier::new()),
+                Path((team, contractor)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN,
+            "a manager without MANAGE_VAULT must not be able to strip it via an allow override"
+        );
+
+        let strong_manager_role =
+            seed_role(&pool, team, "strong-manager", PERM_MANAGE_MEMBERS | PERM_MANAGE_VAULT).await;
+        let strong_manager = seed_user(&pool).await;
+        add_member(&pool, team, strong_manager).await;
+        assign_role(&pool, team, strong_manager, strong_manager_role).await;
+
+        assert!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(strong_manager)),
+                Extension(SyncNotifier::new()),
+                Path((team, contractor)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .is_ok(),
+            "a manager holding MANAGE_VAULT can strip it"
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_targeting_someone_at_or_above_the_actors_position() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "actor", PERM_MANAGE_MEMBERS).await;
+        let target_role = seed_role(&pool, team, "target", PERM_CONNECT).await;
+        sqlx::query("UPDATE team_roles SET position = 3 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, actor, target, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejects_an_actor_holding_no_roles() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let target_role = seed_role(&pool, team, "target", PERM_CONNECT).await;
+
+        add_member(&pool, team, actor).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        assert_eq!(
+            override_guardrails(&pool, team, actor, target, 0).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrail_allows_editing_a_target_holding_no_roles() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let actor_role = seed_role(&pool, team, "actor", PERM_MANAGE_MEMBERS).await;
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+
+        assert!(override_guardrails(&pool, team, actor, target, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_rejects_self_edit() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let role = seed_role(&pool, team, "admin", PERM_MANAGE_MEMBERS).await;
+        add_member(&pool, team, owner).await;
+        assign_role(&pool, team, owner, role).await;
+
+        assert_eq!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(owner)),
+                Extension(SyncNotifier::new()),
+                Path((team, owner)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_rejects_a_lower_ranked_caller() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "lower", PERM_MANAGE_MEMBERS).await;
+        let target_role = seed_role(&pool, team, "higher", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 4 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        assert_eq!(
+            set_member_permissions(
+                State(pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                Path((team, target)),
+                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_queues_rotation_when_a_role_granted_bit_is_denied() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        let target_role = seed_role(&pool, team, "viewer", PERM_VIEW_SECRETS).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        let rotations = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+            )
+            .bind(team)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rotations().await, 1);
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rotations().await, 1);
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_does_not_queue_rotation_for_non_read_class_denies() {
+        use crate::permissions::PERM_EDIT_CONNECTIONS;
+
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        add_member(&pool, team, target).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_EDIT_CONNECTIONS }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_does_not_queue_rotation_while_connect_still_gates() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+
+        let target_role = seed_role(&pool, team, "reader", PERM_VIEW_SECRETS | PERM_CONNECT).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "CONNECT still satisfies the Any key gate, so the member keeps key access and rotation buys nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_does_not_queue_rotation_for_a_copy_secrets_only_deny() {
+        use crate::permissions::PERM_COPY_SECRETS;
+
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        let target_role = seed_role(&pool, team, "copier", PERM_COPY_SECRETS).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "COPY_SECRETS alone does not gate get_my_vault_key, so rotation buys nothing");
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_queues_rotation_when_clearing_the_only_allow_grant() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let contractor = seed_user(&pool).await;
+        add_member(&pool, team, contractor).await;
+        crate::test_support::set_member_overrides(&pool, team, contractor, PERM_VIEW_SECRETS, 0).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path((team, contractor)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "clearing a roleless member's only read-class allow must still revoke key access");
+    }
+
+    #[tokio::test]
+    async fn denying_a_read_class_bit_records_a_rotation_request() {
+        let pool = test_pool_or_skip!();
+        let team = seed_team(&pool, seed_user(&pool).await).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        super::request_team_rotation(&mut conn, team).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+
+        // Idempotent within an epoch.
+        let mut conn = pool.acquire().await.unwrap();
+        super::request_team_rotation(&mut conn, team).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 }
