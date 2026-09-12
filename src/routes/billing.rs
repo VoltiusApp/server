@@ -47,9 +47,39 @@ pub struct UpdateSeatsRequest {
 
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
-    pub plan: String, // "pro" | "teams"
+    pub plan: String, // "pro" | "teams" | "business"
     pub seats: Option<u32>,
     pub interval: Option<String>, // "monthly" | "yearly", defaults to "monthly"
+    // The portal sends `billing_period: "annual"`; only `interval` was ever read,
+    // so every annual checkout silently resolved the monthly variant.
+    #[serde(default)]
+    pub billing_period: Option<String>,
+}
+
+impl CheckoutRequest {
+    fn wants_yearly(&self) -> bool {
+        let raw = self
+            .interval
+            .as_deref()
+            .or(self.billing_period.as_deref())
+            .unwrap_or("monthly");
+        matches!(raw, "yearly" | "annual" | "annually" | "year")
+    }
+}
+
+/// Variant id for a plan/interval pair, or `None` when the plan is unknown or
+/// its variant is unconfigured. Business is sold monthly only, so a yearly
+/// request resolves the same variant rather than failing.
+fn variant_id_for(plan: &str, yearly: bool) -> Option<String> {
+    let key = match (plan, yearly) {
+        ("pro", false) => "LS_VARIANT_PRO_MONTHLY",
+        ("pro", true) => "LS_VARIANT_PRO_YEARLY",
+        ("teams", false) => "LS_VARIANT_TEAMS_MONTHLY",
+        ("teams", true) => "LS_VARIANT_TEAMS_YEARLY",
+        ("business", _) => "LS_VARIANT_BUSINESS_MONTHLY",
+        _ => return None,
+    };
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 #[derive(Serialize)]
@@ -240,14 +270,11 @@ pub async fn create_checkout(
 
     let store_id = std::env::var("LEMONSQUEEZY_STORE_ID").unwrap_or_default();
     let api_key = std::env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default();
-    let yearly = body.interval.as_deref().unwrap_or("monthly") == "yearly";
-    let variant_id = match (body.plan.as_str(), yearly) {
-        ("pro", false) => std::env::var("LS_VARIANT_PRO_MONTHLY").unwrap_or_default(),
-        ("pro", true) => std::env::var("LS_VARIANT_PRO_YEARLY").unwrap_or_default(),
-        ("teams", false) => std::env::var("LS_VARIANT_TEAMS_MONTHLY").unwrap_or_default(),
-        ("teams", true) => std::env::var("LS_VARIANT_TEAMS_YEARLY").unwrap_or_default(),
-        _ => return Err(status_response(StatusCode::BAD_REQUEST)),
-    };
+    let yearly = body.wants_yearly();
+    if !matches!(body.plan.as_str(), "pro" | "teams" | "business") {
+        return Err(status_response(StatusCode::BAD_REQUEST));
+    }
+    let variant_id = variant_id_for(&body.plan, yearly).unwrap_or_default();
 
     if store_id.is_empty() || api_key.is_empty() || variant_id.is_empty() {
         return Err(status_response(StatusCode::SERVICE_UNAVAILABLE));
@@ -551,6 +578,60 @@ mod tests {
 
     /// Set the variant env vars and return the held env lock; keep the guard
     /// alive (`let _env = set_variant_env();`) so the test runs serially.
+    fn req(plan: &str, interval: Option<&str>, billing_period: Option<&str>) -> CheckoutRequest {
+        CheckoutRequest {
+            plan: plan.to_string(),
+            seats: None,
+            interval: interval.map(ToOwned::to_owned),
+            billing_period: billing_period.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn interval_yearly_selects_the_yearly_variant() {
+        assert!(req("teams", Some("yearly"), None).wants_yearly());
+    }
+
+    #[test]
+    fn portals_billing_period_annual_is_honoured() {
+        // The portal sends billing_period: "annual"; before this it was dropped
+        // and every annual checkout resolved the monthly variant.
+        assert!(req("teams", None, Some("annual")).wants_yearly());
+    }
+
+    #[test]
+    fn monthly_and_absent_both_mean_monthly() {
+        assert!(!req("teams", None, Some("monthly")).wants_yearly());
+        assert!(!req("teams", Some("monthly"), None).wants_yearly());
+        assert!(!req("teams", None, None).wants_yearly());
+    }
+
+    #[test]
+    fn explicit_interval_wins_over_billing_period() {
+        assert!(req("pro", Some("yearly"), Some("monthly")).wants_yearly());
+    }
+
+    #[test]
+    fn variant_lookup_covers_every_sellable_plan() {
+        let _env = set_variant_env();
+        assert_eq!(variant_id_for("pro", false).as_deref(), Some("101"));
+        assert_eq!(variant_id_for("pro", true).as_deref(), Some("102"));
+        assert_eq!(variant_id_for("teams", false).as_deref(), Some("201"));
+        assert_eq!(variant_id_for("teams", true).as_deref(), Some("202"));
+        assert_eq!(variant_id_for("nope", false), None);
+    }
+
+    #[test]
+    fn business_is_monthly_only_and_unconfigured_until_its_variant_exists() {
+        let _env = set_variant_env();
+        assert_eq!(variant_id_for("business", false), None);
+        std::env::set_var("LS_VARIANT_BUSINESS_MONTHLY", "301");
+        assert_eq!(variant_id_for("business", false).as_deref(), Some("301"));
+        // A yearly request resolves the same variant rather than failing.
+        assert_eq!(variant_id_for("business", true).as_deref(), Some("301"));
+        std::env::remove_var("LS_VARIANT_BUSINESS_MONTHLY");
+    }
+
     fn set_variant_env() -> std::sync::MutexGuard<'static, ()> {
         let guard = crate::test_support::env_lock();
         std::env::set_var("LS_VARIANT_PRO_MONTHLY", "101");
@@ -604,10 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn tier_from_variant_id_never_grants_business_tier() {
-        // "teams" is the ceiling this map can grant: there is no LS_VARIANT_BUSINESS_*,
-        // so a Business plan is never provisioned by variant mapping. Locks that
-        // invariant against a future variant being wired to "business" here by mistake.
+    fn business_tier_is_granted_only_by_its_own_configured_variant() {
+        // Business became self-serve, so variant mapping may now grant it — but only
+        // via LS_VARIANT_BUSINESS_*. No pro/teams/unknown variant may ever reach it,
+        // which is the half of the old invariant still worth locking.
         let _env = set_variant_env();
         for id in ["101", "102", "201", "202", "999", ""] {
             assert_ne!(
@@ -616,6 +697,10 @@ mod tests {
                 "variant {id} must not map to business",
             );
         }
+        std::env::set_var("LS_VARIANT_BUSINESS_MONTHLY", "301");
+        assert_eq!(tier_from_variant_id("301"), Some("business"));
+        assert_ne!(tier_from_variant_id("999"), Some("business"));
+        std::env::remove_var("LS_VARIANT_BUSINESS_MONTHLY");
     }
 
     #[test]

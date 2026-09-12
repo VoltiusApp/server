@@ -393,6 +393,8 @@ pub fn tier_from_variant_id(variant_id: &str) -> Option<&'static str> {
     let pro_yearly = std::env::var("LS_VARIANT_PRO_YEARLY").ok();
     let teams_monthly = std::env::var("LS_VARIANT_TEAMS_MONTHLY").ok();
     let teams_yearly = std::env::var("LS_VARIANT_TEAMS_YEARLY").ok();
+    let business_monthly = std::env::var("LS_VARIANT_BUSINESS_MONTHLY").ok();
+    let business_yearly = std::env::var("LS_VARIANT_BUSINESS_YEARLY").ok();
 
     if pro_monthly.as_deref() == Some(variant_id) || pro_yearly.as_deref() == Some(variant_id) {
         Some("pro")
@@ -400,6 +402,10 @@ pub fn tier_from_variant_id(variant_id: &str) -> Option<&'static str> {
         || teams_yearly.as_deref() == Some(variant_id)
     {
         Some("teams")
+    } else if business_monthly.as_deref() == Some(variant_id)
+        || business_yearly.as_deref() == Some(variant_id)
+    {
+        Some("business")
     } else {
         None
     }
