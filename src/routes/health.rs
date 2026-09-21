@@ -87,11 +87,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_deep_reports_503_when_the_database_is_unreachable() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_millis(250))
-            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-            .expect("build lazy pool");
+        let pool = crate::test_support::dead_pool().await;
         let app = Router::new()
             .route("/health/deep", get(health_deep))
             .with_state(pool);

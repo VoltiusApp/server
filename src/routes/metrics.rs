@@ -26,26 +26,23 @@ pub async fn get_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env_lock;
+    use crate::test_support::{env_lock, EnvLockGuard};
     use axum::{body::Body, http::Request, middleware::from_fn, routing::get, Router};
     use tower::ServiceExt;
 
-    #[allow(dead_code)]
-    struct EnvLockGuard(std::sync::MutexGuard<'static, ()>);
-
-    fn handle() -> PrometheusHandle {
-        crate::observability::test_handle()
+    fn app(pool: PgPool) -> Router {
+        Router::new()
+            .route("/metrics", get(get_metrics))
+            .layer(from_fn(crate::auth::require_admin_key))
+            .layer(Extension(crate::observability::test_handle()))
+            .with_state(pool)
     }
 
     #[tokio::test]
     async fn rejects_without_the_admin_key() {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("ADMIN_SECRET", "sekret");
-        let app = Router::new()
-            .route("/metrics", get(get_metrics))
-            .layer(from_fn(crate::auth::require_admin_key))
-            .layer(Extension(handle()))
-            .with_state(crate::test_support::any_pool().await);
+        let app = app(crate::test_support::dead_pool().await);
 
         let resp = app
             .oneshot(
@@ -57,18 +54,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn unavailable_when_no_admin_secret_is_configured() {
         let _guard = EnvLockGuard(env_lock());
         std::env::remove_var("ADMIN_SECRET");
-        let app = Router::new()
-            .route("/metrics", get(get_metrics))
-            .layer(from_fn(crate::auth::require_admin_key))
-            .layer(Extension(handle()))
-            .with_state(crate::test_support::any_pool().await);
+        let app = app(crate::test_support::dead_pool().await);
 
         let resp = app
             .oneshot(
@@ -81,7 +74,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -89,11 +82,7 @@ mod tests {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("ADMIN_SECRET", "sekret");
         let pool = crate::test_pool_or_skip!();
-        let app = Router::new()
-            .route("/metrics", get(get_metrics))
-            .layer(from_fn(crate::auth::require_admin_key))
-            .layer(Extension(handle()))
-            .with_state(pool);
+        let app = app(pool);
 
         let resp = app
             .oneshot(
@@ -106,11 +95,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .unwrap(),
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/plain; version=0.0.4"
         );
 

@@ -1712,7 +1712,7 @@ mod authz_tests {
     use crate::test_support::{
         add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
         seed_team_with_roles, seed_user, set_user_seats, set_user_tier, set_user_trial,
-        unique_handle,
+        unique_handle, EnvLockGuard,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -2277,12 +2277,6 @@ mod authz_tests {
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
-
-    /// Wraps the env mutex guard so it isn't a bare `MutexGuard` binding —
-    /// clippy's `await_holding_lock` only fires on the direct type, and this
-    /// lock is process-global/test-only with no real contention risk.
-    #[allow(dead_code)]
-    struct EnvLockGuard(std::sync::MutexGuard<'static, ()>);
 
     #[tokio::test]
     async fn create_role_forbidden_without_manage_roles() {

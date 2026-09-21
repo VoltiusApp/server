@@ -1,4 +1,6 @@
-use axum::{extract::MatchedPath, extract::Request, middleware::Next, response::Response};
+use axum::{
+    extract::MatchedPath, extract::Request, http::Method, middleware::Next, response::Response,
+};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::{Duration, Instant};
 
@@ -72,8 +74,25 @@ fn path_label(req: &Request) -> String {
         .unwrap_or_else(|| "<unmatched>".to_string())
 }
 
+// A client-supplied HTTP method is an arbitrary token (extension methods), never
+// evicted from the registry; anything outside the known verbs collapses to one label.
+fn method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "<other>",
+    }
+}
+
 pub async fn track_requests(req: Request, next: Next) -> Response {
-    let method = req.method().as_str().to_string();
+    let method = method_label(req.method());
     let path = path_label(&req);
     let started = Instant::now();
 
@@ -82,7 +101,7 @@ pub async fn track_requests(req: Request, next: Next) -> Response {
 
     metrics::counter!(
         "voltius_http_requests_total",
-        "method" => method.clone(),
+        "method" => method,
         "path" => path.clone(),
         "status" => status,
     )
@@ -103,17 +122,13 @@ mod tests {
     use axum::{body::Body, http::Request, middleware::from_fn, routing::get, Router};
     use tower::ServiceExt;
 
-    fn handle() -> PrometheusHandle {
-        test_handle()
-    }
-
     async fn ok_handler() -> &'static str {
         "ok"
     }
 
     #[tokio::test]
     async fn records_the_route_pattern_not_the_uri() {
-        let h = handle();
+        let h = test_handle();
         let app = Router::new()
             .route("/t1/:id", get(ok_handler))
             .layer(from_fn(track_requests));
@@ -143,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_unmatched_requests_under_a_single_label() {
-        let h = handle();
+        let h = test_handle();
         let app = Router::new()
             .route("/t2", get(ok_handler))
             .layer(from_fn(track_requests));
@@ -173,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_status_and_duration() {
-        let h = handle();
+        let h = test_handle();
         let app = Router::new()
             .route("/t3", get(|| async { axum::http::StatusCode::IM_A_TEAPOT }))
             .layer(from_fn(track_requests));
@@ -203,8 +218,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn records_extension_methods_under_other_not_the_raw_token() {
+        let h = test_handle();
+        let app = Router::new()
+            .route("/t4", axum::routing::any(ok_handler))
+            .layer(from_fn(track_requests));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("XCUSTOMVERB")
+                    .uri("/t4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        h.run_upkeep();
+        let rendered = h.render();
+        assert!(
+            rendered.contains("method=\"<other>\""),
+            "extension method not collapsed to <other>:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("XCUSTOMVERB"),
+            "raw extension method token leaked into a label:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn storage_gauge_reports_the_sync_blobs_size() {
-        let h = handle();
+        let h = test_handle();
         let pool = crate::test_pool_or_skip!();
 
         refresh_storage_gauge(&pool).await;
