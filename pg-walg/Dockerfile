@@ -27,6 +27,13 @@ RUN set -eux; \
 FROM ${PG_BASE}
 # wal-g publishes glibc binaries only; gcompat runs them on musl.
 RUN set -eux; \
-    if [ -f /etc/alpine-release ]; then apk add --no-cache gcompat; fi
+    if [ -f /etc/alpine-release ]; then \
+      apk add --no-cache gcompat curl python3; \
+    else \
+      apt-get update && apt-get install -y --no-install-recommends curl python3 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 COPY --from=walg /wal-g /usr/local/bin/wal-g
+COPY backup-watch.sh /usr/local/bin/backup-watch
+RUN chmod +x /usr/local/bin/backup-watch
 RUN wal-g --version
