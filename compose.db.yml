@@ -21,7 +21,7 @@ services:
     build:
       context: ./pg-walg
       args:
-        PG_BASE: postgres:${PG_VERSION:-17}-${DEBIAN_SUITE:-trixie}
+        PG_BASE: ${PG_BASE:-postgres:17-trixie}
         WALG_VERSION: v${WALG_VERSION:-3.0.8}
     container_name: voltius-db
     restart: unless-stopped

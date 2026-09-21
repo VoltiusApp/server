@@ -1,9 +1,8 @@
 # Postgres + WAL-G, for continuous WAL archiving and PITR to S3-compatible storage.
 #
-# The base is pinned to a Debian suite, not to bare `postgres:17`, because glibc owns
-# text collation: initdb bakes the host's collation into every text index, and moving
-# an existing data directory to a different glibc can silently corrupt their ordering.
-# Match the suite the cluster was initialised on, or dump and reload.
+# Works on either base. Pick with PG_BASE, and read the note in .env.db.example
+# first: glibc and musl sort text differently, so the choice is baked into every
+# text index at initdb and cannot be changed under an existing data directory.
 ARG PG_BASE=postgres:17-trixie
 
 FROM alpine:3.22 AS walg
@@ -26,5 +25,8 @@ RUN set -eux; \
     install -m 0755 "${name}" /wal-g
 
 FROM ${PG_BASE}
+# wal-g publishes glibc binaries only; gcompat runs them on musl.
+RUN set -eux; \
+    if [ -f /etc/alpine-release ]; then apk add --no-cache gcompat; fi
 COPY --from=walg /wal-g /usr/local/bin/wal-g
 RUN wal-g --version
