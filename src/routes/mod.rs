@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod client_version;
+pub mod health;
 pub mod invitations;
 pub mod meta;
 pub mod metrics;

@@ -662,7 +662,8 @@ async fn main() {
         .merge(admin_routes)
         .merge(ws_routes)
         .merge(metrics_route)
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(routes::health::health))
+        .route("/health/deep", get(routes::health::health_deep))
         .route("/v1/meta", get(routes::meta::get_meta))
         .layer({
             let allow_origin = match std::env::var("CORS_ORIGINS") {
