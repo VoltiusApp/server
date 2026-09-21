@@ -6,6 +6,7 @@ mod handles;
 mod last_seen;
 mod lemonsqueezy;
 mod models;
+mod observability;
 mod permissions;
 mod rate_limit;
 mod routes;
