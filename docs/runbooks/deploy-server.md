@@ -112,9 +112,20 @@ A rollback reverts the binary, never the schema. If the deploy applied a migrati
 binary must still work against the new schema — which is the reason to check that before deploying,
 not after.
 
-## First cutover from the old local-build setup
+## Cutover from the old local-build setup — done 2026-09-21
 
-Before the first GHCR deploy the tree built the image itself with `build: .`. To cut over:
+Production now runs `ghcr.io/voltiusapp/voltius-server:sha-469337c`, with the deployment tree at
+`bfd0f9a` and `SERVER_TAG` in `.env.dockhand`. The previous locally built image is kept as
+`voltius-server:pre-ghcr-20260921` for rollback.
+
+The cutover was deliberately content-neutral: `sha-469337c` is the same commit the running binary was
+built from, verified by comparing `strings` output for `effective_seats`,
+`team_member_permission_overrides` and the embedded `CREATE TABLE team_rotation_requests` — 1/1, 6/6,
+1/1 against the old image. No migration ran (`Migrations applied successfully` with nothing new), and
+`/health`, `/v1/billing/subscription` and `/v1/teams` answered 200, 401, 401 both locally and through
+the tunnel at `https://api.voltius.app`.
+
+The steps, for reference or for a second host:
 
 1. Confirm the tree's tracked files are clean and at the commit whose image you are about to
    deploy. `git status --porcelain` in the tree shows untracked leftovers (`.env.dockhand` and its
