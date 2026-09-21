@@ -3,3 +3,7 @@ target/
 .env
 graphify-out/
 .cargo-home/
+
+# bind mount for compose.db.yml
+/backups/
+.env.db

@@ -1,8 +1,9 @@
 # Restoring the production database
 
-The production database is self-hosted Postgres 17 with WAL-G continuous archiving to Cloudflare R2,
-run from the `voltius-db` compose stack (`/home/ubuntu/fourretout/voltius-db/`, project `voltius-db`).
-Three independent paths write to the bucket:
+The production database is self-hosted Postgres 17 with WAL-G continuous archiving to Cloudflare R2.
+Its definition is `compose.db.yml` and `pg-walg/` in this repo, run as project `voltius-db`; on the
+production host it lives in `/home/ubuntu/fourretout/voltius-db/`. Three independent paths write to
+the bucket:
 
 - WAL-G base backups, daily (`BASEBACKUP_INTERVAL=86400`), pruned to the last 14 (`wal-g delete retain FULL`).
 - WAL-G WAL archiving, `archive_timeout=60`, so the recovery point objective is ≤ 60 s.
