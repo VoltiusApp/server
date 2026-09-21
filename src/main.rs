@@ -138,6 +138,8 @@ async fn main() {
         }
     });
 
+    let metrics_handle = observability::init();
+
     let notifier = SyncNotifier::new();
     let terminal_manager = TerminalManager::new();
     let presence_map: PresenceMap = Arc::new(DashMap::new());
@@ -632,6 +634,11 @@ async fn main() {
         .layer(Extension(presence_map.clone()))
         .layer(Extension(ls_cache.clone()));
 
+    let metrics_route = Router::new()
+        .route("/metrics", get(routes::metrics::get_metrics))
+        .layer(middleware::from_fn(auth::require_admin_key))
+        .layer(Extension(metrics_handle));
+
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()
         .route(
@@ -653,6 +660,7 @@ async fn main() {
         .merge(protected)
         .merge(admin_routes)
         .merge(ws_routes)
+        .merge(metrics_route)
         .route("/health", get(|| async { "ok" }))
         .route("/v1/meta", get(routes::meta::get_meta))
         .layer({
@@ -679,6 +687,7 @@ async fn main() {
                 .on_response(DefaultOnResponse::new().level(Level::INFO))
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
+        .layer(middleware::from_fn(observability::track_requests))
         .with_state(pool);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());

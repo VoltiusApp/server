@@ -52,6 +52,16 @@ pub async fn test_pool() -> Option<PgPool> {
     Some(pool)
 }
 
+/// Never queried; falls back to an unconnected pool when `TEST_DATABASE_URL` is unset.
+pub async fn any_pool() -> PgPool {
+    let url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://unused:unused@127.0.0.1:1/unused".to_string());
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy(&url)
+        .expect("build lazy pool")
+}
+
 /// Skip the enclosing test (returning early) unless a test database is configured.
 #[macro_export]
 macro_rules! test_pool_or_skip {

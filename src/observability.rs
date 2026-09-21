@@ -2,12 +2,10 @@ use axum::{extract::MatchedPath, extract::Request, middleware::Next, response::R
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)]
 const DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-#[allow(dead_code)]
 pub fn init() -> PrometheusHandle {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -45,7 +43,6 @@ pub(crate) fn test_handle() -> PrometheusHandle {
     HANDLE.get_or_init(init).clone()
 }
 
-#[allow(dead_code)]
 fn path_label(req: &Request) -> String {
     // The URI carries user and object ids; labelling with it makes the series count
     // grow with the number of rows rather than the number of routes.
@@ -55,7 +52,6 @@ fn path_label(req: &Request) -> String {
         .unwrap_or_else(|| "<unmatched>".to_string())
 }
 
-#[allow(dead_code)]
 pub async fn track_requests(req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_string();
     let path = path_label(&req);
