@@ -167,7 +167,12 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let auth_limiter = RateLimiter::<std::net::IpAddr>::new(10, Duration::from_secs(60));
+    let auth_per_minute: usize = std::env::var("AUTH_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let auth_limiter =
+        RateLimiter::<std::net::IpAddr>::new(auth_per_minute, Duration::from_secs(60));
     let register_limiter = RegisterRateLimiter(RateLimiter::new(
         register_per_day,
         Duration::from_secs(86400),
@@ -203,7 +208,8 @@ async fn main() {
     let ls_cache = lemonsqueezy::LsCache::default();
     lemonsqueezy::spawn_refresher(ls_cache.clone());
     tracing::info!(
-        auth_per_minute = 10,
+        trusted_proxies = rate_limit::trusted_proxy_count(),
+        auth_per_minute,
         register_per_day,
         invite_per_hour,
         waitlist_per_hour,

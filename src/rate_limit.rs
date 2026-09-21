@@ -2,7 +2,7 @@ use axum::{extract::Request, http::StatusCode, middleware::Next, response::Respo
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -48,31 +48,107 @@ impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
     }
 }
 
+/// A trusted proxy address or subnet. A containerised reverse proxy gets a new
+/// address on every recreate, so a bare IP cannot be the only accepted form.
+#[derive(Clone, Copy, Debug)]
+pub struct TrustedNet {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedNet {
+    pub fn parse(spec: &str) -> Option<Self> {
+        let (host, prefix) = match spec.split_once('/') {
+            Some((host, prefix)) => (host, Some(prefix.trim().parse::<u8>().ok()?)),
+            None => (spec, None),
+        };
+        let addr: IpAddr = host.trim().parse().ok()?;
+        let host_bits = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(host_bits);
+        (prefix <= host_bits).then_some(Self { addr, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                prefix_matches(&net.octets(), &ip.octets(), self.prefix)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                prefix_matches(&net.octets(), &ip.octets(), self.prefix)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn prefix_matches(net: &[u8], ip: &[u8], prefix: u8) -> bool {
+    let whole = (prefix / 8) as usize;
+    if net[..whole] != ip[..whole] {
+        return false;
+    }
+    let remainder = prefix % 8;
+    if remainder == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - remainder);
+    net[whole] & mask == ip[whole] & mask
+}
+
+fn trusted_proxies() -> &'static [TrustedNet] {
+    static NETS: OnceLock<Vec<TrustedNet>> = OnceLock::new();
+    NETS.get_or_init(|| {
+        let raw = std::env::var("TRUSTED_PROXIES")
+            .or_else(|_| std::env::var("TRUSTED_PROXY_IP"))
+            .unwrap_or_default();
+        raw.split(',')
+            .map(str::trim)
+            .filter(|spec| !spec.is_empty())
+            .filter_map(|spec| {
+                let net = TrustedNet::parse(spec);
+                if net.is_none() {
+                    warn!(entry = spec, "Ignoring unparseable trusted proxy entry");
+                }
+                net
+            })
+            .collect()
+    })
+}
+
+pub fn trusted_proxy_count() -> usize {
+    trusted_proxies().len()
+}
+
+fn client_ip(peer: Option<IpAddr>, forwarded_for: Option<&str>, trusted: &[TrustedNet]) -> IpAddr {
+    let Some(peer) = peer else {
+        return IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    };
+    let trusts = |ip: IpAddr| trusted.iter().any(|net| net.contains(ip));
+    if !trusts(peer) {
+        return peer;
+    }
+    // Rightmost entry that is not itself a trusted proxy. Proxies append, so
+    // everything left of that is caller-supplied and forgeable.
+    forwarded_for
+        .and_then(|header| {
+            header
+                .split(',')
+                .rev()
+                .filter_map(|entry| entry.trim().parse::<IpAddr>().ok())
+                .find(|ip| !trusts(*ip))
+        })
+        .unwrap_or(peer)
+}
+
 fn extract_ip(req: &Request) -> IpAddr {
-    let peer_ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
-
-    // Only trust X-Forwarded-For when the direct connection is from the configured trusted proxy.
-    // Without TRUSTED_PROXY_IP set, fall back to the real peer address to prevent spoofing.
-    let trusted: Option<IpAddr> = std::env::var("TRUSTED_PROXY_IP")
-        .ok()
-        .and_then(|s| s.parse().ok());
-
-    let behind_proxy = matches!((peer_ip, trusted), (Some(peer), Some(t)) if peer == t);
-
-    if behind_proxy {
+    client_ip(
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip()),
         req.headers()
             .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .and_then(|s| s.trim().parse().ok())
-            .or(peer_ip)
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-    } else {
-        peer_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-    }
+            .and_then(|value| value.to_str().ok()),
+        trusted_proxies(),
+    )
 }
 
 /// Newtype so each limiter can coexist as a distinct Extension type.
@@ -208,4 +284,137 @@ pub async fn waitlist_rate_limit(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nets(specs: &[&str]) -> Vec<TrustedNet> {
+        specs.iter().filter_map(|s| TrustedNet::parse(s)).collect()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn parses_bare_addresses_as_single_hosts() {
+        let net = TrustedNet::parse("172.22.0.5").unwrap();
+        assert!(net.contains(ip("172.22.0.5")));
+        assert!(!net.contains(ip("172.22.0.6")));
+    }
+
+    #[test]
+    fn parses_cidr_ranges() {
+        let net = TrustedNet::parse("172.22.0.0/16").unwrap();
+        assert!(net.contains(ip("172.22.0.5")));
+        assert!(net.contains(ip("172.22.255.255")));
+        assert!(!net.contains(ip("172.23.0.1")));
+    }
+
+    #[test]
+    fn honours_prefixes_that_do_not_land_on_a_byte() {
+        let net = TrustedNet::parse("10.0.0.0/12").unwrap();
+        assert!(net.contains(ip("10.15.1.1")));
+        assert!(!net.contains(ip("10.16.0.1")));
+    }
+
+    #[test]
+    fn matches_ipv6_and_never_across_families() {
+        let net = TrustedNet::parse("fd00::/8").unwrap();
+        assert!(net.contains(ip("fd00::1")));
+        assert!(!net.contains(ip("fe80::1")));
+        assert!(!net.contains(ip("10.0.0.1")));
+        assert!(!TrustedNet::parse("10.0.0.0/8")
+            .unwrap()
+            .contains(ip("fd00::1")));
+    }
+
+    #[test]
+    fn rejects_nonsense_specs() {
+        assert!(TrustedNet::parse("").is_none());
+        assert!(TrustedNet::parse("not-an-ip").is_none());
+        assert!(TrustedNet::parse("10.0.0.0/33").is_none());
+        assert!(TrustedNet::parse("10.0.0.0/x").is_none());
+    }
+
+    #[test]
+    fn ignores_forwarded_for_from_an_untrusted_peer() {
+        let ip_used = client_ip(
+            Some(ip("203.0.113.9")),
+            Some("198.51.100.1"),
+            &nets(&["172.22.0.0/16"]),
+        );
+        assert_eq!(ip_used, ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn with_no_trusted_proxies_every_caller_keys_on_the_peer() {
+        let a = client_ip(Some(ip("172.22.0.5")), Some("198.51.100.1"), &[]);
+        let b = client_ip(Some(ip("172.22.0.5")), Some("198.51.100.2"), &[]);
+        assert_eq!(
+            a, b,
+            "this is the shared-bucket behaviour a proxy setup must avoid"
+        );
+    }
+
+    #[test]
+    fn takes_the_client_address_from_a_trusted_proxy() {
+        let ip_used = client_ip(
+            Some(ip("172.22.0.5")),
+            Some("198.51.100.1"),
+            &nets(&["172.22.0.0/16"]),
+        );
+        assert_eq!(ip_used, ip("198.51.100.1"));
+    }
+
+    #[test]
+    fn a_forged_prefix_cannot_change_the_key() {
+        let trusted = nets(&["172.22.0.0/16"]);
+        let honest = client_ip(Some(ip("172.22.0.5")), Some("198.51.100.1"), &trusted);
+        let forged = client_ip(
+            Some(ip("172.22.0.5")),
+            Some("1.2.3.4, 9.9.9.9, 198.51.100.1"),
+            &trusted,
+        );
+        assert_eq!(honest, forged);
+    }
+
+    #[test]
+    fn skips_chained_trusted_hops() {
+        let ip_used = client_ip(
+            Some(ip("172.22.0.5")),
+            Some("198.51.100.1, 172.22.0.9"),
+            &nets(&["172.22.0.0/16"]),
+        );
+        assert_eq!(ip_used, ip("198.51.100.1"));
+    }
+
+    #[test]
+    fn falls_back_to_the_peer_when_the_header_is_missing_or_junk() {
+        let trusted = nets(&["172.22.0.0/16"]);
+        assert_eq!(
+            client_ip(Some(ip("172.22.0.5")), None, &trusted),
+            ip("172.22.0.5")
+        );
+        assert_eq!(
+            client_ip(Some(ip("172.22.0.5")), Some("not-an-ip"), &trusted),
+            ip("172.22.0.5")
+        );
+    }
+
+    #[tokio::test]
+    async fn limiter_admits_up_to_the_configured_maximum() {
+        let limiter = RateLimiter::<IpAddr>::new(3, Duration::from_secs(60));
+        let key = ip("198.51.100.1");
+        for _ in 0..3 {
+            assert!(limiter.check(key).await);
+        }
+        assert!(!limiter.check(key).await);
+        assert!(
+            limiter.check(ip("198.51.100.2")).await,
+            "a different key has its own budget"
+        );
+    }
 }
