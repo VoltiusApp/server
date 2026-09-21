@@ -1,7 +1,8 @@
 services:
   server:
-    build: .
+    image: ${SERVER_IMAGE:-ghcr.io/voltiusapp/voltius-server}:${SERVER_TAG:?pin an immutable sha-<short> tag, never latest}
     container_name: voltius-server
+    restart: unless-stopped
     networks:
       - cloudflare
     ports:
