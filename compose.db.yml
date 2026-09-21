@@ -1,0 +1,200 @@
+# Self-hosted Postgres for voltius-server: WAL-G continuous archiving and PITR to
+# S3-compatible storage (Cloudflare R2), plus an independent nightly pg_dump.
+#
+#   docker compose -f compose.db.yml --env-file .env.db up -d
+#
+# Restore procedure and the drill that proves it: docs/runbooks/restore-database.md
+name: voltius-db
+
+x-walg-env: &walg-env
+  WALG_S3_PREFIX: ${WALG_S3_PREFIX}
+  WALG_COMPRESSION_METHOD: lz4
+  AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
+  AWS_ENDPOINT: ${R2_ENDPOINT}
+  AWS_REGION: ${AWS_REGION:-auto}
+  AWS_S3_FORCE_PATH_STYLE: "true"
+
+services:
+  db:
+    image: pg-walg:${PG_VERSION:-17}-${WALG_VERSION:-3.0.8}
+    build:
+      context: ./pg-walg
+      args:
+        PG_BASE: ${PG_BASE:-postgres:17-trixie}
+        WALG_VERSION: v${WALG_VERSION:-3.0.8}
+    container_name: voltius-db
+    restart: unless-stopped
+    networks: [cloudflare]
+    ports:
+      - "127.0.0.1:${DB_ADMIN_PORT:-5433}:5432"
+    environment:
+      <<: *walg-env
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=wal-g wal-push %p
+      - -c
+      # Caps the recovery point objective: an idle database still ships a segment
+      # every 60s, so at most a minute of writes can be lost.
+      - archive_timeout=60
+      - -c
+      - max_wal_senders=3
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  base-backup:
+    image: pg-walg:${PG_VERSION:-17}-${WALG_VERSION:-3.0.8}
+    container_name: voltius-base-backup
+    restart: unless-stopped
+    networks: [cloudflare]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - db-data:/var/lib/postgresql/data:ro
+    environment:
+      <<: *walg-env
+      PGHOST: voltius-db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BASEBACKUP_INTERVAL: ${BASEBACKUP_INTERVAL:-86400}
+      BASEBACKUP_RETAIN: ${BASEBACKUP_RETAIN:-14}
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        sleep 15
+        while true; do
+          echo "[base-backup] $(date -u '+%F %T')Z pushing base backup...";
+          wal-g backup-push /var/lib/postgresql/data && echo "[base-backup] ok" \
+            || echo "[base-backup] FAILED (WAL archiving still protects you)";
+          # Prunes WAL below the oldest retained base as well, which an object-store
+          # lifecycle rule cannot do safely.
+          echo "[base-backup] pruning to last $${BASEBACKUP_RETAIN} full backups...";
+          wal-g delete retain FULL "$${BASEBACKUP_RETAIN}" --confirm && echo "[base-backup] prune ok" \
+            || echo "[base-backup] PRUNE FAILED";
+          sleep "$${BASEBACKUP_INTERVAL}";
+        done
+
+  # Independent of WAL-G on purpose: a second path that shares no code with the first.
+  dump:
+    image: prodrigestivill/postgres-backup-local:${PG_VERSION:-17}-alpine
+    container_name: voltius-dump
+    restart: unless-stopped
+    networks: [cloudflare]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backups:/backups
+    environment:
+      POSTGRES_HOST: voltius-db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SCHEDULE: ${BACKUP_SCHEDULE:-@daily}
+      BACKUP_ON_START: "TRUE"
+      BACKUP_KEEP_DAYS: "7"
+      BACKUP_KEEP_WEEKS: "4"
+      BACKUP_KEEP_MONTHS: "6"
+      TZ: ${TZ:-UTC}
+
+  dump-mirror:
+    image: rclone/rclone:1.69
+    container_name: voltius-dump-mirror
+    restart: unless-stopped
+    networks: [cloudflare]
+    depends_on:
+      - dump
+    volumes:
+      - ./backups:/data:ro
+    environment:
+      RCLONE_CONFIG_R2BACKUP_TYPE: s3
+      RCLONE_CONFIG_R2BACKUP_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2BACKUP_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
+      RCLONE_CONFIG_R2BACKUP_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
+      RCLONE_CONFIG_R2BACKUP_ENDPOINT: ${R2_ENDPOINT}
+      RCLONE_CONFIG_R2BACKUP_ACL: private
+      RCLONE_CONFIG_R2BACKUP_NO_CHECK_BUCKET: "true"
+      R2_BUCKET: ${R2_BUCKET}
+      MIRROR_INTERVAL: ${BACKUP_MIRROR_INTERVAL:-86400}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          echo "[dump-mirror] $(date -u '+%F %T')Z syncing -> r2:$${R2_BUCKET}/voltius-prod/dumps";
+          rclone sync /data "r2backup:$${R2_BUCKET}/voltius-prod/dumps" --copy-links --stats-one-line \
+            && echo "[dump-mirror] ok" || echo "[dump-mirror] FAILED (will retry)";
+          sleep "$${MIRROR_INTERVAL}";
+        done
+
+  # Optional SQL and table browser. Behind a profile and restart:"no" so it never
+  # starts on its own, including after a reboot:
+  #   docker compose -f compose.db.yml --env-file .env.db --profile studio up -d
+  # Bound to loopback only — reach it by forwarding port 8000 over SSH.
+  studio-meta:
+    profiles: [studio]
+    image: supabase/postgres-meta:v0.96.6
+    container_name: voltius-studio-meta
+    restart: "no"
+    networks: [cloudflare]
+    environment:
+      PG_META_PORT: "8080"
+      PG_META_DB_HOST: voltius-db
+      PG_META_DB_PORT: "5432"
+      PG_META_DB_NAME: ${POSTGRES_DB}
+      PG_META_DB_USER: ${POSTGRES_USER}
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY:-}
+
+  studio:
+    profiles: [studio]
+    image: supabase/studio:2026.07.07-sha-a6a04f2
+    container_name: voltius-studio
+    restart: "no"
+    networks: [cloudflare]
+    depends_on:
+      - studio-meta
+    ports:
+      - "127.0.0.1:${STUDIO_PORT:-8000}:3000"
+    environment:
+      HOSTNAME: "0.0.0.0"
+      STUDIO_PG_META_URL: http://voltius-studio-meta:8080
+      POSTGRES_HOST: voltius-db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER_READ_WRITE: ${POSTGRES_USER}
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY:-}
+      DEFAULT_ORGANIZATION_NAME: ${STUDIO_ORG_NAME:-Voltius}
+      DEFAULT_PROJECT_NAME: ${STUDIO_PROJECT_NAME:-voltius-prod}
+      ENABLED_FEATURES_LOGS_ALL: "false"
+      SUPABASE_URL: http://voltius-studio-meta:8080
+      SUPABASE_PUBLIC_URL: http://localhost:${STUDIO_PORT:-8000}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+      AUTH_JWT_SECRET: ${STUDIO_JWT_SECRET:-}
+      PGRST_DB_SCHEMAS: public
+
+networks:
+  cloudflare:
+    external: true
+
+volumes:
+  db-data:

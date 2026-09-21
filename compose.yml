@@ -1,6 +1,8 @@
 services:
   db:
-    image: postgres:16-alpine
+    # Pinned to 16 because bumping it FATALs on an existing volume
+    # ("database files are incompatible with server"). Upgrading needs a dump and reload.
+    image: postgres:${POSTGRES_IMAGE_TAG:-16-alpine}
     container_name: voltius-db
     restart: unless-stopped
     environment:
