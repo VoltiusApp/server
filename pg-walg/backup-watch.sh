@@ -22,6 +22,10 @@ check_archiver() {
   archived_age="${row%%|*}"
   failed_newer="${row##*|}"
 
+  if ! [ "$archived_age" -eq "$archived_age" ] 2>/dev/null; then
+    log "FAIL archiver: unreadable age '$archived_age' from pg_stat_archiver"
+    return 1
+  fi
   if [ "$archived_age" -lt 0 ]; then
     log "FAIL archiver: no WAL segment has ever been archived"
     return 1

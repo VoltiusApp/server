@@ -28,7 +28,7 @@ FROM ${PG_BASE}
 # wal-g publishes glibc binaries only; gcompat runs them on musl.
 RUN set -eux; \
     if [ -f /etc/alpine-release ]; then \
-      apk add --no-cache gcompat curl python3; \
+      apk add --no-cache gcompat curl; \
     else \
       apt-get update && apt-get install -y --no-install-recommends curl python3 \
         && rm -rf /var/lib/apt/lists/*; \
