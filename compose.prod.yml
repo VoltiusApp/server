@@ -12,6 +12,10 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       PORT: "8080"
       RUST_LOG: info
+      # Without this the proxy is the only peer the server sees, so every user
+      # shares one rate-limit bucket. Must cover the proxy's container network.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:?set the reverse proxy network, e.g. 172.22.0.0/16}
+      AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-10}
       SYNC_RATE_LIMIT: ${SYNC_RATE_LIMIT:-10000}
       REGISTER_RATE_LIMIT: ${REGISTER_RATE_LIMIT:-20}
       INVITE_RATE_LIMIT: ${INVITE_RATE_LIMIT:-20}
