@@ -36,6 +36,26 @@ pub fn init() -> PrometheusHandle {
     handle
 }
 
+pub async fn refresh_storage_gauge(pool: &sqlx::PgPool) {
+    match sqlx::query_scalar::<_, i64>("SELECT pg_total_relation_size('sync_blobs')")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(bytes) => metrics::gauge!("voltius_sync_blobs_bytes").set(bytes as f64),
+        Err(e) => tracing::error!(error = %e, "sync_blobs size query failed"),
+    }
+}
+
+pub fn spawn_storage_refresher(pool: sqlx::PgPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            refresh_storage_gauge(&pool).await;
+        }
+    });
+}
+
 #[cfg(test)]
 pub(crate) fn test_handle() -> PrometheusHandle {
     // install_recorder succeeds once per process, so every test shares this one.
@@ -179,6 +199,21 @@ mod tests {
         assert!(
             rendered.contains("le=\"0.025\""),
             "configured buckets missing from:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_gauge_reports_the_sync_blobs_size() {
+        let h = handle();
+        let pool = crate::test_pool_or_skip!();
+
+        refresh_storage_gauge(&pool).await;
+
+        h.run_upkeep();
+        let rendered = h.render();
+        assert!(
+            rendered.contains("voltius_sync_blobs_bytes"),
+            "storage gauge missing from:\n{rendered}"
         );
     }
 }

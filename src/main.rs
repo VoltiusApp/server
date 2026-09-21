@@ -139,6 +139,7 @@ async fn main() {
     });
 
     let metrics_handle = observability::init();
+    observability::spawn_storage_refresher(pool.clone());
 
     let notifier = SyncNotifier::new();
     let terminal_manager = TerminalManager::new();
