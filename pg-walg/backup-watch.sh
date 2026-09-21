@@ -12,12 +12,12 @@ log() { echo "[backup-watch] $(date -u '+%F %T')Z $*"; }
 
 check_archiver() {
   local row archived_age failed_newer
-  row=$(psql -qtAX -F'|' -c "SELECT
+  row=$(PGCONNECT_TIMEOUT=10 PGOPTIONS='-c statement_timeout=10000' psql -qtAX -F'|' -c "SELECT
       COALESCE(EXTRACT(EPOCH FROM (now() - last_archived_time))::bigint, -1),
       CASE WHEN last_failed_time IS NOT NULL
             AND (last_archived_time IS NULL OR last_failed_time > last_archived_time)
            THEN 1 ELSE 0 END
-    FROM pg_stat_archiver;") || { log "FAIL archiver: psql query failed"; return 1; }
+    FROM pg_stat_archiver;") || { log "FAIL archiver: psql query failed or timed out"; return 1; }
 
   archived_age="${row%%|*}"
   failed_newer="${row##*|}"
@@ -38,10 +38,10 @@ check_archiver() {
 }
 
 check_base_backup() {
-  local newest age now
-  newest=$(wal-g backup-list --detail --json 2>/dev/null \
+  local newest newest_epoch age now
+  newest=$(timeout 30s wal-g backup-list --detail --json 2>/dev/null \
     | python3 -c 'import sys,json;b=json.load(sys.stdin);print(max(x["time"] for x in b) if b else "")') \
-    || { log "FAIL base backup: wal-g backup-list failed"; return 1; }
+    || { log "FAIL base backup: wal-g backup-list failed or timed out"; return 1; }
 
   if [ -z "$newest" ]; then
     log "FAIL base backup: no base backup exists"
@@ -49,7 +49,9 @@ check_base_backup() {
   fi
 
   now=$(date -u +%s)
-  age=$(( now - $(date -u -d "$newest" +%s) ))
+  newest_epoch=$(date -u -d "$newest" +%s) \
+    || { log "FAIL base backup: could not parse backup timestamp '$newest'"; return 1; }
+  age=$(( now - newest_epoch ))
   if [ "$age" -gt "$BACKUP_MAX_AGE" ]; then
     log "FAIL base backup: newest is ${age}s old, limit ${BACKUP_MAX_AGE}s"
     return 1
@@ -74,9 +76,14 @@ check_dump() {
 }
 
 check_disk() {
-  local free
-  free=$(df --output=pcent "$DATA_DIR" | tail -1 | tr -dc '0-9')
-  free=$(( 100 - free ))
+  local used free
+  used=$(df --output=pcent "$DATA_DIR" 2>/dev/null | tail -1 | tr -dc '0-9') \
+    || { log "FAIL disk: df failed for $DATA_DIR"; return 1; }
+  if ! [ "$used" -ge 0 ] 2>/dev/null; then
+    log "FAIL disk: df returned no usable percentage for $DATA_DIR"
+    return 1
+  fi
+  free=$(( 100 - used ))
   if [ "$free" -lt "$DISK_FREE_MIN" ]; then
     log "FAIL disk: ${free}% free, minimum ${DISK_FREE_MIN}%"
     return 1
@@ -96,7 +103,7 @@ while true; do
       if curl -fsS --max-time 15 -o /dev/null "$INSTATUS_HEARTBEAT_URL"; then
         log "all checks passed, heartbeat sent"
       else
-        log "all checks passed, but the heartbeat POST failed"
+        log "all checks passed, but the heartbeat GET failed"
       fi
     else
       log "all checks passed, INSTATUS_HEARTBEAT_URL unset, nothing pinged"
