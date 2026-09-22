@@ -70,7 +70,7 @@ checkout() {
 lay_out() {
   checkout "$ROOT/voltius-db" /compose.db.yml /pg-walg/ /.env.db.example /.gitignore
   checkout "$ROOT/voltius-server" /compose.prod.yml /.env.example
-  checkout "$ROOT/voltius-tofu" /infra/cloudflare/ /scripts/backup-tofu-state.sh /.gitignore
+  checkout "$ROOT/voltius-tofu" /infra/cloudflare/ /infra/oci/ /ansible/ /scripts/backup-tofu-state.sh /.gitignore
   mkdir -p "$ROOT/cloudflared"
   cat > "$ROOT/cloudflared/compose.yml" <<'YAML'
 # Token lives in .env beside this file, never in the command line: anything that can
@@ -94,9 +94,10 @@ YAML
 # A path unit, not a timer: the state only changes when someone runs `tofu apply`,
 # so polling would either lag or run all day for nothing.
 install_state_watch() {
-  local state="$ROOT/voltius-tofu/infra/cloudflare/terraform.tfstate"
+  local cf="$ROOT/voltius-tofu/infra/cloudflare/terraform.tfstate"
+  local oci="$ROOT/voltius-tofu/infra/oci/terraform.tfstate"
   log "installing the OpenTofu state watch"
-  cat > /etc/systemd/system/voltius-tofu-state-backup.service <<UNIT
+  sudo tee /etc/systemd/system/voltius-tofu-state-backup.service >/dev/null <<UNIT
 [Unit]
 Description=Copy the OpenTofu state to the R2 backup bucket
 Requires=docker.service
@@ -105,21 +106,23 @@ After=docker.service
 [Service]
 Type=oneshot
 Environment=TOFU_STATE_ENV_FILE=$ROOT/voltius-db/.env.db
-ExecStart=$ROOT/voltius-tofu/scripts/backup-tofu-state.sh $state
+ExecStart=$ROOT/voltius-tofu/scripts/backup-tofu-state.sh $cf
+ExecStart=$ROOT/voltius-tofu/scripts/backup-tofu-state.sh $oci
 UNIT
-  cat > /etc/systemd/system/voltius-tofu-state-backup.path <<UNIT
+  sudo tee /etc/systemd/system/voltius-tofu-state-backup.path >/dev/null <<UNIT
 [Unit]
 Description=Watch the OpenTofu state for changes
 
 [Path]
-PathChanged=$state
+PathChanged=$cf
+PathChanged=$oci
 Unit=voltius-tofu-state-backup.service
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable --now voltius-tofu-state-backup.path
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now voltius-tofu-state-backup.path
 }
 
 check_secrets() {

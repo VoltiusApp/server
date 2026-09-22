@@ -2,7 +2,9 @@
 Description=Watch the OpenTofu state for changes
 
 [Path]
-PathChanged={{ voltius_tofu_state }}
+{% for state in voltius_tofu_states %}
+PathChanged={{ state }}
+{% endfor %}
 Unit=voltius-tofu-state-backup.service
 
 [Install]
