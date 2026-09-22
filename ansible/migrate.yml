@@ -269,7 +269,15 @@
   hosts: "{{ voltius_source }}"
   gather_facts: false
   tasks:
+    # A drill migrates two throwaway hosts and must not touch the record that
+    # serves users: -e voltius_cutover=false stops here.
+    - name: Say that the cutover is being skipped
+      ansible.builtin.debug:
+        msg: "voltius_cutover is false: api.voltius.app is untouched, {{ voltius_target }} serves nobody"
+      when: not (voltius_cutover | default(true) | bool)
+
     - name: Point api.voltius.app at the new tunnel
+      when: voltius_cutover | default(true) | bool
       ansible.builtin.shell:
         cmd: |
           set -eu
@@ -287,6 +295,7 @@
       register: voltius_public_health
       until: voltius_public_health.status == 200
       delegate_to: localhost
+      when: voltius_cutover | default(true) | bool
 
 - name: Phase 8 — verify
   hosts: "{{ voltius_target }}"
@@ -294,7 +303,7 @@
   tasks:
     - name: Wait for the backup watchdog to pass a full round
       ansible.builtin.shell:
-        cmd: docker logs --tail 20 voltius-backup-watch 2>&1 | grep -c 'heartbeat sent'
+        cmd: docker logs --tail 20 voltius-backup-watch 2>&1 | grep -c 'all checks passed'
       register: voltius_watch
       until: voltius_watch.stdout | int > 0
       retries: 60
