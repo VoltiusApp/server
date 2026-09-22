@@ -45,6 +45,16 @@ throughout**, and no base-backup, backup-watch, dump, dump-mirror, server or tun
 rehearsal must not write to R2 or answer to the world. It refuses to run on a host that
 has a `voltius-server` container.
 
+### Last migration drill: 2026-09-22
+
+Phases 1–6 run between two throwaway A1 instances, production untouched: freeze,
+`pg_switch_wal`, archive wait, source stack stopped, restore, promote, server started. The
+target came up with 32 tables, 335 users, migration 42, on timeline 3, answering `/health`.
+It took five attempts, and each failure was a fault worth finding — see PR #53.
+
+Phase 7 is still unproven and cannot be drilled: pointing `api.voltius.app` somewhere is
+the one step with no throwaway equivalent.
+
 ### Last rehearsal: 2026-09-22
 
 Passed on a throwaway 1 OCPU / 6 GB A1 instance created by `var.hosts`, from bare Ubuntu 24.04:
