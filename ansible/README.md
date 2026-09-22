@@ -9,6 +9,10 @@ every mirrored dump in R2.
 Requires `ansible-core` on the controller. No collections, no Python modules on the
 targets: every docker step is the CLI.
 
+Nothing here is tied to a cloud. A target is any Ubuntu 24.04 host reachable over SSH —
+`infra/oci` creates the one production happens to run on, and `infra/README.md` says
+what a host from anywhere else has to satisfy.
+
 ## Inventory
 
 Copy `inventory.example.yml` to `inventory.yml` (gitignored) and give each host its
