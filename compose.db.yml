@@ -129,6 +129,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # BACKUP_ON_START fires before Postgres is up on a host reboot, where dockerd
+    # starts both at once and ignores depends_on; the failed run then sits until @daily.
+    entrypoint:
+      - sh
+      - -c
+      - 'until pg_isready -h "$$POSTGRES_HOST" -p "$$POSTGRES_PORT" -U "$$POSTGRES_USER" -q; do sleep 2; done; exec /init.sh'
     volumes:
       - ./backups:/backups
     environment:
