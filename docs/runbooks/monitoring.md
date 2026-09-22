@@ -99,6 +99,12 @@ The archiver query runs with `PGCONNECT_TIMEOUT=10` and a 10s `statement_timeout
 check wraps `wal-g backup-list` in `timeout 30s`. A hung Postgres or a hung WAL-G call fails the
 round instead of hanging the loop.
 
+A refused connection is retried for `DB_CONNECT_WAIT_SECONDS` (120s) before the round fails. That
+window exists for host reboots: Docker starts every restart-policy container at once and ignores
+`depends_on`, so `voltius-backup-watch` can run its first round seconds before Postgres accepts
+connections and withhold a heartbeat for no reason. A Postgres that is genuinely down stays down far
+longer than the window, so the check still fails when it should.
+
 `BACKUP_MAX_AGE_SECONDS` (172800s / 48h) must stay above both producers it measures: `base-backup`'s
 own interval, `BASEBACKUP_INTERVAL` (86400s / 24h, `compose.db.yml`), and `dump`'s `BACKUP_SCHEDULE`
 (`@daily`, `compose.db.yml`). Nothing enforces that relationship — raising either producer's cadence
