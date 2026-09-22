@@ -11,6 +11,7 @@ mod permissions;
 mod rate_limit;
 mod routes;
 mod self_host;
+mod single_instance;
 mod session_grants;
 mod team_join_grants;
 mod sync_notifier;
@@ -78,6 +79,11 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    // Before anything serves or writes: a second instance on this database is
+    // silently wrong today, so it must not start.
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let _instance_lock = single_instance::acquire(&database_url).await;
 
     let pool = db::create_pool().await;
 
