@@ -18,7 +18,7 @@ ages. See "Deployment status" below: this mechanism is not live yet.
 ## Reading `/metrics`
 
 ```sh
-curl -s -H "x-admin-key: $ADMIN_SECRET" https://sync.voltius.app/metrics
+curl -s -H "x-admin-key: $ADMIN_SECRET" https://api.voltius.app/metrics
 ```
 
 `$ADMIN_SECRET` comes from the server's own `.env` on the box (the same value the admin API uses),
@@ -64,10 +64,14 @@ dashboard. Reading `/metrics` is for an investigation already underway, not for 
   (`{"database": "ok"|"unreachable", "pool_size": N, "pool_idle": N}`), 200 on success, 503 on
   failure.
 
-The Instatus monitor currently pointed at `https://sync.voltius.app/health` must be repointed to
-`/health/deep`. `/health` is a static string — the status page can read 100% uptime while the
-database is completely unreachable. This repoint is an operator action in the Instatus dashboard;
-nothing in this repo does it.
+The server's public hostname is `api.voltius.app` — the Cloudflare tunnel ingress
+(`deploy-server.md`) and the client's `DEFAULT_SERVER_URL`. `sync.voltius.app` has no DNS record;
+an Instatus component carrying that name is not probing this server, whatever uptime it reports.
+
+The Instatus monitor for the server must point at `https://api.voltius.app/health/deep`, not
+`/health`. `/health` is a static string — the status page can read 100% uptime while the database
+is completely unreachable. This repoint is an operator action in the Instatus dashboard; nothing
+in this repo does it.
 
 ## The heartbeat
 
