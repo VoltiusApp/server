@@ -168,14 +168,17 @@ services:
       RCLONE_CONFIG_R2BACKUP_ACL: private
       RCLONE_CONFIG_R2BACKUP_NO_CHECK_BUCKET: "true"
       R2_BUCKET: ${R2_BUCKET}
+      # A drill runs this stack against the same bucket under its own prefix; a
+      # shared one would have rclone sync delete production's dumps.
+      DUMPS_PREFIX: ${DUMPS_PREFIX:-voltius-prod/dumps}
       MIRROR_INTERVAL: ${BACKUP_MIRROR_INTERVAL:-86400}
     entrypoint:
       - /bin/sh
       - -c
       - |
         while true; do
-          echo "[dump-mirror] $(date -u '+%F %T')Z syncing -> r2:$${R2_BUCKET}/voltius-prod/dumps";
-          rclone sync /data "r2backup:$${R2_BUCKET}/voltius-prod/dumps" --copy-links --stats-one-line \
+          echo "[dump-mirror] $(date -u '+%F %T')Z syncing -> r2:$${R2_BUCKET}/$${DUMPS_PREFIX}";
+          rclone sync /data "r2backup:$${R2_BUCKET}/$${DUMPS_PREFIX}" --copy-links --stats-one-line \
             && echo "[dump-mirror] ok" || echo "[dump-mirror] FAILED (will retry)";
           sleep "$${MIRROR_INTERVAL}";
         done
