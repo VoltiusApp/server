@@ -1,5 +1,9 @@
 # Rebuilding the production host
 
+`ansible/` supersedes `scripts/bootstrap-host.sh` for both jobs below: `site.yml` prepares a host
+and `migrate.yml` moves production onto it. This page stays as the description of what has to
+arrive from where, and as the manual path if Ansible is not available.
+
 What to do when the box is gone, or when a second one has to be stood up. It assumes a fresh Ubuntu
 24.04 aarch64 machine with passwordless sudo and nothing else.
 
@@ -15,7 +19,8 @@ The server image itself comes from GHCR, so nothing is compiled on the host.
 
 ## The secrets bundle
 
-`.env.dockhand`, `.env.db`, `cloudflared/.env` and `voltius-tofu/.env.tofu` exist nowhere else. No database backup contains
+`.env.dockhand`, `.env.db`, `cloudflared/.env`, `cloudflared-api/.env`, `voltius-tofu/.env.tofu` and
+`voltius-tofu/oci_api_key.pem` exist nowhere else. No database backup contains
 them, and losing `JWT_SECRET` alone signs every user out permanently. `scripts/secrets-bundle.sh`
 tars them, encrypts them to an age recipient, and uploads them to
 `s3://<bucket>/voltius-prod/secrets/`, keeping `secrets-latest.tar.age` as the pointer.

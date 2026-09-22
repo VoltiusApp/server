@@ -11,7 +11,9 @@ FILES=(
   "voltius-server/.env.dockhand"
   "voltius-db/.env.db"
   "cloudflared/.env"
+  "cloudflared-api/.env"
   "voltius-tofu/.env.tofu"
+  "voltius-tofu/oci_api_key.pem"
 )
 
 WORK=""
