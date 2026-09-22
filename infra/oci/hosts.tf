@@ -17,6 +17,14 @@ variable "hosts" {
   description = "Additional hosts to create, keyed by the name used in the Ansible inventory."
 }
 
+# The current instance keeps the single key it was created with; new hosts also
+# accept the controller's key, which is what runs the playbooks over SSH.
+variable "host_ssh_authorized_keys" {
+  type        = list(string)
+  default     = []
+  description = "Public keys for hosts in var.hosts. Empty falls back to ssh_authorized_key."
+}
+
 data "oci_core_images" "ubuntu_2404" {
   compartment_id           = var.oci_tenancy_ocid
   operating_system         = "Canonical Ubuntu"
@@ -35,7 +43,7 @@ resource "oci_core_instance" "host" {
   shape               = each.value.shape
 
   metadata = {
-    ssh_authorized_keys = var.ssh_authorized_key
+    ssh_authorized_keys = join("\n", coalescelist(var.host_ssh_authorized_keys, [var.ssh_authorized_key]))
   }
 
   shape_config {
