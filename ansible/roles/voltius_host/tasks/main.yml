@@ -1,0 +1,81 @@
+---
+- name: Refuse to reshape a host that is already serving
+  ansible.builtin.shell:
+    cmd: docker ps --filter name=^voltius-server$ --filter status=running --format '{{ "{{" }}.Names{{ "}}" }}'
+  register: voltius_host_running
+  changed_when: false
+
+- name: Stop unless this host is idle
+  ansible.builtin.assert:
+    that: voltius_host_running.stdout == "" or voltius_host_allow_live | default(false)
+    fail_msg: >-
+      voltius-server is running here. site.yml prepares an idle host; pass
+      -e voltius_host_allow_live=true only to re-run it against a live one.
+
+- name: Create the directories
+  ansible.builtin.file:
+    path: "{{ voltius_root }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - voltius-db
+    - voltius-server
+    - cloudflared-api
+
+- name: Lay out the sparse checkouts
+  ansible.builtin.include_tasks: checkout.yml
+  loop:
+    - dir: voltius-db
+      paths: /compose.db.yml /pg-walg/ /.env.db.example /.gitignore
+    - dir: voltius-server
+      paths: /compose.prod.yml /.env.example /scripts/
+  loop_control:
+    loop_var: checkout
+
+- name: Install the tunnel connector compose file
+  ansible.builtin.copy:
+    src: cloudflared-compose.yml
+    dest: "{{ voltius_root }}/cloudflared-api/compose.yml"
+    mode: "0644"
+
+- name: Build the pg-walg images
+  ansible.builtin.command:
+    cmd: docker compose -f compose.db.yml --env-file .env.db.example build db backup-watch
+    chdir: "{{ voltius_root }}/voltius-db"
+  register: voltius_host_build
+  changed_when: "'Building' in voltius_host_build.stderr or 'naming to' in voltius_host_build.stderr"
+
+- name: Install the OpenTofu state backup units
+  become: true
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: /etc/systemd/system/{{ item }}
+    mode: "0644"
+  loop:
+    - voltius-tofu-state-backup.service
+    - voltius-tofu-state-backup.path
+  when: voltius_host_tofu_controller | default(false)
+
+- name: Enable the state watch
+  become: true
+  ansible.builtin.systemd_service:
+    name: voltius-tofu-state-backup.path
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: voltius_host_tofu_controller | default(false)
+
+- name: Report what is still missing before this host can serve
+  ansible.builtin.stat:
+    path: "{{ voltius_root }}/{{ item }}"
+  register: voltius_host_secret_files
+  loop:
+    - voltius-server/.env.dockhand
+    - voltius-db/.env.db
+    - cloudflared-api/.env
+
+- name: Say so
+  ansible.builtin.debug:
+    msg: >-
+      Prepared. Missing before it can serve:
+      {{ voltius_host_secret_files.results | rejectattr('stat.exists') | map(attribute='item') | list | default(['nothing'], true) | join(', ') }}
