@@ -28,8 +28,8 @@ psql_wait() {
 }
 
 check_archiver() {
-  local row archived_age failed_newer
-  row=$(psql_wait "SELECT
+  local row mode archived_age failed_newer status_dir pending
+  row=$(psql_wait "SELECT current_setting('archive_mode'),
       COALESCE(EXTRACT(EPOCH FROM (now() - last_archived_time))::bigint, -1),
       CASE WHEN last_failed_time IS NOT NULL
             AND (last_archived_time IS NULL OR last_failed_time > last_archived_time)
@@ -37,9 +37,15 @@ check_archiver() {
     FROM pg_stat_archiver;") \
     || { log "FAIL archiver: no answer from Postgres within ${CONNECT_WAIT}s"; return 1; }
 
+  mode="${row%%|*}"
+  row="${row#*|}"
   archived_age="${row%%|*}"
   failed_newer="${row##*|}"
 
+  if [ "$mode" != "on" ] && [ "$mode" != "always" ]; then
+    log "FAIL archiver: archive_mode is '$mode'"
+    return 1
+  fi
   if ! [ "$archived_age" -eq "$archived_age" ] 2>/dev/null; then
     log "FAIL archiver: unreadable age '$archived_age' from pg_stat_archiver"
     return 1
@@ -48,15 +54,29 @@ check_archiver() {
     log "FAIL archiver: no WAL segment has ever been archived"
     return 1
   fi
-  if [ "$archived_age" -gt "$ARCHIVE_MAX_AGE" ]; then
-    log "FAIL archiver: last archived ${archived_age}s ago, limit ${ARCHIVE_MAX_AGE}s"
-    return 1
-  fi
   if [ "$failed_newer" = "1" ]; then
     log "FAIL archiver: last_failed_time is newer than last_archived_time"
     return 1
   fi
-  log "ok archiver: last archived ${archived_age}s ago"
+
+  # Age alone is not a fault: Postgres does not switch segments while nothing is
+  # being written, so an idle database's last archive recedes with no WAL at risk.
+  status_dir="$DATA_DIR/pg_wal/archive_status"
+  if [ ! -d "$status_dir" ]; then
+    log "FAIL archiver: cannot read $status_dir"
+    return 1
+  fi
+  pending=$(find "$status_dir" -maxdepth 1 -name '*.ready' 2>/dev/null | wc -l)
+
+  if [ "$pending" -eq 0 ]; then
+    log "ok archiver: nothing waiting, last archived ${archived_age}s ago"
+    return 0
+  fi
+  if [ "$archived_age" -gt "$ARCHIVE_MAX_AGE" ]; then
+    log "FAIL archiver: ${pending} segment(s) waiting, last archived ${archived_age}s ago, limit ${ARCHIVE_MAX_AGE}s"
+    return 1
+  fi
+  log "ok archiver: ${pending} segment(s) waiting, last archived ${archived_age}s ago"
 }
 
 check_base_backup() {

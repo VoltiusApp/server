@@ -90,7 +90,7 @@ The four checks (`pg-walg/backup-watch.sh`):
 
 | Check | Threshold | Env var (default) |
 |---|---|---|
-| `check_archiver` | `pg_stat_archiver.last_archived_time` under the limit **and** `last_failed_time` not newer than `last_archived_time` | `ARCHIVE_MAX_AGE_SECONDS` (600s) |
+| `check_archiver` | `archive_mode` on, something has been archived, `last_failed_time` not newer than `last_archived_time`, and — only while `pg_wal/archive_status` holds `.ready` files — `last_archived_time` under the limit | `ARCHIVE_MAX_AGE_SECONDS` (600s) |
 | `check_base_backup` | Newest `wal-g backup-list` entry under the limit | `BACKUP_MAX_AGE_SECONDS` (172800s / 48h) |
 | `check_dump` | Newest `*.sql.gz` under `DUMP_DIR` under the limit | `BACKUP_MAX_AGE_SECONDS` (same, 48h) |
 | `check_disk` | Free space on `DATA_DIR` at or above the minimum | `DISK_FREE_MIN_PERCENT` (15%) |
@@ -98,6 +98,17 @@ The four checks (`pg-walg/backup-watch.sh`):
 The archiver query runs with `PGCONNECT_TIMEOUT=10` and a 10s `statement_timeout`; the base-backup
 check wraps `wal-g backup-list` in `timeout 30s`. A hung Postgres or a hung WAL-G call fails the
 round instead of hanging the loop.
+
+Archive age is judged only while segments are actually waiting. Postgres does not switch a WAL
+segment when nothing has been written, so on a quiet database `last_archived_time` recedes past any
+threshold with no WAL at risk — the old unconditional age check failed a healthy idle database, which
+is a page for nothing. `.ready` files in `pg_wal/archive_status` are the real signal: they mean a
+completed segment is queued for `archive_command`. Because the check would otherwise read "nothing
+waiting" as healthy even with archiving switched off, `archive_mode` is now asserted explicitly.
+
+This keeps the case the age check exists for. When `archive_command` exits 127 — the WAL-G binary
+missing, as in #27 — Postgres does not update `last_failed_time`, so age is the only evidence; the
+`.ready` file stays put and ages, and the round fails with the count of waiting segments.
 
 A refused connection is retried for `DB_CONNECT_WAIT_SECONDS` (120s) before the round fails. That
 window exists for host reboots: Docker starts every restart-policy container at once and ignores
