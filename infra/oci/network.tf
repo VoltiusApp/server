@@ -30,6 +30,9 @@ resource "oci_core_default_route_table" "main" {
   }
 }
 
+# The API is not published here: traffic arrives through the tunnel, whose
+# connector dials out. An ingress rule for 14372 exposed it to the internet in
+# cleartext, past Cloudflare.
 resource "oci_core_default_security_list" "main" {
   compartment_id             = "ocid1.tenancy.oc1..aaaaaaaa33dfprecs3tmxiz3romtjrqadraiopzl3dbol5y2yii7kyvwgbya"
   display_name               = "Default Security List for vcn-20231117-1841"
@@ -72,17 +75,6 @@ resource "oci_core_default_security_list" "main" {
     tcp_options {
       max = 22
       min = 22
-    }
-  }
-  ingress_security_rules {
-    description = "TermForge"
-    protocol    = "6"
-    source      = "0.0.0.0/0"
-    source_type = "CIDR_BLOCK"
-    stateless   = false
-    tcp_options {
-      max = 14372
-      min = 14372
     }
   }
 }

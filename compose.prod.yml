@@ -5,8 +5,11 @@ services:
     restart: unless-stopped
     networks:
       - cloudflare
+    # Loopback only: the tunnel reaches this container over the cloudflare
+    # network by name, so publishing to 0.0.0.0 only exposed the API to the
+    # internet in cleartext, past the proxy.
     ports:
-      - "14372:8080"
+      - "127.0.0.1:14372:8080"
     environment:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
