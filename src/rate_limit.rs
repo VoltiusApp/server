@@ -10,9 +10,14 @@ use uuid::Uuid;
 
 /// Per-key sliding window rate limiter. Key is typically IpAddr or Uuid.
 pub struct RateLimiter<K = IpAddr> {
-    state: Arc<Mutex<HashMap<K, Vec<Instant>>>>,
+    state: Arc<Mutex<Buckets<K>>>,
     max_requests: usize,
     window: Duration,
+}
+
+struct Buckets<K> {
+    by_key: HashMap<K, Vec<Instant>>,
+    last_sweep: Instant,
 }
 
 // Manual Clone: Arc clone is always valid regardless of K.
@@ -29,7 +34,10 @@ impl<K> Clone for RateLimiter<K> {
 impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
     pub fn new(max_requests: usize, window: Duration) -> Self {
         Self {
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(Buckets {
+                by_key: HashMap::new(),
+                last_sweep: Instant::now(),
+            })),
             max_requests,
             window,
         }
@@ -38,13 +46,26 @@ impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
     pub async fn check(&self, key: K) -> bool {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        let entries = state.entry(key).or_default();
-        entries.retain(|t| now.duration_since(*t) < self.window);
+        let window = self.window;
+        // A key that never returns is only reclaimed here.
+        if now.duration_since(state.last_sweep) >= window {
+            state
+                .by_key
+                .retain(|_, hits| hits.last().is_some_and(|t| now.duration_since(*t) < window));
+            state.last_sweep = now;
+        }
+        let entries = state.by_key.entry(key).or_default();
+        entries.retain(|t| now.duration_since(*t) < window);
         if entries.len() >= self.max_requests {
             return false;
         }
         entries.push(now);
         true
+    }
+
+    #[cfg(test)]
+    async fn tracked_keys(&self) -> usize {
+        self.state.lock().await.by_key.len()
     }
 }
 
@@ -416,5 +437,36 @@ mod tests {
             limiter.check(ip("198.51.100.2")).await,
             "a different key has its own budget"
         );
+    }
+
+    #[tokio::test]
+    async fn keys_that_go_quiet_are_evicted() {
+        let window = Duration::from_millis(30);
+        let limiter = RateLimiter::<IpAddr>::new(3, window);
+        for last_octet in 1..=50 {
+            assert!(limiter.check(ip(&format!("198.51.100.{last_octet}"))).await);
+        }
+        assert_eq!(limiter.tracked_keys().await, 50);
+
+        tokio::time::sleep(window * 2).await;
+        assert!(limiter.check(ip("203.0.113.1")).await);
+        assert_eq!(limiter.tracked_keys().await, 1);
+    }
+
+    #[tokio::test]
+    async fn eviction_keeps_keys_still_inside_their_window() {
+        let window = Duration::from_millis(200);
+        let limiter = RateLimiter::<IpAddr>::new(1, window);
+        let quiet = ip("198.51.100.1");
+        let busy = ip("198.51.100.2");
+        assert!(limiter.check(quiet).await);
+
+        tokio::time::sleep(window * 6 / 10).await;
+        assert!(limiter.check(busy).await);
+
+        tokio::time::sleep(window / 2).await;
+        assert!(limiter.check(ip("203.0.113.1")).await);
+        assert_eq!(limiter.tracked_keys().await, 2);
+        assert!(!limiter.check(busy).await, "budget survived the sweep");
     }
 }
