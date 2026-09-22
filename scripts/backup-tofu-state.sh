@@ -17,6 +17,9 @@ fi
 
 dir=$(cd "$(dirname "$STATE")" && pwd)
 base=$(basename "$STATE")
+# One prefix per config, or a second one overwrites the first: every state file
+# is named terraform.tfstate.
+config=$(basename "$dir")
 stamp=$(date -u '+%Y%m%dT%H%M%SZ')
 
 docker run --rm \
@@ -32,7 +35,7 @@ docker run --rm \
     export RCLONE_CONFIG_R2BACKUP_ENDPOINT="$R2_ENDPOINT"
     export RCLONE_CONFIG_R2BACKUP_ACL=private
     export RCLONE_CONFIG_R2BACKUP_NO_CHECK_BUCKET=true
-    dest="r2backup:$R2_BUCKET/voltius-prod/tofu"
+    dest="r2backup:$R2_BUCKET/voltius-prod/tofu/'"$config"'"
     rclone copyto "/state/'"$base"'" "$dest/terraform.tfstate"
     rclone copyto "/state/'"$base"'" "$dest/terraform.tfstate.'"$stamp"'"
     rclone lsl "$dest"

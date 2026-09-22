@@ -26,9 +26,16 @@ tars them, encrypts them to an age recipient, and uploads them to
 `s3://<bucket>/voltius-prod/secrets/`, keeping `secrets-latest.tar.age` as the pointer.
 
 ```sh
-cd /home/ubuntu/fourretout/voltius-db && set -a && . .env.db && set +a
-AGE_RECIPIENTS=age1... /path/to/scripts/secrets-bundle.sh pack
+cd /home/ubuntu/fourretout/voltius-db && set -a && . ./.env.db && set +a
+AGE_RECIPIENTS=age1... \
+  DOCKHAND_ENV_FILE=/var/lib/docker/volumes/dockhand_dockhand_data/_data/stacks/Docker/voltius/.env.dockhand \
+  /path/to/scripts/secrets-bundle.sh pack
 ```
+
+`DOCKHAND_ENV_FILE` is needed on **this** host and only for `.env.dockhand`: the live copy sits in
+the dockhand volume rather than under `$ROOT`, and is root-owned, so `pack` reads it through
+passwordless sudo. Without it the run still succeeds and uploads a bundle with every production
+secret missing. A rebuilt host keeps its env files under `$ROOT` and needs none of this.
 
 **Run it after every change to any of those files**, and keep the age private key off this
 machine — a key stored beside the bundle protects nothing. `verify` lists what the bucket holds.

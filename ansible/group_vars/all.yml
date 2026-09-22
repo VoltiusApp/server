@@ -5,7 +5,9 @@ voltius_ref: main
 # puts every client in one rate-limit bucket.
 voltius_cloudflare_subnet: 172.22.0.0/16
 voltius_db_volume: voltius-db_db-data
-voltius_tofu_state: "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
+voltius_tofu_states:
+  - "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
+  - "{{ voltius_root }}/voltius-tofu/infra/oci/terraform.tfstate"
 voltius_pg_walg_image: pg-walg:17-3.0.8
 # A restored copy plus its WAL and one base backup, with room to grow.
 voltius_min_free_bytes: 21474836480
