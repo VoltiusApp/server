@@ -42,6 +42,7 @@ jobs:
         run: |
           echo "IMAGE=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
           echo "PLATFORM_SLUG=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+          echo "GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
         env:
           PLATFORM: ${{ matrix.platform }}
 
@@ -70,6 +71,8 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: |
+            GIT_SHA=${{ env.GIT_SHA }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.PLATFORM_SLUG }}

@@ -177,10 +177,12 @@ services:
   # starts on its own, including after a reboot:
   #   docker compose -f compose.db.yml --env-file .env.db --profile studio up -d
   # Bound to loopback only — reach it by forwarding port 8000 over SSH.
+  # Names are prefixed voltius-db-: plain voltius-studio belongs to a separate,
+  # hand-run studio stack on this host and compose would refuse to start.
   studio-meta:
     profiles: [studio]
     image: supabase/postgres-meta:v0.96.6
-    container_name: voltius-studio-meta
+    container_name: voltius-db-studio-meta
     restart: "no"
     networks: [cloudflare]
     environment:
@@ -195,7 +197,7 @@ services:
   studio:
     profiles: [studio]
     image: supabase/studio:2026.07.07-sha-a6a04f2
-    container_name: voltius-studio
+    container_name: voltius-db-studio
     restart: "no"
     networks: [cloudflare]
     depends_on:
@@ -204,7 +206,7 @@ services:
       - "127.0.0.1:${STUDIO_PORT:-8000}:3000"
     environment:
       HOSTNAME: "0.0.0.0"
-      STUDIO_PG_META_URL: http://voltius-studio-meta:8080
+      STUDIO_PG_META_URL: http://studio-meta:8080
       POSTGRES_HOST: voltius-db
       POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB}
@@ -214,7 +216,7 @@ services:
       DEFAULT_ORGANIZATION_NAME: ${STUDIO_ORG_NAME:-Voltius}
       DEFAULT_PROJECT_NAME: ${STUDIO_PROJECT_NAME:-voltius-prod}
       ENABLED_FEATURES_LOGS_ALL: "false"
-      SUPABASE_URL: http://voltius-studio-meta:8080
+      SUPABASE_URL: http://studio-meta:8080
       SUPABASE_PUBLIC_URL: http://localhost:${STUDIO_PORT:-8000}
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
       SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
