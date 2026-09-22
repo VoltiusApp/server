@@ -23,8 +23,10 @@
     - name: voltius_age_key
       prompt: |
         Paste the age private key (AGE-SECRET-KEY-…), then Enter.
+        Leave empty if you passed voltius_age_key_file instead.
         It is written to RAM on the target, used once, and deleted
       private: true
+      unsafe: true
   vars:
     voltius_rehearsal_volume: voltius-rehearsal-data
     voltius_rehearsal_container: voltius-rehearsal
@@ -44,12 +46,30 @@
         that: voltius_rehearse_guard.stdout == ""
         fail_msg: "{{ inventory_hostname }} has a voltius-server container — rehearse on a throwaway host"
 
+    # A non-interactive run passes voltius_age_key_file, a path on the
+    # controller — ideally under /dev/shm, so the key never reaches a disk.
+    - name: Read the key from the controller
+      ansible.builtin.slurp:
+        src: "{{ voltius_age_key_file }}"
+      register: voltius_age_key_slurped
+      delegate_to: localhost
+      when: voltius_age_key_file | default("") != ""
+      no_log: true
+
     - name: Put the key in RAM only
       ansible.builtin.copy:
-        content: "{{ voltius_age_key }}\n"
+        content: >-
+          {{ (voltius_age_key_slurped.content | b64decode) if voltius_age_key_file | default("") != ""
+             else voltius_age_key ~ "\n" }}
         dest: /dev/shm/voltius-age.key
         mode: "0600"
       no_log: true
+
+    - name: The key must not be empty
+      ansible.builtin.stat:
+        path: /dev/shm/voltius-age.key
+      register: voltius_age_key_stat
+      failed_when: voltius_age_key_stat.stat.size < 60
 
     - name: Unpack the secrets bundle
       ansible.builtin.shell:

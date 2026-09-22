@@ -12,6 +12,9 @@ variable "hosts" {
     memory_in_gbs           = number
     boot_volume_size_in_gbs = optional(number, 200)
     availability_domain     = optional(string)
+    # There is no NAT gateway in this VCN, so a host without one has no route
+    # out and cannot reach GHCR, R2 or apt.
+    assign_public_ip = optional(bool, true)
   }))
   default     = {}
   description = "Additional hosts to create, keyed by the name used in the Ansible inventory."
@@ -59,7 +62,7 @@ resource "oci_core_instance" "host" {
 
   create_vnic_details {
     subnet_id        = oci_core_subnet.main.id
-    assign_public_ip = false
+    assign_public_ip = each.value.assign_public_ip
     display_name     = each.key
   }
 
