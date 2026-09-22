@@ -30,6 +30,11 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # Optional knobs — see .env.example
       RESEND_API_KEY: ${RESEND_API_KEY:-}
+      # The server treats an empty string as a value, so these carry its defaults.
+      RESEND_FROM: ${RESEND_FROM:-Voltius <noreply@voltius.app>}
+      RESEND_LOGO_URL: ${RESEND_LOGO_URL:-https://voltius.app/logo.png}
+      VOLTIUS_APP_URL: ${VOLTIUS_APP_URL:-https://app.voltius.app}
+      VOLTIUS_MARKETING_URL: ${VOLTIUS_MARKETING_URL:-https://voltius.app}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       TRUSTED_PROXY_IP: ${TRUSTED_PROXY_IP:-}
@@ -38,6 +43,10 @@ services:
       REGISTER_RATE_LIMIT: ${REGISTER_RATE_LIMIT:-}
       INVITE_RATE_LIMIT: ${INVITE_RATE_LIMIT:-}
       WAITLIST_RATE_LIMIT: ${WAITLIST_RATE_LIMIT:-}
+      USER_SEARCH_RATE_LIMIT: ${USER_SEARCH_RATE_LIMIT:-}
+      STRANGER_KNOCK_RATE_LIMIT: ${STRANGER_KNOCK_RATE_LIMIT:-}
+      SYNC_BLOB_RETENTION_DAYS: ${SYNC_BLOB_RETENTION_DAYS:-}
+      TEAM_OBJECTS_MIN_CLIENT_VERSION: ${TEAM_OBJECTS_MIN_CLIENT_VERSION:-}
       # Only needed if you also run the admin dashboard.
       ADMIN_SECRET: ${ADMIN_SECRET:-}
     healthcheck:
