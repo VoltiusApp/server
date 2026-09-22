@@ -53,8 +53,12 @@ OpenTofu *create* a rule over the platform default rather than adopt it. Backup 
 a lifecycle concern here: WAL-G prunes to the last 14 base backups and rclone mirrors the dump
 rotation, so a server-side expiry rule could delete a base backup out from under a WAL chain.
 
-**The tunnel.** `api.voltius.app` is a proxied CNAME to `<tunnel-id>.cfargotunnel.com` and that record
-*is* managed here, but the tunnel object and its ingress rules are not yet described.
+**The tunnel's ingress rules.** The `oracle` tunnel object is described, and `api.voltius.app`'s
+proxied CNAME to `<tunnel-id>.cfargotunnel.com` is a normal DNS record here, but the ingress list is
+left to the dashboard on purpose. `cloudflare_zero_trust_tunnel_cloudflared_config` replaces the
+whole rule list, and this tunnel also routes hostnames that have nothing to do with Voltius — adopting
+it would mean either carrying those rules in this public repository or deleting them on the next
+apply. Do not add that resource without every rule the tunnel serves.
 
 **Compute.** The Oracle instance stays clickops until there is a second machine; `tofu import` can
 adopt it later without a rebuild.
