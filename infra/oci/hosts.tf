@@ -28,11 +28,15 @@ variable "host_ssh_authorized_keys" {
   description = "Public keys for hosts in var.hosts. Empty falls back to ssh_authorized_key."
 }
 
+# Per shape: the image has to match the architecture, and an aarch64 image on
+# an x86 shape fails at boot with nothing useful to read.
 data "oci_core_images" "ubuntu_2404" {
+  for_each = toset([for h in values(var.hosts) : h.shape])
+
   compartment_id           = var.oci_tenancy_ocid
   operating_system         = "Canonical Ubuntu"
   operating_system_version = "24.04"
-  shape                    = "VM.Standard.A1.Flex"
+  shape                    = each.value
   sort_by                  = "TIMECREATED"
   sort_order               = "DESC"
 }
@@ -56,7 +60,7 @@ resource "oci_core_instance" "host" {
 
   source_details {
     source_type             = "image"
-    source_id               = data.oci_core_images.ubuntu_2404.images[0].id
+    source_id               = data.oci_core_images.ubuntu_2404[each.value.shape].images[0].id
     boot_volume_size_in_gbs = each.value.boot_volume_size_in_gbs
   }
 
