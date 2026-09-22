@@ -30,21 +30,21 @@ that production depends on.
 Read-only inventory first:
 
 ```sh
-docker run --rm --env-file /home/ubuntu/fourretout/voltius-db/.env pg-walg:17-3.0.8 bash -c '
+docker run --rm --env-file /home/ubuntu/fourretout/voltius-db/.env.db pg-walg:17-3.0.8 bash -c '
 export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
   AWS_ENDPOINT="$R2_ENDPOINT" AWS_S3_FORCE_PATH_STYLE=true AWS_REGION="${AWS_REGION:-auto}" \
   WALG_COMPRESSION_METHOD=lz4
 wal-g backup-list --detail'
 ```
 
-The newest base backup should be under 24 hours old. The stack's `.env` supplies the R2 credentials
+The newest base backup should be under 24 hours old. The stack's `.env.db` supplies the R2 credentials
 as `R2_*`; WAL-G reads `AWS_*`, which is why every command re-exports them.
 
 Fetch the latest base into a scratch volume:
 
 ```sh
 docker volume create waldrill-data
-docker run --rm --env-file /home/ubuntu/fourretout/voltius-db/.env -v waldrill-data:/pgdata pg-walg:17-3.0.8 bash -c '
+docker run --rm --env-file /home/ubuntu/fourretout/voltius-db/.env.db -v waldrill-data:/pgdata pg-walg:17-3.0.8 bash -c '
 export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
   AWS_ENDPOINT="$R2_ENDPOINT" AWS_S3_FORCE_PATH_STYLE=true AWS_REGION="${AWS_REGION:-auto}" \
   WALG_COMPRESSION_METHOD=lz4
@@ -66,7 +66,7 @@ Start it in recovery. The `restore_command` runs as a child of the postmaster, s
 must be in the container's environment, not only in the fetch step:
 
 ```sh
-docker run -d --name waldrill --env-file /home/ubuntu/fourretout/voltius-db/.env \
+docker run -d --name waldrill --env-file /home/ubuntu/fourretout/voltius-db/.env.db \
   -v waldrill-data:/var/lib/postgresql/data --entrypoint bash pg-walg:17-3.0.8 -c '
 export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
   AWS_ENDPOINT="$R2_ENDPOINT" AWS_S3_FORCE_PATH_STYLE=true AWS_REGION="${AWS_REGION:-auto}" \
@@ -102,18 +102,22 @@ Tear down, including the volume:
 docker rm -f waldrill && docker volume rm waldrill-data
 ```
 
-## Last drill: 2026-09-21
+## Last drill: 2026-09-22
 
-Passed, against `base_0000000100000035000000D2` (2026-09-20 21:48 UTC).
+Passed, against `base_00000001000000370000008E` (2026-09-21 21:48 UTC), using the `db` target built
+from this repo (PostgreSQL 17.11, glibc 2.41-12+deb13u4) on data written by the previous image
+(17.10, deb13u3), capped at `--cpus=1`.
 
 | Measure | Result |
 |---|---|
-| Base fetch | 6 s, 77 MB on disk |
-| WAL replay to end of archive | 68 s |
-| Total to accepting connections | ~95 s |
-| Recovery point reached | last transaction 15:37:38 UTC, ~5 s before the drill started |
+| Base fetch | 6 s, 78 MB on disk |
+| WAL replay to end of archive | 37 s |
+| Total to accepting connections | ~49 s |
+| Recovery point reached | newest `updated_at` equal to production's at the time of the drill |
 | Schema | 32 tables, migration 42, 0 failed |
-| Size | 54 MB, of which `sync_blobs` is 44 MB |
+| Size | 57 MB |
+| Collation | `datcollversion` 2.41 = actual on every database |
+| Index integrity | `bt_index_check(heapallindexed)` passed on all 141 btree indexes (24 on text) |
 | Cross-check | table set identical to the nightly `pg_dump` |
 
 Production was untouched: no port published, not on the `cloudflare` network, `archive_mode=off`,

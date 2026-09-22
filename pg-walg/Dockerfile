@@ -24,17 +24,26 @@ RUN set -eux; \
     tar -xzf "${name}.tar.gz"; \
     install -m 0755 "${name}" /wal-g
 
-FROM ${PG_BASE}
+FROM ${PG_BASE} AS db
 # wal-g publishes glibc binaries only; gcompat runs them on musl. ca-certificates is
-# required: without it wal-g and curl cannot verify TLS to R2 or the heartbeat URL.
+# required: without it wal-g cannot verify TLS to R2.
 RUN set -eux; \
     if [ -f /etc/alpine-release ]; then \
-      apk add --no-cache gcompat curl ca-certificates; \
+      apk add --no-cache gcompat ca-certificates; \
     else \
-      apt-get update && apt-get install -y --no-install-recommends curl ca-certificates python3 \
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY --from=walg /wal-g /usr/local/bin/wal-g
-COPY backup-watch.sh /usr/local/bin/backup-watch
-RUN chmod +x /usr/local/bin/backup-watch
 RUN wal-g --version
+
+# Own stage and tag: `build backup-watch` then leaves the image the database runs alone.
+FROM db AS watch
+RUN set -eux; \
+    if [ -f /etc/alpine-release ]; then \
+      apk add --no-cache curl; \
+    else \
+      apt-get update && apt-get install -y --no-install-recommends curl python3 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+COPY --chmod=0755 backup-watch.sh /usr/local/bin/backup-watch
