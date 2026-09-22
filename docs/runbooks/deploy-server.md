@@ -96,6 +96,8 @@ Confirm the image the container is actually running matches the manifest digest 
 docker inspect voltius-server --format '{{.Image}}'
 ```
 
+For reading `/metrics` and confirming `/health/deep` after the recreate, see `monitoring.md`.
+
 If a migration shipped, confirm it applied:
 
 ```sh

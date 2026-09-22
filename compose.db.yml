@@ -90,6 +90,30 @@ services:
           sleep "$${BASEBACKUP_INTERVAL}";
         done
 
+  backup-watch:
+    image: pg-walg:${PG_VERSION:-17}-${WALG_VERSION:-3.0.8}
+    container_name: voltius-backup-watch
+    restart: unless-stopped
+    networks: [cloudflare]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - db-data:/var/lib/postgresql/data:ro
+      - ./backups:/backups:ro
+    environment:
+      <<: *walg-env
+      PGHOST: voltius-db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      INSTATUS_HEARTBEAT_URL: ${INSTATUS_HEARTBEAT_URL:-}
+      BACKUP_WATCH_INTERVAL: ${BACKUP_WATCH_INTERVAL:-900}
+      ARCHIVE_MAX_AGE_SECONDS: ${ARCHIVE_MAX_AGE_SECONDS:-600}
+      BACKUP_MAX_AGE_SECONDS: ${BACKUP_MAX_AGE_SECONDS:-172800}
+      DISK_FREE_MIN_PERCENT: ${DISK_FREE_MIN_PERCENT:-15}
+    entrypoint: ["/usr/local/bin/backup-watch"]
+
   # Independent of WAL-G on purpose: a second path that shares no code with the first.
   dump:
     image: prodrigestivill/postgres-backup-local:${PG_VERSION:-17}-alpine

@@ -140,14 +140,9 @@ mod authz_tests {
     //! through a throwaway `Router` via `oneshot`. These are pure (no DB), so they
     //! run without `TEST_DATABASE_URL`.
     use super::*;
-    use crate::test_support::env_lock;
+    use crate::test_support::{env_lock, EnvLockGuard};
     use axum::{body::Body, http::Request, middleware::from_fn, routing::get, Extension, Router};
     use tower::ServiceExt;
-
-    /// Newtype wrapper so the env-lock guard survives the test's `.await` points
-    /// without tripping clippy's `await_holding_lock` (mirrors the teams.rs tests).
-    #[allow(dead_code)]
-    struct EnvLockGuard(std::sync::MutexGuard<'static, ()>);
 
     async fn ok_handler() -> StatusCode {
         StatusCode::OK

@@ -6,6 +6,7 @@ mod handles;
 mod last_seen;
 mod lemonsqueezy;
 mod models;
+mod observability;
 mod permissions;
 mod rate_limit;
 mod routes;
@@ -136,6 +137,9 @@ async fn main() {
             }
         }
     });
+
+    let metrics_handle = observability::init();
+    observability::spawn_storage_refresher(pool.clone());
 
     let notifier = SyncNotifier::new();
     let terminal_manager = TerminalManager::new();
@@ -631,6 +635,11 @@ async fn main() {
         .layer(Extension(presence_map.clone()))
         .layer(Extension(ls_cache.clone()));
 
+    let metrics_route = Router::new()
+        .route("/metrics", get(routes::metrics::get_metrics))
+        .layer(middleware::from_fn(auth::require_admin_key))
+        .layer(Extension(metrics_handle));
+
     // WebSocket terminal relay — auth via query param (not middleware)
     let ws_routes = Router::new()
         .route(
@@ -652,7 +661,9 @@ async fn main() {
         .merge(protected)
         .merge(admin_routes)
         .merge(ws_routes)
-        .route("/health", get(|| async { "ok" }))
+        .merge(metrics_route)
+        .route("/health", get(routes::health::health))
+        .route("/health/deep", get(routes::health::health_deep))
         .route("/v1/meta", get(routes::meta::get_meta))
         .layer({
             let allow_origin = match std::env::var("CORS_ORIGINS") {
@@ -678,6 +689,7 @@ async fn main() {
                 .on_response(DefaultOnResponse::new().level(Level::INFO))
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
+        .layer(middleware::from_fn(observability::track_requests))
         .with_state(pool);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());

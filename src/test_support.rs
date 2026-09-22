@@ -22,6 +22,11 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Newtype so the env-lock guard survives a test's `.await` points without
+/// tripping clippy's `await_holding_lock`, which only fires on the bare type.
+#[allow(dead_code)]
+pub struct EnvLockGuard(pub MutexGuard<'static, ()>);
+
 /// Serializes tests that read or write `users.last_seen_on`. Activity counts are
 /// whole-table aggregates, so a concurrent test stamping a user would shift the
 /// totals mid-assertion. Any test touching that column must hold this lock.
@@ -50,6 +55,16 @@ pub async fn test_pool() -> Option<PgPool> {
         .await
         .expect("run migrations on test database");
     Some(pool)
+}
+
+/// A pool that never connects: routed at an address nothing listens on, with a
+/// short `acquire_timeout` so a test that touches it fails fast instead of hanging.
+pub async fn dead_pool() -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(250))
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .expect("build lazy pool")
 }
 
 /// Skip the enclosing test (returning early) unless a test database is configured.
