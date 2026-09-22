@@ -15,9 +15,9 @@ The server image itself comes from GHCR, so nothing is compiled on the host.
 
 ## The secrets bundle
 
-`.env.dockhand`, `.env.db` and `cloudflared/.env` exist nowhere else. No database backup contains
+`.env.dockhand`, `.env.db`, `cloudflared/.env` and `voltius-tofu/.env.tofu` exist nowhere else. No database backup contains
 them, and losing `JWT_SECRET` alone signs every user out permanently. `scripts/secrets-bundle.sh`
-tars the three, encrypts them to an age recipient, and uploads them to
+tars them, encrypts them to an age recipient, and uploads them to
 `s3://<bucket>/voltius-prod/secrets/`, keeping `secrets-latest.tar.age` as the pointer.
 
 ```sh
@@ -68,9 +68,9 @@ tree and `.env.dockhand` live inside the dockhand Docker volume (`deploy-server.
 
 - **Provisioning the machine.** Creating the instance, its disk and its firewall rules is still
   manual, and stays that way until there is a second machine.
-- **Running OpenTofu.** The `voltius-tofu/` checkout and the state watch are laid down, but the
-  Cloudflare API token is not in the secrets bundle, so a rebuilt host cannot `apply` until you put it
-  back. The state itself is recoverable from `voltius-prod/tofu/` in the backup bucket, and is
+- **Nothing about OpenTofu, beyond laying it out.** The `voltius-tofu/` checkout, its `.env.tofu`
+  from the bundle and the state watch all come back, so a rebuilt host can `apply` — but it will not
+  do so on its own. The state is recoverable from `voltius-prod/tofu/` in the backup bucket, and is
   rebuildable from the import blocks even without that.
 - **The tunnel's ingress rules.** A rebuilt host reuses the existing tunnel token, so the hostname
   follows the tunnel; the routes live in Cloudflare and are deliberately not described in OpenTofu —

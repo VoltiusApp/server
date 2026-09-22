@@ -16,19 +16,20 @@ file elsewhere is a second source of truth that drifts silently.
 
 ## Running it
 
-The API token is never stored here. Supply it in the environment:
+Nothing needed to authenticate is stored here. It lives in `$ROOT/voltius-tofu/.env.tofu`, mode 600,
+which the secrets bundle carries — see `.env.tofu.example` for its shape:
 
 ```sh
-export CLOUDFLARE_API_TOKEN=...   # account-owned token, see Permissions below
-export TF_VAR_account_id=...      # Cloudflare account that owns the zone
-export TF_VAR_zone_id=...         # voltius.app
+cd $ROOT/voltius-tofu/infra/cloudflare
+set -a && . "$ROOT/voltius-tofu/.env.tofu" && set +a
 tofu init
 tofu plan
 ```
 
 The account and zone IDs are inputs with no defaults, and `*.tfvars` is gitignored. They are
 identifiers rather than credentials and grant nothing on their own, but this repository is public and
-there is no reason to publish which account to aim at.
+there is no reason to publish which account to aim at, so they travel with the token rather than in
+git.
 
 State is local and gitignored. That is deliberate: one operator, one machine. A remote backend costs
 an R2 bucket, a lock story and a bootstrap problem — the bucket would have to exist before the thing

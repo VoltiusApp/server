@@ -70,7 +70,7 @@ checkout() {
 lay_out() {
   checkout "$ROOT/voltius-db" /compose.db.yml /pg-walg/ /.env.db.example /.gitignore
   checkout "$ROOT/voltius-server" /compose.prod.yml /.env.example
-  checkout "$ROOT/voltius-tofu" /infra/cloudflare/ /scripts/backup-tofu-state.sh
+  checkout "$ROOT/voltius-tofu" /infra/cloudflare/ /scripts/backup-tofu-state.sh /.gitignore
   mkdir -p "$ROOT/cloudflared"
   cat > "$ROOT/cloudflared/compose.yml" <<'YAML'
 # Token lives in .env beside this file, never in the command line: anything that can
