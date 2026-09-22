@@ -25,12 +25,13 @@ RUN set -eux; \
     install -m 0755 "${name}" /wal-g
 
 FROM ${PG_BASE}
-# wal-g publishes glibc binaries only; gcompat runs them on musl.
+# wal-g publishes glibc binaries only; gcompat runs them on musl. ca-certificates is
+# required: without it wal-g and curl cannot verify TLS to R2 or the heartbeat URL.
 RUN set -eux; \
     if [ -f /etc/alpine-release ]; then \
-      apk add --no-cache gcompat curl; \
+      apk add --no-cache gcompat curl ca-certificates; \
     else \
-      apt-get update && apt-get install -y --no-install-recommends curl python3 \
+      apt-get update && apt-get install -y --no-install-recommends curl ca-certificates python3 \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY --from=walg /wal-g /usr/local/bin/wal-g
