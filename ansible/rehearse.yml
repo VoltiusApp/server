@@ -82,8 +82,15 @@
           ROOT='{{ voltius_root }}'
           {{ voltius_root }}/voltius-server/scripts/secrets-bundle.sh unpack
         chdir: "{{ voltius_root }}"
+      register: voltius_unpack
       changed_when: true
       no_log: true
+      failed_when: false
+
+    - name: Say why the unpack failed, without echoing the command
+      ansible.builtin.fail:
+        msg: "secrets-bundle.sh unpack failed: {{ voltius_unpack.stderr_lines | default([]) | join(' / ') }}"
+      when: voltius_unpack.rc | default(1) != 0
 
     - name: Delete the key
       ansible.builtin.file:
