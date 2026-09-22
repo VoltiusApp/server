@@ -171,38 +171,25 @@ If the underlying data is in doubt after resolving the alert, the restore drill 
 `restore-database.md` proves whether it is actually recoverable — a heartbeat resuming does not by
 itself prove that.
 
-## Deployment status
+## Rebuilding the database stack images
 
-`compose.db.yml` is in this repo but **is not adopted by the live stack**, which still runs its own
-copy of the database compose file. `backup-watch` therefore **does not run in production** until
-one of:
-
-- the live stack is switched to `compose.db.yml`, or
-- the `backup-watch` service is hand-added to the live copy.
-
-**Before doing either, rebuild the image:**
+`pg-walg/Dockerfile` has two targets with two tags: `db` (`pg-walg:<pg>-<walg>`, used by `db` and
+`base-backup`) and `watch` (`pg-walg-watch:<pg>-<walg>`, adds curl, python3 and
+`backup-watch.sh`). A change to the watchdog is therefore deployed without touching Postgres:
 
 ```sh
-docker compose -f compose.db.yml --env-file .env.db build db
+docker compose -f compose.db.yml --env-file .env.db build backup-watch
+docker compose -f compose.db.yml --env-file .env.db up -d backup-watch
 ```
 
-`compose.db.yml` pins all three of `db`, `base-backup` and `backup-watch` to the same
-`pg-walg:${PG_VERSION}-${WALG_VERSION}` tag, but only `db` carries a `build:` block. If that tag is
-already cached locally — it is, on a box that already runs the live `db` service — `docker compose
-up -d` reuses the cached image for all three services and never rebuilds, even though this branch
-changed what's inside the image (`backup-watch.sh`, `curl`, `python3`). The result is
-`voltius-backup-watch` crash-looping on `exec /usr/local/bin/backup-watch: no such file or
-directory`, with no heartbeat and no build failure to point at it. The explicit `build db` above is
-what puts the new script in the tag; `base-backup` and `backup-watch` then get it for free by
-reusing that same tag on their next `up -d`.
+**Never run a bare `build` or `up -d --build` on this stack outside a database maintenance
+window.** Every build of the `db` target yields a new image ID, even from an unchanged
+Dockerfile, and a new ID makes the next `up -d` recreate `voltius-db`.
 
-Both touch production and are the operator's call — nothing in this task set does either. Until
-one happens, there is no heartbeat, no missed-heartbeat alert, and the Instatus monitor described
-above has nothing pinging it even once it exists. Check what is actually running before trusting
-this document:
+Check what is actually running before trusting this document:
 
 ```sh
-docker ps --filter name=voltius-backup-watch
+docker ps --filter label=com.docker.compose.project=voltius-db --format '{{.Names}}\t{{.Image}}'
 ```
 
 See `restore-database.md` for the database stack's layout, the drill that proves a restore works,

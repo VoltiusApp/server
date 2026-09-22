@@ -7,11 +7,11 @@
 name: voltius-db
 
 x-walg-env: &walg-env
-  WALG_S3_PREFIX: ${WALG_S3_PREFIX}
+  WALG_S3_PREFIX: ${WALG_S3_PREFIX:?set WALG_S3_PREFIX in .env.db}
   WALG_COMPRESSION_METHOD: lz4
-  AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
-  AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
-  AWS_ENDPOINT: ${R2_ENDPOINT}
+  AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID in .env.db}
+  AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY in .env.db}
+  AWS_ENDPOINT: ${R2_ENDPOINT:?set R2_ENDPOINT in .env.db}
   AWS_REGION: ${AWS_REGION:-auto}
   AWS_S3_FORCE_PATH_STYLE: "true"
 
@@ -20,7 +20,8 @@ services:
     image: pg-walg:${PG_VERSION:-17}-${WALG_VERSION:-3.0.8}
     build:
       context: ./pg-walg
-      args:
+      target: db
+      args: &pg-walg-args
         PG_BASE: ${PG_BASE:-postgres:17-trixie}
         WALG_VERSION: v${WALG_VERSION:-3.0.8}
     container_name: voltius-db
@@ -91,7 +92,11 @@ services:
         done
 
   backup-watch:
-    image: pg-walg:${PG_VERSION:-17}-${WALG_VERSION:-3.0.8}
+    image: pg-walg-watch:${PG_VERSION:-17}-${WALG_VERSION:-3.0.8}
+    build:
+      context: ./pg-walg
+      target: watch
+      args: *pg-walg-args
     container_name: voltius-backup-watch
     restart: unless-stopped
     networks: [cloudflare]
