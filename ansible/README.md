@@ -52,6 +52,29 @@ Passed on a throwaway 1 OCPU / 6 GB A1 instance created by `var.hosts`, from bar
 the manual drill. Production was untouched: `archive_mode=off`, nothing that writes to R2 started,
 and the source host was never contacted. The instance was destroyed afterwards.
 
+## Drill the move itself
+
+`rehearse.yml` proves a host can be built and a backup restored. It does not prove
+`migrate.yml`, whose freeze, WAL handover and cutover only ever run during a real move.
+To run those without users noticing, migrate two throwaway hosts:
+
+```sh
+tofu apply   # var.hosts: drill-a and drill-b, plus -var drill_bucket=true in infra/cloudflare
+ansible-playbook site.yml -l 'drill-a,drill-b'
+ansible-playbook drill-seed.yml -e voltius_target=drill-a \
+  -e voltius_age_key_file=/dev/shm/age.key -e voltius_drill_bucket=voltius-drill
+ansible-playbook migrate.yml -e voltius_source=drill-a -e voltius_target=drill-b \
+  -e voltius_cutover=false
+```
+
+`drill-seed.yml` reads production's bucket exactly once, for the base backup that seeds
+drill-a, then repoints that host at the drill bucket and asserts nothing of production's
+is named any more. Archived WAL, base backups and mirrored dumps all land in the drill
+bucket; the watchdog heartbeat is cleared so a drill cannot report production healthy.
+
+`-e voltius_cutover=false` leaves `api.voltius.app` alone, which means phase 7 is the one
+step a drill cannot prove. Destroy both hosts and empty the drill bucket afterwards.
+
 ## Move production
 
 ```sh

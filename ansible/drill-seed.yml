@@ -1,0 +1,151 @@
+---
+# Builds a stand-in for production on a throwaway host, so migrate.yml can be
+# run for real without users noticing:
+#
+#   ansible-playbook drill-seed.yml -e voltius_target=drill-a \
+#     -e voltius_age_key_file=/dev/shm/age.key -e voltius_drill_bucket=voltius-drill
+#
+# Production's bucket is read exactly once, for the base backup that seeds this
+# host. Everything the host writes afterwards — archived WAL, base backups,
+# mirrored dumps — goes to the drill bucket, and the watchdog's heartbeat is
+# cleared so a drill cannot report production's backups healthy.
+
+- name: Read the production R2 credentials locally
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Read .env.db
+      ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+- name: Seed a stand-in production host
+  hosts: "{{ voltius_target }}"
+  gather_facts: true
+  vars:
+    voltius_prod_db_env: "{{ hostvars['localhost'].voltius_db_env }}"
+  tasks:
+    - name: Name the drill bucket
+      ansible.builtin.assert:
+        that:
+          - voltius_drill_bucket is defined
+          - voltius_drill_bucket != voltius_prod_db_env.R2_BUCKET
+        fail_msg: pass -e voltius_drill_bucket=<a bucket that is not production's>
+
+    - name: Refuse to seed a host that serves
+      ansible.builtin.shell:
+        cmd: docker ps -a --filter name=^voltius-server$ --format '{{ "{{" }}.Names{{ "}}" }}'
+      register: voltius_seed_guard
+      changed_when: false
+
+    - name: Stop if this is a production host
+      ansible.builtin.assert:
+        that: voltius_seed_guard.stdout == ""
+        fail_msg: "{{ inventory_hostname }} has a voltius-server container — seed a throwaway host"
+
+    - name: Put the key in RAM only
+      ansible.builtin.copy:
+        content: "{{ lookup('file', voltius_age_key_file) }}\n"
+        dest: /dev/shm/voltius-age.key
+        mode: "0600"
+      no_log: true
+
+    - name: Unpack the secrets bundle
+      ansible.builtin.shell:
+        cmd: >-
+          AGE_IDENTITY=/dev/shm/voltius-age.key
+          R2_BUCKET='{{ voltius_prod_db_env.R2_BUCKET }}'
+          R2_ENDPOINT='{{ voltius_prod_db_env.R2_ENDPOINT }}'
+          R2_ACCESS_KEY_ID='{{ voltius_prod_db_env.R2_ACCESS_KEY_ID }}'
+          R2_SECRET_ACCESS_KEY='{{ voltius_prod_db_env.R2_SECRET_ACCESS_KEY }}'
+          ROOT='{{ voltius_root }}'
+          {{ voltius_root }}/voltius-server/scripts/secrets-bundle.sh unpack
+        chdir: "{{ voltius_root }}"
+      changed_when: true
+      no_log: true
+
+    - name: Delete the key
+      ansible.builtin.file:
+        path: /dev/shm/voltius-age.key
+        state: absent
+
+    - name: Read the restored .env.db
+      ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+    - name: Restore production into this host, archiving disabled
+      ansible.builtin.include_tasks: tasks/restore-database.yml
+      vars:
+        voltius_restore_volume: "{{ voltius_db_volume }}"
+        voltius_restore_container: voltius-drill-restore
+        voltius_restore_target: LATEST
+        voltius_restore_archive_mode: "off"
+
+    # From here the host is on its own bucket. Everything above read production;
+    # nothing below can reach it.
+    - name: Point this host's stack at the drill bucket
+      ansible.builtin.replace:
+        path: "{{ voltius_root }}/voltius-db/.env.db"
+        regexp: "{{ item.find }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - find: '^R2_BUCKET=.*$'
+          replace: "R2_BUCKET={{ voltius_drill_bucket }}"
+        - find: '^WALG_S3_PREFIX=.*$'
+          replace: "WALG_S3_PREFIX=s3://{{ voltius_drill_bucket }}/voltius-prod/walg"
+        - find: '^INSTATUS_HEARTBEAT_URL=.*$'
+          replace: "INSTATUS_HEARTBEAT_URL="
+      no_log: true
+
+    - name: Re-read it
+      ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+    - name: Confirm nothing here points at production any more
+      ansible.builtin.assert:
+        that:
+          - voltius_db_env.R2_BUCKET == voltius_drill_bucket
+          - voltius_prod_db_env.R2_BUCKET not in voltius_db_env.WALG_S3_PREFIX
+          - voltius_db_env.INSTATUS_HEARTBEAT_URL | length == 0
+        fail_msg: the drill host still names production's bucket — stop
+
+    - name: Start the database stack
+      ansible.builtin.command:
+        cmd: docker compose -f compose.db.yml --env-file .env.db up -d
+        chdir: "{{ voltius_root }}/voltius-db"
+      changed_when: true
+
+    - name: Wait for it to be healthy
+      ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' voltius-db
+      register: voltius_seed_db_health
+      until: voltius_seed_db_health.stdout | trim == "healthy"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Wait for the first base backup to reach the drill bucket
+      ansible.builtin.shell:
+        cmd: docker logs voltius-base-backup 2>&1 | grep -c '\[base-backup\] ok'
+      register: voltius_seed_base
+      until: voltius_seed_base.stdout | int > 0
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Start the server
+      ansible.builtin.command:
+        cmd: docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml up -d server
+        chdir: "{{ voltius_root }}/voltius-server"
+      changed_when: true
+
+    - name: Wait for it
+      ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' voltius-server
+      register: voltius_seed_server_health
+      until: voltius_seed_server_health.stdout | trim == "healthy"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Ready
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} now stands in for production, archiving to
+          {{ voltius_drill_bucket }}. Migrate it with:
+          ansible-playbook migrate.yml -e voltius_source={{ inventory_hostname }}
+          -e voltius_target=<other host> -e voltius_cutover=false

@@ -1,0 +1,49 @@
+name: infra
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**", "ansible/**", ".github/workflows/infra.yml"]
+  pull_request:
+    paths: ["infra/**", "ansible/**", ".github/workflows/infra.yml"]
+  workflow_dispatch:
+
+jobs:
+  tofu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.12.6
+
+      # No credentials and no state: fmt and validate only, which is what
+      # catches a broken config before it reaches the host that holds the state.
+      - name: Check formatting
+        run: tofu fmt -check -recursive infra
+
+      - name: Validate each configuration
+        run: |
+          for dir in infra/*/; do
+            [ -f "$dir/versions.tf" ] || continue
+            echo "== $dir"
+            tofu -chdir="$dir" init -backend=false -input=false
+            tofu -chdir="$dir" validate
+          done
+
+  ansible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-lint
+        run: pipx install ansible-lint
+
+      - name: Lint the playbooks
+        working-directory: ansible
+        run: ansible-lint site.yml rehearse.yml migrate.yml
