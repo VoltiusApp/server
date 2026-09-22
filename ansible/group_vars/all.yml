@@ -8,6 +8,17 @@ voltius_db_volume: voltius-db_db-data
 voltius_tofu_states:
   - "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
   - "{{ voltius_root }}/voltius-tofu/infra/oci/terraform.tfstate"
-voltius_pg_walg_image: pg-walg:17-3.0.8
+voltius_pg_version: "17"
+voltius_walg_version: 3.0.8
+voltius_pg_base: postgres:17-trixie
+voltius_pg_walg_image: "pg-walg:{{ voltius_pg_version }}-{{ voltius_walg_version }}"
+voltius_pg_walg_watch_image: "pg-walg-watch:{{ voltius_pg_version }}-{{ voltius_walg_version }}"
 # A restored copy plus its WAL and one base backup, with room to grow.
 voltius_min_free_bytes: 21474836480
+voltius_db_env_required:
+  - POSTGRES_USER
+  - POSTGRES_DB
+  - R2_BUCKET
+  - R2_ENDPOINT
+  - R2_ACCESS_KEY_ID
+  - R2_SECRET_ACCESS_KEY

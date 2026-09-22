@@ -9,8 +9,9 @@
   ansible.builtin.apt:
     name: [age, curl, git, rclone, rsync, tar]
     state: present
+    # No cache_valid_time: a cloud image ships package lists whose timestamp is
+    # fresh and whose contents are not, so a skipped update means "no such package".
     update_cache: true
-    cache_valid_time: 3600
 
 - name: Check for docker
   ansible.builtin.command: docker compose version

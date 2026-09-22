@@ -8,7 +8,11 @@
 - name: Parse it
   ansible.builtin.set_fact:
     voltius_db_env: >-
-      {{ dict(voltius_db_env_raw.content | b64decode | split('\n')
-              | select('match', '^[A-Za-z_][A-Za-z0-9_]*=')
-              | map('split', '=', 1)) }}
+      {{ dict(voltius_db_env_raw.content | b64decode
+              | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')) }}
   no_log: true
+
+- name: Check the keys the playbooks rely on are there
+  ansible.builtin.assert:
+    that: voltius_db_env.keys() | list | intersect(voltius_db_env_required) | length == voltius_db_env_required | length
+    fail_msg: ".env.db is missing one of {{ voltius_db_env_required | join(', ') }}"

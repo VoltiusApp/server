@@ -38,12 +38,22 @@
     dest: "{{ voltius_root }}/cloudflared-api/compose.yml"
     mode: "0644"
 
+# Built with docker directly: compose would interpolate the whole file first and
+# the R2 variables only exist in the real .env.db, which is not here yet.
 - name: Build the pg-walg images
   ansible.builtin.command:
-    cmd: docker compose -f compose.db.yml --env-file .env.db.example build db backup-watch
-    chdir: "{{ voltius_root }}/voltius-db"
+    cmd: >-
+      docker build --target {{ item.target }} -t {{ item.tag }}
+      --build-arg PG_BASE={{ voltius_pg_base }}
+      --build-arg WALG_VERSION=v{{ voltius_walg_version }} .
+    chdir: "{{ voltius_root }}/voltius-db/pg-walg"
+  loop:
+    - target: db
+      tag: "{{ voltius_pg_walg_image }}"
+    - target: watch
+      tag: "{{ voltius_pg_walg_watch_image }}"
   register: voltius_host_build
-  changed_when: "'Building' in voltius_host_build.stderr or 'naming to' in voltius_host_build.stderr"
+  changed_when: "'naming to' in voltius_host_build.stderr or 'writing image' in voltius_host_build.stderr"
 
 - name: Install the OpenTofu state backup units
   become: true

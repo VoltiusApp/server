@@ -35,6 +35,8 @@ still missing.
 
 ```sh
 ansible-playbook rehearse.yml -e voltius_target=rehearsal
+# or, without a terminal to paste into:
+ansible-playbook rehearse.yml -e voltius_target=rehearsal -e voltius_age_key_file=/dev/shm/age.key
 ```
 
 Unpacks the secrets bundle, restores production into a throwaway volume, counts the
@@ -42,6 +44,13 @@ tables and migrations, then deletes the copy and the secrets. **`archive_mode=of
 throughout**, and no base-backup, backup-watch, dump, dump-mirror, server or tunnel: a
 rehearsal must not write to R2 or answer to the world. It refuses to run on a host that
 has a `voltius-server` container.
+
+### Last rehearsal: 2026-09-22
+
+Passed on a throwaway 1 OCPU / 6 GB A1 instance created by `var.hosts`, from bare Ubuntu 24.04:
+`site.yml`, then a restore of production out of R2 — 32 tables, migration 42, 0 failed, matching
+the manual drill. Production was untouched: `archive_mode=off`, nothing that writes to R2 started,
+and the source host was never contacted. The instance was destroyed afterwards.
 
 ## Move production
 
