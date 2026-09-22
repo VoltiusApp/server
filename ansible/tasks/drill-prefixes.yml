@@ -1,0 +1,33 @@
+---
+# A drill host must never write where production does. The bundle carries
+# production's .env.db, so every host in a drill is repointed right after it is
+# unpacked, and asserted before anything starts.
+- name: Point this host's stack at the drill prefixes
+  ansible.builtin.replace:
+    path: "{{ voltius_root }}/voltius-db/.env.db"
+    regexp: "{{ item.find }}"
+    replace: "{{ item.replace }}"
+  loop:
+    - find: '^WALG_S3_PREFIX=.*$'
+      replace: "WALG_S3_PREFIX=s3://{{ voltius_db_env.R2_BUCKET }}/{{ voltius_drill_prefix }}/walg"
+    - find: '^INSTATUS_HEARTBEAT_URL=.*$'
+      replace: "INSTATUS_HEARTBEAT_URL="
+  no_log: true
+
+- name: Send the mirrored dumps somewhere production is not
+  ansible.builtin.lineinfile:
+    path: "{{ voltius_root }}/voltius-db/.env.db"
+    regexp: '^DUMPS_PREFIX='
+    line: "DUMPS_PREFIX={{ voltius_drill_prefix }}/dumps"
+  no_log: true
+
+- name: Re-read it
+  ansible.builtin.include_tasks: read-db-env.yml
+
+- name: Confirm no prefix here is production's
+  ansible.builtin.assert:
+    that:
+      - voltius_drill_prefix in voltius_db_env.WALG_S3_PREFIX
+      - voltius_drill_prefix in voltius_db_env.DUMPS_PREFIX
+      - voltius_db_env.INSTATUS_HEARTBEAT_URL | length == 0
+    fail_msg: the drill host still writes where production does — stop

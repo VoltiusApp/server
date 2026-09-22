@@ -100,22 +100,48 @@
     - name: voltius_age_key
       prompt: |
         Paste the age private key (AGE-SECRET-KEY-…), then Enter.
+        Leave empty if you passed voltius_age_key_file instead.
         It is written to RAM on the target, used once, and deleted
       private: true
+      unsafe: true
   tasks:
     - name: Take the R2 credentials from the source
       ansible.builtin.set_fact:
         voltius_source_db_env: "{{ hostvars[voltius_source].voltius_db_env }}"
       no_log: true
 
+    # A run without a terminal passes voltius_age_key_file, a path on the
+    # controller — ideally under /dev/shm, so the key never reaches a disk.
     - name: Put the key in RAM only
       ansible.builtin.copy:
-        content: "{{ voltius_age_key }}\n"
+        content: "{{ lookup('file', voltius_age_key_file) if voltius_age_key_file | default('') != '' else voltius_age_key }}\n"
         dest: /dev/shm/voltius-age.key
         mode: "0600"
       no_log: true
 
+    - name: An empty key here fails later, inside a censored task
+      ansible.builtin.stat:
+        path: /dev/shm/voltius-age.key
+      register: voltius_key_stat
+      failed_when: voltius_key_stat.stat.size < 60
+
+    # A migration that failed after this point is retried by running the whole
+    # playbook again, so an already-restored file is expected, not an error.
+    - name: See whether the bundle was already unpacked here
+      ansible.builtin.stat:
+        path: "{{ voltius_root }}/{{ item }}"
+      register: voltius_secret_state
+      loop:
+        - voltius-server/.env.dockhand
+        - voltius-db/.env.db
+
+    - name: Note that the secrets are already in place
+      ansible.builtin.debug:
+        msg: "secrets already restored on {{ inventory_hostname }}, not unpacking again"
+      when: voltius_secret_state.results | map(attribute='stat.exists') | select | list | length == 2
+
     - name: Unpack the secrets bundle
+      when: voltius_secret_state.results | map(attribute='stat.exists') | select | list | length < 2
       ansible.builtin.shell:
         cmd: >-
           AGE_IDENTITY=/dev/shm/voltius-age.key
@@ -153,20 +179,55 @@
     - name: Read the target's copy of .env.db
       ansible.builtin.include_tasks: tasks/read-db-env.yml
 
+    # A drill migrates throwaway hosts: the bundle just restored production's
+    # .env.db here, so repoint it before anything starts writing.
+    - name: Repoint a drill target at the drill prefixes
+      ansible.builtin.include_tasks: tasks/drill-prefixes.yml
+      when: voltius_drill_prefix | default("") != ""
+
 - name: Phase 3 — carry the dumps over
   hosts: "{{ voltius_target }}"
   gather_facts: false
+  vars:
+    voltius_rsync_ssh: >-
+      ssh -o StrictHostKeyChecking=accept-new
+      {{ '-i ' ~ ansible_ssh_private_key_file if ansible_ssh_private_key_file is defined else '' }}
   tasks:
     # dump-mirror runs `rclone sync`: started against an empty backups/ it would
     # delete every mirrored dump in R2.
-    - name: Copy backups/ from the source
+    # Through the controller, not source-to-target: the source holds no key for
+    # the target, and rsync cannot copy between two remote hosts anyway.
+    - name: Make somewhere to stage them
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: voltius-backups
+      register: voltius_backup_stage
+      delegate_to: localhost
+
+    - name: Pull backups/ off the source
       ansible.builtin.command:
         cmd: >-
-          rsync -a --delete -e 'ssh -o StrictHostKeyChecking=accept-new'
-          {{ voltius_root }}/voltius-db/backups/
-          {{ ansible_user }}@{{ hostvars[voltius_target].ansible_host }}:{{ voltius_root }}/voltius-db/backups/
-      delegate_to: "{{ voltius_source }}"
+          rsync -a --delete -e {{ voltius_rsync_ssh | quote }}
+          {{ ('%s@%s:' % (ansible_user, hostvars[voltius_source].ansible_host))
+             if hostvars[voltius_source].ansible_connection | default('ssh') != 'local' else '' }}{{ voltius_root }}/voltius-db/backups/
+          {{ voltius_backup_stage.path }}/
+      delegate_to: localhost
       changed_when: true
+
+    - name: Push them to the target
+      ansible.builtin.command:
+        cmd: >-
+          rsync -a --delete -e {{ voltius_rsync_ssh | quote }} {{ voltius_backup_stage.path }}/
+          {{ ('%s@%s:' % (ansible_user, hostvars[voltius_target].ansible_host))
+             if hostvars[voltius_target].ansible_connection | default('ssh') != 'local' else '' }}{{ voltius_root }}/voltius-db/backups/
+      delegate_to: localhost
+      changed_when: true
+
+    - name: Drop the staging copy
+      ansible.builtin.file:
+        path: "{{ voltius_backup_stage.path }}"
+        state: absent
+      delegate_to: localhost
 
 - name: Phase 4 — freeze the source (downtime starts)
   hosts: "{{ voltius_source }}"
@@ -177,6 +238,7 @@
         prompt: |
           About to stop production on {{ voltius_source }}.
           Users are offline from here until phase 7. Enter to continue, Ctrl-C A to abort
+      when: voltius_confirm | default(true) | bool
 
     - name: Stop the server
       ansible.builtin.command: docker stop voltius-server
@@ -265,11 +327,61 @@
         url: http://127.0.0.1:14372/health
         status_code: 200
 
+    # The connector's token is minted by Cloudflare and exists nowhere until it
+    # is asked for. Fetched here rather than kept in OpenTofu state, which holds
+    # no secret. A drill skips it: without the DNS change it would serve nobody.
+    - name: Read the Cloudflare credentials from the controller
+      ansible.builtin.slurp:
+        src: "{{ voltius_root }}/voltius-tofu/.env.tofu"
+      register: voltius_tofu_env_raw
+      delegate_to: localhost
+      when: voltius_cutover | default(true) | bool
+      no_log: true
+
+    - name: Parse them
+      ansible.builtin.set_fact:
+        voltius_tofu_env: >-
+          {{ dict(voltius_tofu_env_raw.content | b64decode
+                  | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')) }}
+      when: voltius_cutover | default(true) | bool
+      no_log: true
+
+    - name: Find the voltius-api tunnel
+      ansible.builtin.uri:
+        url: >-
+          https://api.cloudflare.com/client/v4/accounts/{{ voltius_tofu_env.TF_VAR_account_id }}/cfd_tunnel?name=voltius-api&is_deleted=false
+        headers:
+          Authorization: "Bearer {{ voltius_tofu_env.CLOUDFLARE_API_TOKEN }}"
+      register: voltius_tunnel_lookup
+      delegate_to: localhost
+      when: voltius_cutover | default(true) | bool
+      no_log: true
+
+    - name: Fetch its connector token
+      ansible.builtin.uri:
+        url: >-
+          https://api.cloudflare.com/client/v4/accounts/{{ voltius_tofu_env.TF_VAR_account_id }}/cfd_tunnel/{{ voltius_tunnel_lookup.json.result[0].id }}/token
+        headers:
+          Authorization: "Bearer {{ voltius_tofu_env.CLOUDFLARE_API_TOKEN }}"
+      register: voltius_tunnel_token
+      delegate_to: localhost
+      when: voltius_cutover | default(true) | bool
+      no_log: true
+
+    - name: Write it beside the connector's compose file
+      ansible.builtin.copy:
+        content: "TUNNEL_TOKEN={{ voltius_tunnel_token.json.result }}\n"
+        dest: "{{ voltius_root }}/cloudflared-api/.env"
+        mode: "0600"
+      when: voltius_cutover | default(true) | bool
+      no_log: true
+
     - name: Start the tunnel connector
       ansible.builtin.command:
         cmd: docker compose up -d
         chdir: "{{ voltius_root }}/cloudflared-api"
       changed_when: true
+      when: voltius_cutover | default(true) | bool
 
 - name: Phase 7 — cut traffic over (downtime ends)
   hosts: "{{ voltius_source }}"
