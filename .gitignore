@@ -7,3 +7,4 @@ graphify-out/
 # bind mount for compose.db.yml
 /backups/
 .env.db
+.env.tofu

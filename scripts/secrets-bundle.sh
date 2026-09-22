@@ -11,6 +11,7 @@ FILES=(
   "voltius-server/.env.dockhand"
   "voltius-db/.env.db"
   "cloudflared/.env"
+  "voltius-tofu/.env.tofu"
 )
 
 WORK=""
