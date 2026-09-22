@@ -70,6 +70,7 @@ checkout() {
 lay_out() {
   checkout "$ROOT/voltius-db" /compose.db.yml /pg-walg/ /.env.db.example /.gitignore
   checkout "$ROOT/voltius-server" /compose.prod.yml /.env.example
+  checkout "$ROOT/voltius-tofu" /infra/cloudflare/ /scripts/backup-tofu-state.sh
   mkdir -p "$ROOT/cloudflared"
   cat > "$ROOT/cloudflared/compose.yml" <<'YAML'
 # Token lives in .env beside this file, never in the command line: anything that can
@@ -88,6 +89,37 @@ networks:
   cloudflare:
     external: true
 YAML
+}
+
+# A path unit, not a timer: the state only changes when someone runs `tofu apply`,
+# so polling would either lag or run all day for nothing.
+install_state_watch() {
+  local state="$ROOT/voltius-tofu/infra/cloudflare/terraform.tfstate"
+  log "installing the OpenTofu state watch"
+  cat > /etc/systemd/system/voltius-tofu-state-backup.service <<UNIT
+[Unit]
+Description=Copy the OpenTofu state to the R2 backup bucket
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=TOFU_STATE_ENV_FILE=$ROOT/voltius-db/.env.db
+ExecStart=$ROOT/voltius-tofu/scripts/backup-tofu-state.sh $state
+UNIT
+  cat > /etc/systemd/system/voltius-tofu-state-backup.path <<UNIT
+[Unit]
+Description=Watch the OpenTofu state for changes
+
+[Path]
+PathChanged=$state
+Unit=voltius-tofu-state-backup.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now voltius-tofu-state-backup.path
 }
 
 check_secrets() {
@@ -141,6 +173,7 @@ main() {
   fi
   install_age
   lay_out
+  install_state_watch
   check_secrets
   start_db
   start_server
@@ -150,6 +183,6 @@ main() {
 }
 
 # Sourced by the tests, which call the functions one at a time.
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
   main "$@"
 fi

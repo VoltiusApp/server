@@ -47,9 +47,10 @@ git clone --depth=1 https://github.com/VoltiusApp/server /tmp/voltius-server
 
 In order, it installs Docker and age, creates the `cloudflare` network **on the fixed subnet
 172.22.0.0/16** (`TRUSTED_PROXIES` in `.env.dockhand` names that subnet — a different one silently
-puts every client in one rate-limit bucket), lays out `voltius-db/`, `voltius-server/` and
-`cloudflared/` under `/home/ubuntu/fourretout`, checks the three env files are present, then starts
-the database stack, the server and the tunnel and waits for health.
+puts every client in one rate-limit bucket), lays out `voltius-db/`, `voltius-server/`,
+`voltius-tofu/` and `cloudflared/` under `/home/ubuntu/fourretout`, installs the systemd path unit
+that copies the OpenTofu state to R2 whenever it changes, checks the three env files are present, then
+starts the database stack, the server and the tunnel and waits for health.
 
 It stops rather than guess if the database volume `voltius-db_db-data` does not exist: restore it
 first with `restore-database.md`, then re-run.
@@ -66,9 +67,14 @@ tree and `.env.dockhand` live inside the dockhand Docker volume (`deploy-server.
 ## What this does not cover
 
 - **Provisioning the machine.** Creating the instance, its disk and its firewall rules is still
-  manual. Cloudflare DNS and the tunnel are next to be captured as Terraform.
-- **DNS.** A rebuilt host reuses the existing tunnel token, so the hostname follows the tunnel; the
-  route itself lives in Cloudflare, not here.
+  manual, and stays that way until there is a second machine.
+- **Running OpenTofu.** The `voltius-tofu/` checkout and the state watch are laid down, but the
+  Cloudflare API token is not in the secrets bundle, so a rebuilt host cannot `apply` until you put it
+  back. The state itself is recoverable from `voltius-prod/tofu/` in the backup bucket, and is
+  rebuildable from the import blocks even without that.
+- **The tunnel's ingress rules.** A rebuilt host reuses the existing tunnel token, so the hostname
+  follows the tunnel; the routes live in Cloudflare and are deliberately not described in OpenTofu —
+  that tunnel also serves hostnames unrelated to voltius.
 - **Anything that is not voltius** — vaultwarden, dockhand, the dev containers. The script starts
   what production needs and nothing else.
 
