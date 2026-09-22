@@ -186,6 +186,12 @@ docker compose -f compose.db.yml --env-file .env.db up -d backup-watch
 window.** Every build of the `db` target yields a new image ID, even from an unchanged
 Dockerfile, and a new ID makes the next `up -d` recreate `voltius-db`.
 
+Recreating `voltius-db` costs about a minute, not the few seconds a clean shutdown suggests: on
+2026-09-22 Postgres shut down at 09:59:37 and the new postmaster started at 10:00:38, the gap being
+the daemon materialising the 747 MB image. `voltius-server` answers 500 with `failed to lookup
+address information` while no container holds the name on the `cloudflare` network, and recovers by
+itself once Postgres is back.
+
 Check what is actually running before trusting this document:
 
 ```sh
