@@ -7,17 +7,35 @@ BACKUP_MAX_AGE="${BACKUP_MAX_AGE_SECONDS:-172800}"
 DISK_FREE_MIN="${DISK_FREE_MIN_PERCENT:-15}"
 DUMP_DIR="${DUMP_DIR:-/backups}"
 DATA_DIR="${DATA_DIR:-/var/lib/postgresql/data}"
+CONNECT_WAIT="${DB_CONNECT_WAIT_SECONDS:-120}"
 
 log() { echo "[backup-watch] $(date -u '+%F %T')Z $*"; }
 
+# Compose's depends_on cannot cover this: on a host reboot dockerd starts every
+# restart-policy container at once, so this one can outrun Postgres by seconds.
+psql_wait() {
+  local deadline out
+  deadline=$(( $(date -u +%s) + CONNECT_WAIT ))
+  while :; do
+    if out=$(PGCONNECT_TIMEOUT=10 PGOPTIONS='-c statement_timeout=10000' \
+             psql -qtAX -F'|' -c "$1" 2>/dev/null); then
+      printf '%s' "$out"
+      return 0
+    fi
+    [ "$(date -u +%s)" -ge "$deadline" ] && return 1
+    sleep 5
+  done
+}
+
 check_archiver() {
   local row archived_age failed_newer
-  row=$(PGCONNECT_TIMEOUT=10 PGOPTIONS='-c statement_timeout=10000' psql -qtAX -F'|' -c "SELECT
+  row=$(psql_wait "SELECT
       COALESCE(EXTRACT(EPOCH FROM (now() - last_archived_time))::bigint, -1),
       CASE WHEN last_failed_time IS NOT NULL
             AND (last_archived_time IS NULL OR last_failed_time > last_archived_time)
            THEN 1 ELSE 0 END
-    FROM pg_stat_archiver;") || { log "FAIL archiver: psql query failed or timed out"; return 1; }
+    FROM pg_stat_archiver;") \
+    || { log "FAIL archiver: no answer from Postgres within ${CONNECT_WAIT}s"; return 1; }
 
   archived_age="${row%%|*}"
   failed_newer="${row##*|}"
