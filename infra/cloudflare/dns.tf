@@ -20,7 +20,7 @@ resource "cloudflare_dns_record" "cname_api" {
   zone_id = var.zone_id
   name    = "api.voltius.app"
   type    = "CNAME"
-  content = "c500bb72-ffa3-4c2f-a68b-83e67009b0bf.cfargotunnel.com"
+  content = "${local.api_tunnel_id}.cfargotunnel.com"
   ttl     = 1
   proxied = true
 }

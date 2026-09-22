@@ -1,0 +1,308 @@
+---
+# Move production from one host to another. See
+# specs-archive/2026-09-22-scale-up-automation-design.md.
+#
+#   ansible-playbook migrate.yml -e voltius_source=oracle -e voltius_target=newhost
+#
+# Downtime starts at phase 4 and ends at phase 7.
+
+- name: Phase 1 — preflight
+  hosts: "{{ voltius_source }}:{{ voltius_target }}"
+  gather_facts: true
+  tasks:
+    - name: Name both ends
+      ansible.builtin.assert:
+        that:
+          - voltius_source is defined
+          - voltius_target is defined
+          - voltius_source != voltius_target
+        fail_msg: pass -e voltius_source=<host> -e voltius_target=<host>
+
+    - name: Check the source is serving
+      when: inventory_hostname == voltius_source
+      block:
+        - name: Read the source container health
+          ansible.builtin.command: >-
+            docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' voltius-server voltius-db
+          register: voltius_src_health
+          changed_when: false
+
+        - name: Both must be healthy
+          ansible.builtin.assert:
+            that: voltius_src_health.stdout_lines | unique == ["healthy"]
+            fail_msg: "source is not healthy: {{ voltius_src_health.stdout_lines }}"
+
+        - name: Check the newest base backup
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              docker run --rm --env-file {{ voltius_root }}/voltius-db/.env.db {{ voltius_pg_walg_image }} bash -c '
+                export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+                  AWS_ENDPOINT="$R2_ENDPOINT" AWS_S3_FORCE_PATH_STYLE=true AWS_REGION="${AWS_REGION:-auto}" \
+                  WALG_COMPRESSION_METHOD=lz4
+                wal-g backup-list' | tail -2
+          register: voltius_backup_list
+          changed_when: false
+
+        - name: Show it
+          ansible.builtin.debug:
+            var: voltius_backup_list.stdout_lines
+
+        - name: Read the source's .env.db
+          ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+    - name: Check the target is prepared and idle
+      when: inventory_hostname == voltius_target
+      block:
+        - name: The database volume must not exist yet
+          ansible.builtin.command: docker volume inspect {{ voltius_db_volume }}
+          register: voltius_tgt_volume
+          changed_when: false
+          failed_when: false
+
+        - name: Stop if it does
+          ansible.builtin.assert:
+            that: voltius_tgt_volume.rc != 0
+            fail_msg: "{{ voltius_db_volume }} already exists on the target"
+
+        - name: Nothing of ours may be running there
+          ansible.builtin.shell:
+            cmd: docker ps --filter name=voltius --filter status=running --format '{{ "{{" }}.Names{{ "}}" }}'
+          register: voltius_tgt_running
+          changed_when: false
+
+        - name: Stop if something is
+          ansible.builtin.assert:
+            that: voltius_tgt_running.stdout == ""
+            fail_msg: "target already runs: {{ voltius_tgt_running.stdout_lines }}"
+
+        - name: site.yml must have run
+          ansible.builtin.stat:
+            path: "{{ voltius_root }}/voltius-db/compose.db.yml"
+          register: voltius_tgt_layout
+
+        - name: Stop if it has not
+          ansible.builtin.assert:
+            that: voltius_tgt_layout.stat.exists
+            fail_msg: run site.yml against the target first
+
+        - name: Check free disk
+          ansible.builtin.assert:
+            that: >-
+              ansible_facts.mounts | selectattr('mount', 'eq', '/') | map(attribute='size_available')
+              | first > voltius_min_free_bytes
+            fail_msg: "less than {{ (voltius_min_free_bytes / 1024 / 1024 / 1024) | round(1) }} GB free on /"
+
+- name: Phase 2 — secrets
+  hosts: "{{ voltius_target }}"
+  gather_facts: false
+  vars_prompt:
+    - name: voltius_age_key
+      prompt: |
+        Paste the age private key (AGE-SECRET-KEY-…), then Enter.
+        It is written to RAM on the target, used once, and deleted
+      private: true
+  tasks:
+    - name: Take the R2 credentials from the source
+      ansible.builtin.set_fact:
+        voltius_source_db_env: "{{ hostvars[voltius_source].voltius_db_env }}"
+      no_log: true
+
+    - name: Put the key in RAM only
+      ansible.builtin.copy:
+        content: "{{ voltius_age_key }}\n"
+        dest: /dev/shm/voltius-age.key
+        mode: "0600"
+      no_log: true
+
+    - name: Unpack the secrets bundle
+      ansible.builtin.shell:
+        cmd: >-
+          AGE_IDENTITY=/dev/shm/voltius-age.key
+          R2_BUCKET='{{ voltius_source_db_env.R2_BUCKET }}'
+          R2_ENDPOINT='{{ voltius_source_db_env.R2_ENDPOINT }}'
+          R2_ACCESS_KEY_ID='{{ voltius_source_db_env.R2_ACCESS_KEY_ID }}'
+          R2_SECRET_ACCESS_KEY='{{ voltius_source_db_env.R2_SECRET_ACCESS_KEY }}'
+          ROOT='{{ voltius_root }}'
+          {{ voltius_root }}/voltius-server/scripts/secrets-bundle.sh unpack
+        chdir: "{{ voltius_root }}"
+      register: voltius_unpack
+      changed_when: true
+      no_log: true
+
+    - name: Delete the key
+      ansible.builtin.file:
+        path: /dev/shm/voltius-age.key
+        state: absent
+
+    - name: The files the target needs must now exist
+      ansible.builtin.stat:
+        path: "{{ voltius_root }}/{{ item }}"
+      register: voltius_restored
+      loop:
+        - voltius-server/.env.dockhand
+        - voltius-db/.env.db
+      failed_when: not voltius_restored.stat.exists
+
+    - name: Read the target's copy of .env.db
+      ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+- name: Phase 3 — carry the dumps over
+  hosts: "{{ voltius_target }}"
+  gather_facts: false
+  tasks:
+    # dump-mirror runs `rclone sync`: started against an empty backups/ it would
+    # delete every mirrored dump in R2.
+    - name: Copy backups/ from the source
+      ansible.builtin.command:
+        cmd: >-
+          rsync -a --delete -e 'ssh -o StrictHostKeyChecking=accept-new'
+          {{ voltius_root }}/voltius-db/backups/
+          {{ ansible_user }}@{{ hostvars[voltius_target].ansible_host }}:{{ voltius_root }}/voltius-db/backups/
+      delegate_to: "{{ voltius_source }}"
+      changed_when: true
+
+- name: Phase 4 — freeze the source (downtime starts)
+  hosts: "{{ voltius_source }}"
+  gather_facts: false
+  tasks:
+    - name: Confirm
+      ansible.builtin.pause:
+        prompt: |
+          About to stop production on {{ voltius_source }}.
+          Users are offline from here until phase 7. Enter to continue, Ctrl-C A to abort
+
+    - name: Stop the server
+      ansible.builtin.command: docker stop voltius-server
+      changed_when: true
+
+    - name: Close the current WAL segment
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec voltius-db psql -U "{{ voltius_db_env.POSTGRES_USER }}"
+          -d "{{ voltius_db_env.POSTGRES_DB }}" -tAc 'select pg_switch_wal()'
+      register: voltius_switch
+      changed_when: true
+
+    - name: Wait until it is archived
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec voltius-db psql -U "{{ voltius_db_env.POSTGRES_USER }}"
+          -d "{{ voltius_db_env.POSTGRES_DB }}" -tAc
+          "select last_archived_wal >= pg_walfile_name('{{ voltius_switch.stdout | trim }}') and failed_count = 0 from pg_stat_archiver"
+      register: voltius_archived
+      until: voltius_archived.stdout | trim == "t"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    # The target promotes onto timeline 2 and archives into the same prefix. Two
+    # writers to one archive is unrecoverable, so this stack does not come back.
+    - name: Stop the database stack for good
+      ansible.builtin.command:
+        cmd: docker compose -f compose.db.yml --env-file .env.db stop
+        chdir: "{{ voltius_root }}/voltius-db"
+      changed_when: true
+
+- name: Phase 5 — restore onto the target
+  hosts: "{{ voltius_target }}"
+  gather_facts: false
+  tasks:
+    - name: Restore to the end of the archive
+      ansible.builtin.include_tasks: tasks/restore-database.yml
+      vars:
+        voltius_restore_volume: "{{ voltius_db_volume }}"
+        voltius_restore_container: voltius-restore
+        voltius_restore_target: LATEST
+        voltius_restore_archive_mode: "on"
+
+    - name: Start the database stack
+      ansible.builtin.command:
+        cmd: docker compose -f compose.db.yml --env-file .env.db up -d
+        chdir: "{{ voltius_root }}/voltius-db"
+      changed_when: true
+
+    - name: Wait for it to be healthy
+      ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' voltius-db
+      register: voltius_db_health
+      until: voltius_db_health.stdout | trim == "healthy"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+- name: Phase 6 — start the server on the target
+  hosts: "{{ voltius_target }}"
+  gather_facts: false
+  tasks:
+    - name: Pull the pinned image
+      ansible.builtin.command:
+        cmd: docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml pull -q server
+        chdir: "{{ voltius_root }}/voltius-server"
+      changed_when: true
+
+    - name: Start it
+      ansible.builtin.command:
+        cmd: docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml up -d server
+        chdir: "{{ voltius_root }}/voltius-server"
+      changed_when: true
+
+    - name: Wait for health
+      ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' voltius-server
+      register: voltius_server_health
+      until: voltius_server_health.stdout | trim == "healthy"
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Answer locally before any traffic is sent here
+      ansible.builtin.uri:
+        url: http://127.0.0.1:14372/health
+        status_code: 200
+
+    - name: Start the tunnel connector
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ voltius_root }}/cloudflared-api"
+      changed_when: true
+
+- name: Phase 7 — cut traffic over (downtime ends)
+  hosts: "{{ voltius_source }}"
+  gather_facts: false
+  tasks:
+    - name: Point api.voltius.app at the new tunnel
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          set -a; . {{ voltius_root }}/voltius-tofu/.env.tofu; set +a
+          tofu apply -auto-approve -var api_tunnel=voltius-api
+        chdir: "{{ voltius_root }}/voltius-tofu/infra/cloudflare"
+      changed_when: true
+
+    - name: Check through the tunnel
+      ansible.builtin.uri:
+        url: https://api.voltius.app/health/deep
+        status_code: 200
+      retries: 20
+      delay: 5
+      register: voltius_public_health
+      until: voltius_public_health.status == 200
+      delegate_to: localhost
+
+- name: Phase 8 — verify
+  hosts: "{{ voltius_target }}"
+  gather_facts: false
+  tasks:
+    - name: Wait for the backup watchdog to pass a full round
+      ansible.builtin.shell:
+        cmd: docker logs --tail 20 voltius-backup-watch 2>&1 | grep -c 'heartbeat sent'
+      register: voltius_watch
+      until: voltius_watch.stdout | int > 0
+      retries: 60
+      delay: 30
+      changed_when: false
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          {{ voltius_target }} is serving. The old stack is stopped and must stay
+          stopped: it would archive a second timeline into the same prefix.

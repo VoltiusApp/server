@@ -1,0 +1,139 @@
+---
+# Prove a fresh host can be rebuilt, without touching production.
+#
+#   ansible-playbook rehearse.yml -e voltius_target=rehearsal
+#
+# It restores a full copy of production into a throwaway volume, checks it, and
+# deletes it. It never starts base-backup, backup-watch, dump, dump-mirror, the
+# server or a tunnel: those write to R2 or answer to the world.
+
+# The bundle and the archive live in R2; the credentials come from the
+# controller's own .env.db, never from the throwaway host.
+- name: Read the R2 credentials locally
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Read .env.db
+      ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+- name: Rehearse a rebuild
+  hosts: "{{ voltius_target }}"
+  gather_facts: true
+  vars_prompt:
+    - name: voltius_age_key
+      prompt: |
+        Paste the age private key (AGE-SECRET-KEY-…), then Enter.
+        It is written to RAM on the target, used once, and deleted
+      private: true
+  vars:
+    voltius_rehearsal_volume: voltius-rehearsal-data
+    voltius_rehearsal_container: voltius-rehearsal
+    voltius_r2_bucket: "{{ hostvars['localhost'].voltius_db_env.R2_BUCKET }}"
+    voltius_r2_endpoint: "{{ hostvars['localhost'].voltius_db_env.R2_ENDPOINT }}"
+    voltius_r2_access_key_id: "{{ hostvars['localhost'].voltius_db_env.R2_ACCESS_KEY_ID }}"
+    voltius_r2_secret_access_key: "{{ hostvars['localhost'].voltius_db_env.R2_SECRET_ACCESS_KEY }}"
+  tasks:
+    - name: Refuse to rehearse on a host that serves
+      ansible.builtin.shell:
+        cmd: docker ps -a --filter name=^voltius-server$ --format '{{ "{{" }}.Names{{ "}}" }}'
+      register: voltius_rehearse_guard
+      changed_when: false
+
+    - name: Stop if this is a production host
+      ansible.builtin.assert:
+        that: voltius_rehearse_guard.stdout == ""
+        fail_msg: "{{ inventory_hostname }} has a voltius-server container — rehearse on a throwaway host"
+
+    - name: Put the key in RAM only
+      ansible.builtin.copy:
+        content: "{{ voltius_age_key }}\n"
+        dest: /dev/shm/voltius-age.key
+        mode: "0600"
+      no_log: true
+
+    - name: Unpack the secrets bundle
+      ansible.builtin.shell:
+        cmd: >-
+          AGE_IDENTITY=/dev/shm/voltius-age.key
+          R2_BUCKET='{{ voltius_r2_bucket }}'
+          R2_ENDPOINT='{{ voltius_r2_endpoint }}'
+          R2_ACCESS_KEY_ID='{{ voltius_r2_access_key_id }}'
+          R2_SECRET_ACCESS_KEY='{{ voltius_r2_secret_access_key }}'
+          ROOT='{{ voltius_root }}'
+          {{ voltius_root }}/voltius-server/scripts/secrets-bundle.sh unpack
+        chdir: "{{ voltius_root }}"
+      changed_when: true
+      no_log: true
+
+    - name: Delete the key
+      ansible.builtin.file:
+        path: /dev/shm/voltius-age.key
+        state: absent
+
+    - name: Read the restored .env.db
+      ansible.builtin.include_tasks: tasks/read-db-env.yml
+
+    - name: Restore a copy, archiving disabled
+      ansible.builtin.include_tasks: tasks/restore-database.yml
+      vars:
+        voltius_restore_volume: "{{ voltius_rehearsal_volume }}"
+        voltius_restore_container: "{{ voltius_rehearsal_container }}"
+        voltius_restore_target: LATEST
+        voltius_restore_archive_mode: "off"
+
+    - name: Start the copy again to inspect it
+      ansible.builtin.shell:
+        cmd: >-
+          docker run -d --name {{ voltius_rehearsal_container }}-check
+          --env-file {{ voltius_root }}/voltius-db/.env.db
+          -v {{ voltius_rehearsal_volume }}:/var/lib/postgresql/data
+          {{ voltius_pg_walg_image }}
+          postgres -c archive_mode=off -c listen_addresses=localhost
+      changed_when: true
+
+    - name: Wait for it
+      ansible.builtin.command: >-
+        docker exec {{ voltius_rehearsal_container }}-check
+        pg_isready -U {{ voltius_db_env.POSTGRES_USER }} -d {{ voltius_db_env.POSTGRES_DB }} -h localhost
+      register: voltius_rehearsal_ready
+      until: voltius_rehearsal_ready.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Count what came back
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec {{ voltius_rehearsal_container }}-check
+          psql -U {{ voltius_db_env.POSTGRES_USER }} -d {{ voltius_db_env.POSTGRES_DB }} -tAc
+          "select (select count(*) from pg_tables where schemaname='public') || ' tables, migration '
+           || (select max(version) from _sqlx_migrations) || ', '
+           || (select count(*) from _sqlx_migrations where not success) || ' failed'"
+      register: voltius_rehearsal_counts
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "restored: {{ voltius_rehearsal_counts.stdout | trim }}"
+
+    - name: A restore with no tables is a failed rehearsal
+      ansible.builtin.assert:
+        that: voltius_rehearsal_counts.stdout is search('^[1-9][0-9]* tables')
+        fail_msg: "restore produced {{ voltius_rehearsal_counts.stdout | trim }}"
+
+    - name: Tear the copy down
+      ansible.builtin.shell:
+        cmd: |
+          docker rm -f {{ voltius_rehearsal_container }}-check
+          docker volume rm {{ voltius_rehearsal_volume }}
+      changed_when: true
+
+    - name: Remove the restored secrets from the throwaway host
+      ansible.builtin.file:
+        path: "{{ voltius_root }}/{{ item }}"
+        state: absent
+      loop:
+        - voltius-server/.env.dockhand
+        - voltius-db/.env.db
+        - cloudflared/.env
+        - voltius-tofu/.env.tofu

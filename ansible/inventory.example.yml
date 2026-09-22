@@ -1,0 +1,13 @@
+# Copy to inventory.yml (gitignored). Addresses are the VCN's private IPs: the
+# controller and the targets share the subnet, so nothing is reached over the
+# internet and no host needs a public SSH port.
+all:
+  vars:
+    ansible_user: ubuntu
+  children:
+    voltius_hosts:
+      hosts:
+        oracle:
+          ansible_connection: local
+        newhost:
+          ansible_host: 10.0.0.42

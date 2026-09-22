@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the OpenTofu state for changes
+
+[Path]
+PathChanged={{ voltius_tofu_state }}
+Unit=voltius-tofu-state-backup.service
+
+[Install]
+WantedBy=multi-user.target

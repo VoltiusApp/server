@@ -1,0 +1,16 @@
+# Connector for the voltius-api tunnel, which carries api.voltius.app and nothing
+# else. The token lives in .env beside this file, never on the command line:
+# anything that can run `docker inspect` can read a command line.
+services:
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-voltius-api
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in cloudflared-api/.env}
+    networks: [cloudflare]
+
+networks:
+  cloudflare:
+    external: true

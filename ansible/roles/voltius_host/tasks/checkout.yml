@@ -1,0 +1,22 @@
+---
+- name: Initialise {{ checkout.dir }}
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      git init -q -b main
+      git remote add origin {{ voltius_repo }}
+      git sparse-checkout set --no-cone {{ checkout.paths }}
+    chdir: "{{ voltius_root }}/{{ checkout.dir }}"
+    creates: "{{ voltius_root }}/{{ checkout.dir }}/.git"
+
+- name: Fetch the pinned ref into {{ checkout.dir }}
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      git fetch -q --depth=1 origin {{ voltius_ref }}
+      test "$(git rev-parse HEAD 2>/dev/null || true)" = "$(git rev-parse FETCH_HEAD)" && exit 90
+      git reset -q --hard FETCH_HEAD
+    chdir: "{{ voltius_root }}/{{ checkout.dir }}"
+  register: voltius_host_fetch
+  changed_when: voltius_host_fetch.rc == 0
+  failed_when: voltius_host_fetch.rc not in [0, 90]

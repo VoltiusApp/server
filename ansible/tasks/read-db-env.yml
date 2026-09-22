@@ -1,0 +1,14 @@
+---
+- name: Read .env.db
+  ansible.builtin.slurp:
+    src: "{{ voltius_root }}/voltius-db/.env.db"
+  register: voltius_db_env_raw
+  no_log: true
+
+- name: Parse it
+  ansible.builtin.set_fact:
+    voltius_db_env: >-
+      {{ dict(voltius_db_env_raw.content | b64decode | split('\n')
+              | select('match', '^[A-Za-z_][A-Za-z0-9_]*=')
+              | map('split', '=', 1)) }}
+  no_log: true

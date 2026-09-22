@@ -1,0 +1,90 @@
+---
+# Fetches the newest WAL-G base into a volume and replays to the end of the
+# archive. voltius_restore_archive_mode decides whether the promoted copy may
+# write to the archive: a rehearsal must be "off", or it pushes its own timeline
+# into production's prefix.
+- name: Require an explicit archive mode
+  ansible.builtin.assert:
+    that: voltius_restore_archive_mode in ["on", "off"]
+    fail_msg: set voltius_restore_archive_mode to "on" (real move) or "off" (rehearsal)
+
+- name: Refuse to restore over an existing volume
+  ansible.builtin.command: docker volume inspect {{ voltius_restore_volume }}
+  register: voltius_volume_check
+  changed_when: false
+  failed_when: false
+
+- name: Stop if the volume is already there
+  ansible.builtin.assert:
+    that: voltius_volume_check.rc != 0
+    fail_msg: "{{ voltius_restore_volume }} exists — remove it first, or restore somewhere else"
+
+- name: Create the data volume
+  ansible.builtin.command: docker volume create {{ voltius_restore_volume }}
+  changed_when: true
+
+- name: Fetch the base backup and write the recovery settings
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      docker run --rm --env-file {{ voltius_root }}/voltius-db/.env.db \
+        -v {{ voltius_restore_volume }}:/pgdata {{ voltius_pg_walg_image }} bash -c '
+        set -eu
+        export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+          AWS_ENDPOINT="$R2_ENDPOINT" AWS_S3_FORCE_PATH_STYLE=true AWS_REGION="${AWS_REGION:-auto}" \
+          WALG_COMPRESSION_METHOD=lz4
+        wal-g backup-fetch /pgdata {{ voltius_restore_target }}
+        touch /pgdata/recovery.signal
+        cat >> /pgdata/postgresql.auto.conf <<CONF
+      restore_command = '"'"'wal-g wal-fetch "%f" "%p"'"'"'
+      recovery_target_timeline = '"'"'latest'"'"'
+      recovery_target_action = '"'"'promote'"'"'
+      archive_mode = '"'"'{{ voltius_restore_archive_mode }}'"'"'
+      CONF
+        chown -R postgres:postgres /pgdata && chmod 700 /pgdata'
+  register: voltius_fetch_base
+  changed_when: true
+
+- name: Start Postgres in recovery
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      docker run -d --name {{ voltius_restore_container }} \
+        --env-file {{ voltius_root }}/voltius-db/.env.db \
+        -v {{ voltius_restore_volume }}:/var/lib/postgresql/data \
+        --entrypoint bash {{ voltius_pg_walg_image }} -c '
+        export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+          AWS_ENDPOINT="$R2_ENDPOINT" AWS_S3_FORCE_PATH_STYLE=true AWS_REGION="${AWS_REGION:-auto}" \
+          WALG_COMPRESSION_METHOD=lz4
+        exec docker-entrypoint.sh postgres -c archive_mode={{ voltius_restore_archive_mode }} -c listen_addresses=localhost'
+  changed_when: true
+
+- name: Wait for recovery to finish and the copy to be promoted
+  ansible.builtin.shell:
+    cmd: >-
+      docker exec {{ voltius_restore_container }}
+      psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'select not pg_is_in_recovery()'
+  environment:
+    POSTGRES_USER: "{{ voltius_db_env.POSTGRES_USER }}"
+    POSTGRES_DB: "{{ voltius_db_env.POSTGRES_DB }}"
+  register: voltius_promoted
+  until: voltius_promoted.rc == 0 and voltius_promoted.stdout | trim == "t"
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: Record the recovery point
+  ansible.builtin.shell:
+    cmd: >-
+      docker logs {{ voltius_restore_container }} 2>&1
+      | grep -E 'last completed transaction|consistent recovery state|selected new timeline' | tail -3
+  register: voltius_recovery_point
+  changed_when: false
+
+- name: Show it
+  ansible.builtin.debug:
+    var: voltius_recovery_point.stdout_lines
+
+- name: Stop the restore container, leaving the promoted data behind
+  ansible.builtin.command: docker rm -f {{ voltius_restore_container }}
+  changed_when: true

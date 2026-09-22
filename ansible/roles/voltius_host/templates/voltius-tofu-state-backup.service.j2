@@ -1,0 +1,9 @@
+[Unit]
+Description=Copy the OpenTofu state to the R2 backup bucket
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=TOFU_STATE_ENV_FILE={{ voltius_root }}/voltius-db/.env.db
+ExecStart={{ voltius_root }}/voltius-tofu/scripts/backup-tofu-state.sh {{ voltius_tofu_state }}

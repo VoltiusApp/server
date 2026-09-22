@@ -1,0 +1,11 @@
+voltius_root: /home/ubuntu/fourretout
+voltius_repo: https://github.com/VoltiusApp/server
+voltius_ref: main
+# TRUSTED_PROXIES in .env.dockhand names this subnet. A different one silently
+# puts every client in one rate-limit bucket.
+voltius_cloudflare_subnet: 172.22.0.0/16
+voltius_db_volume: voltius-db_db-data
+voltius_tofu_state: "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
+voltius_pg_walg_image: pg-walg:17-3.0.8
+# A restored copy plus its WAL and one base backup, with room to grow.
+voltius_min_free_bytes: 21474836480

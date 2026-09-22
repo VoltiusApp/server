@@ -1,0 +1,7 @@
+---
+- name: Prepare a voltius host
+  hosts: voltius_hosts
+  gather_facts: true
+  roles:
+    - base
+    - voltius_host
