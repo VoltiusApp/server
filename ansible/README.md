@@ -59,18 +59,19 @@ and the source host was never contacted. The instance was destroyed afterwards.
 To run those without users noticing, migrate two throwaway hosts:
 
 ```sh
-tofu apply   # var.hosts: drill-a and drill-b, plus -var drill_bucket=true in infra/cloudflare
+tofu apply   # var.hosts: drill-a and drill-b
 ansible-playbook site.yml -l 'drill-a,drill-b'
 ansible-playbook drill-seed.yml -e voltius_target=drill-a \
-  -e voltius_age_key_file=/dev/shm/age.key -e voltius_drill_bucket=voltius-drill
+  -e voltius_age_key_file=/dev/shm/age.key -e voltius_drill_prefix=voltius-drill
 ansible-playbook migrate.yml -e voltius_source=drill-a -e voltius_target=drill-b \
   -e voltius_cutover=false
 ```
 
-`drill-seed.yml` reads production's bucket exactly once, for the base backup that seeds
-drill-a, then repoints that host at the drill bucket and asserts nothing of production's
-is named any more. Archived WAL, base backups and mirrored dumps all land in the drill
-bucket; the watchdog heartbeat is cleared so a drill cannot report production healthy.
+`drill-seed.yml` reads production's prefixes exactly once, for the base backup that seeds
+drill-a, then repoints that host under `voltius-drill/` and asserts none of production's
+prefixes is named any more. The isolation is by prefix rather than by bucket because the
+R2 credentials are scoped to one bucket and cannot write to another. The watchdog
+heartbeat is cleared, so a drill cannot report production healthy.
 
 `-e voltius_cutover=false` leaves `api.voltius.app` alone, which means phase 7 is the one
 step a drill cannot prove. Destroy both hosts and empty the drill bucket afterwards.

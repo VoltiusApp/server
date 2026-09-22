@@ -5,10 +5,12 @@
 #   ansible-playbook drill-seed.yml -e voltius_target=drill-a \
 #     -e voltius_age_key_file=/dev/shm/age.key -e voltius_drill_bucket=voltius-drill
 #
-# Production's bucket is read exactly once, for the base backup that seeds this
-# host. Everything the host writes afterwards — archived WAL, base backups,
-# mirrored dumps — goes to the drill bucket, and the watchdog's heartbeat is
-# cleared so a drill cannot report production's backups healthy.
+# Production's prefixes are read exactly once, for the base backup that seeds
+# this host. Everything the host writes afterwards — archived WAL, base backups,
+# mirrored dumps — goes under voltius-drill/ in the same bucket, because the R2
+# credentials are scoped to that bucket and cannot write to another one. The
+# watchdog's heartbeat is cleared too, so a drill cannot report production's
+# backups healthy.
 
 - name: Read the production R2 credentials locally
   hosts: localhost
@@ -23,12 +25,13 @@
   vars:
     voltius_prod_db_env: "{{ hostvars['localhost'].voltius_db_env }}"
   tasks:
-    - name: Name the drill bucket
+    - name: The drill prefix must not be production's
       ansible.builtin.assert:
         that:
-          - voltius_drill_bucket is defined
-          - voltius_drill_bucket != voltius_prod_db_env.R2_BUCKET
-        fail_msg: pass -e voltius_drill_bucket=<a bucket that is not production's>
+          - voltius_drill_prefix is defined
+          - voltius_drill_prefix is search('drill')
+          - voltius_drill_prefix not in voltius_prod_db_env.WALG_S3_PREFIX
+        fail_msg: "pass -e voltius_drill_prefix=voltius-drill (it must name drill and not be production's)"
 
     - name: Refuse to seed a host that serves
       ansible.builtin.shell:
@@ -80,30 +83,36 @@
 
     # From here the host is on its own bucket. Everything above read production;
     # nothing below can reach it.
-    - name: Point this host's stack at the drill bucket
+    - name: Point this host's stack at the drill prefixes
       ansible.builtin.replace:
         path: "{{ voltius_root }}/voltius-db/.env.db"
         regexp: "{{ item.find }}"
         replace: "{{ item.replace }}"
       loop:
-        - find: '^R2_BUCKET=.*$'
-          replace: "R2_BUCKET={{ voltius_drill_bucket }}"
         - find: '^WALG_S3_PREFIX=.*$'
-          replace: "WALG_S3_PREFIX=s3://{{ voltius_drill_bucket }}/voltius-prod/walg"
+          replace: "WALG_S3_PREFIX=s3://{{ voltius_prod_db_env.R2_BUCKET }}/{{ voltius_drill_prefix }}/walg"
         - find: '^INSTATUS_HEARTBEAT_URL=.*$'
           replace: "INSTATUS_HEARTBEAT_URL="
+      no_log: true
+
+    - name: Send the mirrored dumps somewhere production is not
+      ansible.builtin.lineinfile:
+        path: "{{ voltius_root }}/voltius-db/.env.db"
+        regexp: '^DUMPS_PREFIX='
+        line: "DUMPS_PREFIX={{ voltius_drill_prefix }}/dumps"
       no_log: true
 
     - name: Re-read it
       ansible.builtin.include_tasks: tasks/read-db-env.yml
 
-    - name: Confirm nothing here points at production any more
+    - name: Confirm no prefix here is production's
       ansible.builtin.assert:
         that:
-          - voltius_db_env.R2_BUCKET == voltius_drill_bucket
-          - voltius_prod_db_env.R2_BUCKET not in voltius_db_env.WALG_S3_PREFIX
+          - voltius_db_env.WALG_S3_PREFIX != voltius_prod_db_env.WALG_S3_PREFIX
+          - voltius_drill_prefix in voltius_db_env.WALG_S3_PREFIX
+          - voltius_drill_prefix in voltius_db_env.DUMPS_PREFIX
           - voltius_db_env.INSTATUS_HEARTBEAT_URL | length == 0
-        fail_msg: the drill host still names production's bucket — stop
+        fail_msg: the drill host still writes where production does — stop
 
     - name: Start the database stack
       ansible.builtin.command:
@@ -145,7 +154,7 @@
     - name: Ready
       ansible.builtin.debug:
         msg: >-
-          {{ inventory_hostname }} now stands in for production, archiving to
-          {{ voltius_drill_bucket }}. Migrate it with:
+          {{ inventory_hostname }} now stands in for production, archiving under
+          {{ voltius_drill_prefix }}/. Migrate it with:
           ansible-playbook migrate.yml -e voltius_source={{ inventory_hostname }}
           -e voltius_target=<other host> -e voltius_cutover=false
