@@ -6,6 +6,9 @@ BUNDLE_PREFIX="${BUNDLE_PREFIX:-voltius-prod/secrets}"
 AGE_RECIPIENTS="${AGE_RECIPIENTS:-}"
 AGE_IDENTITY="${AGE_IDENTITY:-}"
 ROOT="${ROOT:-/home/ubuntu/fourretout}"
+# On the current production host .env.dockhand lives inside the dockhand volume,
+# not under $ROOT, and is root-owned. Point this at it there.
+DOCKHAND_ENV_FILE="${DOCKHAND_ENV_FILE:-}"
 
 FILES=(
   "voltius-server/.env.dockhand"
@@ -43,17 +46,30 @@ rclone_run() {
   rm -f "$envfile"
 }
 
+# Where a bundle entry is read from, which is $ROOT/<entry> unless overridden.
+source_for() {
+  case "$1" in
+    voltius-server/.env.dockhand) printf '%s\n' "${DOCKHAND_ENV_FILE:-$ROOT/$1}" ;;
+    *) printf '%s\n' "$ROOT/$1" ;;
+  esac
+}
+
 pack() {
   need age
   [ -n "$AGE_RECIPIENTS" ] || die "AGE_RECIPIENTS is unset (age1... public key, or -R file)"
   mkwork
   local staged=0
   for f in "${FILES[@]}"; do
-    if [ -r "$ROOT/$f" ]; then
-      install -D -m 600 "$ROOT/$f" "$WORK/bundle/$f"
+    local src; src=$(source_for "$f")
+    if [ -r "$src" ]; then
+      install -D -m 600 "$src" "$WORK/bundle/$f"
+      staged=$((staged + 1))
+    elif sudo -n test -r "$src" 2>/dev/null; then
+      install -D -m 600 /dev/null "$WORK/bundle/$f"
+      sudo -n cat "$src" > "$WORK/bundle/$f"
       staged=$((staged + 1))
     else
-      echo "skip (unreadable): $ROOT/$f" >&2
+      echo "skip (unreadable): $src" >&2
     fi
   done
   [ "$staged" -gt 0 ] || die "nothing to pack"
