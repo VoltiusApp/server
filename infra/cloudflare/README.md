@@ -24,9 +24,45 @@ identifiers rather than credentials and grant nothing on their own, but this rep
 there is no reason to publish which account to aim at.
 
 State is local and gitignored. That is deliberate: one operator, one machine. A remote backend costs
-an R2 bucket, a lock table and a bootstrap problem, and buys nothing until a second person or a CI
-job runs `apply`. The state file holds no secret — the token comes from the environment and no
-resource here has a sensitive attribute — so losing it costs a re-import, not an outage.
+an R2 bucket, a lock story and a bootstrap problem — the bucket would have to exist before the thing
+that manages buckets could run — and buys nothing until a second person or a CI job runs `apply`. The
+local backend does take a lockfile, so two runs on this host serialise; only cross-machine
+concurrency is unprotected, and there is one machine.
+
+The state file holds no secret: the token comes from the environment and no resource here has a
+sensitive attribute. Keep it mode 600 anyway — this host runs other containers.
+
+## Do not delete imports.tf
+
+The import blocks are what make losing the state cheap. They are inert once the resources are
+adopted — a plan with them present reports no changes — and they hardcode every resource ID, so a
+destroyed state is rebuilt by one import-only apply rather than by reconstructing DNS. Deleting them
+as spent scaffolding is the obvious tidy-up and it is the one thing that would turn a lost file into
+real work.
+
+### Rebuilding state from scratch
+
+```sh
+cd infra/cloudflare
+tofu init
+tofu plan      # expect "N to import, 0 to add, 0 to change, 0 to destroy"
+tofu apply     # refuse to proceed if anything other than imports appears
+```
+
+If the plan wants to add, change or destroy anything, something drifted in the dashboard. Reconcile
+the config with reality first; do not let an apply "fix" it.
+
+## Backing the state up
+
+`scripts/backup-tofu-state.sh` copies it to `voltius-prod/tofu/` in the R2 backup bucket, as
+`terraform.tfstate` plus a timestamped copy, which also gives the history a local backend does not:
+
+```sh
+./scripts/backup-tofu-state.sh infra/cloudflare/terraform.tfstate /path/to/.env.db
+```
+
+Credentials come from the database stack's env file, injected by docker; the script never reads them.
+Run it after any apply.
 
 ## Permissions
 
