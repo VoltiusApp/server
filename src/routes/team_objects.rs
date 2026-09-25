@@ -60,9 +60,10 @@ impl TeamObjectType {
 /// object that can carry secrets.
 fn edit_permission_for_secret_type(secret_type: &str) -> Option<i64> {
     match secret_type {
-        "connection_password" | "connection_key" | "connection_passphrase" => {
-            Some(PERM_EDIT_CONNECTIONS)
-        }
+        "connection_password"
+        | "connection_key"
+        | "connection_passphrase"
+        | "connection_proxy_password" => Some(PERM_EDIT_CONNECTIONS),
         "identity_password" => Some(PERM_EDIT_IDENTITIES),
         "key_private" | "key_public" | "key_passphrase" => Some(PERM_EDIT_KEYS),
         _ => None,
@@ -944,6 +945,53 @@ mod authz_tests {
 
         assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
         assert!(!secret_exists(&pool, team, &secret_id).await);
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_accepts_connection_proxy_password() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let body = UpsertSecretRequest {
+            secret_id: format!("proxy_password:{object_id}"),
+            object_id: object_id.clone(),
+            secret_type: "connection_proxy_password".to_string(),
+            ciphertext: "cipher".to_string(),
+            key_version: 1,
+        };
+        let secret_id = body.secret_id.clone();
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            axum::http::HeaderMap::new(),
+            Path(team),
+            Json(body),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
+        let persisted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2)",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(persisted);
+    }
+
+    #[test]
+    fn proxy_password_needs_edit_connections() {
+        assert_eq!(
+            edit_permission_for_secret_type("connection_proxy_password"),
+            Some(PERM_EDIT_CONNECTIONS)
+        );
     }
 
     #[tokio::test]
