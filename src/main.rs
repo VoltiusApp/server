@@ -156,7 +156,7 @@ async fn main() {
     let sync_rate: usize = std::env::var("SYNC_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(10000);
     let register_per_day: usize = std::env::var("REGISTER_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
