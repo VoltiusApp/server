@@ -121,7 +121,7 @@ pub async fn create_team(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<CreateTeamRequest>,
-) -> Result<(StatusCode, Json<Team>), StatusCode> {
+) -> Result<(StatusCode, Json<TeamWithRole>), StatusCode> {
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -187,7 +187,15 @@ pub async fn create_team(
     })?;
 
     info!(team_id = %team.id, owner_id = %auth.0, "Team created");
-    Ok((StatusCode::CREATED, Json(team)))
+    let created = teams_for_user(&pool, auth.0, Some(team.id))
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team.id, "Failed to read back created team");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .pop()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 // ─── List my teams ────────────────────────────────────────────────────────────
@@ -208,6 +216,21 @@ pub async fn list_teams(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<TeamWithRole>>, StatusCode> {
+    teams_for_user(&pool, auth.0, None)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!(error = %e, "Failed to list teams");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// `only` narrows the result to one team; `None` lists every team the user is in.
+async fn teams_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    only: Option<Uuid>,
+) -> Result<Vec<TeamWithRole>, sqlx::Error> {
     // Returns one row per (team, role) — aggregated in Rust
     let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>, i64, i64)>(
         r#"
@@ -218,16 +241,14 @@ pub async fn list_teams(
         JOIN users u ON u.id = t.owner_id
         LEFT JOIN team_member_roles tmr ON tmr.team_id = t.id AND tmr.user_id = $1
         LEFT JOIN team_member_permission_overrides o ON o.team_id = t.id AND o.user_id = $1
+        WHERE $2::uuid IS NULL OR t.id = $2
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
     )
-    .bind(auth.0)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to list teams");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .bind(user_id)
+    .bind(only)
+    .fetch_all(pool)
+    .await?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
     for (id, name, owner_id, owner_tier, created_at, role_id, permission_allow, permission_deny) in rows {
@@ -252,7 +273,7 @@ pub async fn list_teams(
         }
     }
 
-    Ok(Json(teams))
+    Ok(teams)
 }
 
 // ─── Get team members ─────────────────────────────────────────────────────────
@@ -1811,6 +1832,30 @@ mod authz_tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_team_returns_the_row_list_teams_would() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+
+        let (status, Json(created)) = create_team(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Json(CreateTeamRequest { name: "Ops".into() }),
+        )
+        .await
+        .expect("create team");
+
+        assert_eq!(status, StatusCode::CREATED);
+        let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(owner)))
+            .await
+            .expect("list teams");
+        let listed = listed.into_iter().find(|t| t.id == created.id).expect("created team listed");
+        assert_eq!(created.owner_tier, "business");
+        assert_eq!(created.role_ids.len(), 1);
+        assert_eq!(serde_json::to_value(&created).unwrap(), serde_json::to_value(&listed).unwrap());
     }
 
     #[tokio::test]
