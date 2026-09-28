@@ -41,6 +41,8 @@ pub struct CreateSessionRequest {
     /// alongside a vault share). Each entry carries that user's wrapped key.
     #[serde(default)]
     pub invitees: Vec<ParticipantKeyEntry>,
+    #[serde(default)]
+    pub connection_object_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -585,8 +587,8 @@ pub async fn create_session(
 
     let session_id = sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO terminal_sessions
-           (host_user_id, connection_name, visibility, session_key_bytes, allowed_roles, invite_token)
-           VALUES ($1, $2, $3, $4, $5, $6)
+           (host_user_id, connection_name, visibility, session_key_bytes, allowed_roles, invite_token, connection_object_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING id"#,
     )
     .bind(auth.0)
@@ -595,6 +597,7 @@ pub async fn create_session(
     .bind(&body.session_key_bytes)
     .bind(&body.allowed_roles)
     .bind(&invite_token)
+    .bind(&body.connection_object_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
@@ -747,17 +750,14 @@ struct VisibleSessionRow {
     visibility: String,
     created_at: chrono::DateTime<Utc>,
     vault_ids: Vec<Uuid>,
+    connection_object_id: Option<String>,
     invited_by: Option<Uuid>,
     /// `invited_by`'s handle, read from `users`.
     invited_by_handle: Option<String>,
     invitee_ids: Vec<Uuid>,
 }
 
-/// Sessions `user_id` may see: their own, ones they hold an individual grant
-/// (#66) on, and vault sessions shared with a team they belong to (respecting
-/// the role filter if set). Invite-link sessions are reachable only via the
-/// link, never listed here.
-async fn visible_sessions(
+async fn listed_sessions(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<VisibleSessionRow>, StatusCode> {
@@ -785,6 +785,7 @@ async fn visible_sessions(
             ts.host_user_id,
             ts.visibility,
             ts.created_at,
+            ts.connection_object_id,
             COALESCE(
                 (SELECT array_agg(tsv.team_id) FROM terminal_session_vaults tsv WHERE tsv.session_id = ts.id),
                 ARRAY[]::uuid[]
@@ -861,6 +862,52 @@ async fn visible_sessions(
         error!(error = %e, "Failed to list active sessions");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// Sessions `user_id` may see: their own, ones they hold an individual grant
+/// (#66) on, and vault sessions shared with a team they belong to (respecting
+/// the role filter if set). Invite-link sessions are reachable only via the
+/// link, never listed here.
+async fn visible_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<VisibleSessionRow>, StatusCode> {
+    let rows = listed_sessions(pool, user_id).await?;
+    let mut authz: std::collections::HashMap<Uuid, Option<crate::object_authz::ObjectAuthz>> = Default::default();
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let hidden = match row.connection_object_id.as_deref() {
+            Some(object_id) if row.host_user_id != user_id && row.invited_by.is_none() => {
+                let owners: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+                    "SELECT team_id, rule_set_id FROM team_vault_objects WHERE object_id = $1 AND team_id = ANY($2)",
+                )
+                .bind(object_id)
+                .bind(&row.vault_ids)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to resolve shared host visibility");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                let mut visible = owners.is_empty();
+                for (team_id, set) in owners {
+                    let entry = match authz.entry(team_id) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(crate::object_authz::ObjectAuthz::load(pool, team_id, user_id).await?)
+                        }
+                    };
+                    if entry.as_ref().is_some_and(|a| a.can(set, crate::permissions::PERM_VIEW)) {
+                        visible = true;
+                        break;
+                    }
+                }
+                !visible
+            }
+            _ => false,
+        };
+        if !hidden {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 pub async fn list_active_sessions(
@@ -1687,7 +1734,7 @@ mod authz_tests {
     use axum::{Extension, Json};
     use std::time::Duration;
 
-    fn claims_for(user: uuid::Uuid) -> AuthClaims {
+    pub(super) fn claims_for(user: uuid::Uuid) -> AuthClaims {
         AuthClaims(Claims {
             sub: user,
             exp: 0,
@@ -1717,6 +1764,7 @@ mod authz_tests {
             session_key_bytes: None,
             allowed_roles: Vec::new(),
             invitees,
+            connection_object_id: None,
         }
     }
 
@@ -1724,7 +1772,7 @@ mod authz_tests {
         session_request(vault_ids, "vault", Vec::new())
     }
 
-    fn direct_session_request(invitees: Vec<ParticipantKeyEntry>) -> CreateSessionRequest {
+    pub(super) fn direct_session_request(invitees: Vec<ParticipantKeyEntry>) -> CreateSessionRequest {
         session_request(Vec::new(), "direct", invitees)
     }
 
@@ -1976,8 +2024,10 @@ mod authz_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::authz_tests::{claims_for, direct_session_request};
     use super::*;
     use crate::rate_limit::RateLimiter;
+    use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member, assign_role, default_knock_limiter as knocks, seed_role, seed_session,
@@ -2972,6 +3022,69 @@ mod tests {
         // The host is nobody's invitee, so their own row carries no inviter.
         let for_host = visible_sessions(&pool, host).await.unwrap();
         assert!(for_host.iter().find(|r| r.id == session_id).unwrap().invited_by_handle.is_none());
+    }
+
+    async fn vault_session_on_host(pool: &PgPool, allow_mate: bool) -> (Uuid, Uuid, Uuid) {
+        let owner = seed_user(pool).await;
+        let team = seed_team(pool, owner).await;
+        let host = crate::test_support::member_with_role(pool, team, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+        let mate = crate::test_support::member_with_role(pool, team, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+        crate::test_support::seed_team_object(pool, team, owner, "h-1", "connection").await;
+        let mut entries = vec![("everyone", None, 0, crate::permissions::PERM_VIEW), ("member", Some(host), crate::permissions::PERM_VIEW, 0)];
+        if allow_mate {
+            entries.push(("member", Some(mate), crate::permissions::PERM_VIEW, 0));
+        }
+        let set = crate::test_support::seed_rule_set(pool, team, owner, &entries).await;
+        crate::test_support::point_object(pool, team, "h-1", Some(set)).await;
+        let session_id = seed_session(pool, host, "vault").await;
+        sqlx::query("INSERT INTO terminal_session_vaults (session_id, team_id) VALUES ($1, $2)")
+            .bind(session_id).bind(team).execute(pool).await.unwrap();
+        sqlx::query("UPDATE terminal_sessions SET connection_object_id = 'h-1' WHERE id = $1")
+            .bind(session_id).execute(pool).await.unwrap();
+        (host, mate, session_id)
+    }
+
+    #[tokio::test]
+    async fn a_vault_session_on_a_hidden_host_is_not_listed_to_a_blocked_teammate() {
+        let pool = test_pool_or_skip!();
+        let (host, mate, session_id) = vault_session_on_host(&pool, false).await;
+        assert!(visible_sessions(&pool, host).await.unwrap().iter().any(|r| r.id == session_id));
+        assert!(visible_sessions(&pool, mate).await.unwrap().iter().all(|r| r.id != session_id));
+    }
+
+    #[tokio::test]
+    async fn a_vault_session_on_a_visible_host_is_still_listed() {
+        let pool = test_pool_or_skip!();
+        let (_, mate, session_id) = vault_session_on_host(&pool, true).await;
+        assert!(visible_sessions(&pool, mate).await.unwrap().iter().any(|r| r.id == session_id));
+    }
+
+    #[tokio::test]
+    async fn create_session_stores_connection_object_id() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        let mut req = direct_session_request(vec![ParticipantKeyEntry { user_id: mate, wrapped_key: "wrapped".into() }]);
+        req.connection_object_id = Some("h-9".into());
+
+        let (_, Json(created)) = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
+            Extension(knocks()),
+            Json(req),
+        )
+        .await
+        .expect("create session");
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT connection_object_id FROM terminal_sessions WHERE id = $1")
+            .bind(created.session_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(stored.as_deref(), Some("h-9"));
     }
 
     #[tokio::test]
