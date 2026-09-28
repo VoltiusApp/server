@@ -10,10 +10,11 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::object_authz::{record_member_client, require_rule_set_client, ObjectAuthz};
 use crate::permissions::{
     require_all_team_permissions, require_team_member, require_team_permissions, PermCheck,
     PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
-    PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS,
+    PERM_EDIT_SNIPPETS, PERM_VIEW, PERM_VIEW_SECRETS,
 };
 use crate::routes::client_version::{require_client_version, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
@@ -105,6 +106,8 @@ pub struct TeamObjectResponse {
     pub updated_at: DateTime<Utc>,
     pub updated_by: Uuid,
     pub deleted_at: Option<DateTime<Utc>>,
+    pub rule_set_id: Option<Uuid>,
+    pub my_permissions: i64,
 }
 
 /// Absent-key_version defaults to epoch 1 so a client that predates DEK
@@ -138,9 +141,12 @@ pub struct TeamSecretResponse {
 pub async fn list_objects(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<TeamObjectResponse>>, StatusCode> {
-    require_team_member(&pool, team_id, auth.0).await?;
+    let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
+    record_member_client(&pool, team_id, auth.0, &headers).await;
 
     let rows = sqlx::query_as::<
         _,
@@ -153,9 +159,10 @@ pub async fn list_objects(
             DateTime<Utc>,
             Uuid,
             Option<DateTime<Utc>>,
+            Option<Uuid>,
         ),
     >(
-        r#"SELECT object_id, object_type, name, folder_id, metadata, updated_at, updated_by, deleted_at
+        r#"SELECT object_id, object_type, name, folder_id, metadata, updated_at, updated_by, deleted_at, rule_set_id
            FROM team_vault_objects
            WHERE team_id = $1
            ORDER BY updated_at ASC"#,
@@ -170,15 +177,20 @@ pub async fn list_objects(
 
     Ok(Json(
         rows.into_iter()
-            .map(|row| TeamObjectResponse {
-                object_id: row.0,
-                object_type: row.1,
-                name: row.2,
-                folder_id: row.3,
-                metadata: row.4,
-                updated_at: row.5,
-                updated_by: row.6,
-                deleted_at: row.7,
+            .filter_map(|row| {
+                let my_permissions = authz.mask(row.8);
+                (my_permissions & PERM_VIEW != 0).then(|| TeamObjectResponse {
+                    object_id: row.0,
+                    object_type: row.1,
+                    name: row.2,
+                    folder_id: row.3,
+                    metadata: row.4,
+                    updated_at: row.5,
+                    updated_by: row.6,
+                    deleted_at: row.7,
+                    rule_set_id: row.8,
+                    my_permissions,
+                })
             })
             .collect(),
     ))
@@ -654,10 +666,15 @@ pub async fn delete_secret(
 mod authz_tests {
     use super::*;
     use crate::auth::AuthUser;
-    use crate::permissions::{PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_SNIPPETS, PERM_VIEW_SECRETS};
+    use crate::permissions::{
+        PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_SNIPPETS, PERM_VIEW, PERM_VIEW_SECRETS,
+    };
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
-    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use crate::test_support::{
+        hidden_object_fixture, member_with_role, rule_set_client_headers, seed_rule_set, seed_team,
+        seed_user,
+    };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
 
@@ -683,11 +700,73 @@ mod authz_tests {
         let res = list_objects(
             State(pool.clone()),
             Extension(AuthUser(outsider)),
+            axum::http::HeaderMap::new(),
             Path(team),
         )
         .await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    async fn listed_ids(pool: &PgPool, team: Uuid, user: Uuid) -> Vec<String> {
+        list_objects(State(pool.clone()), Extension(AuthUser(user)), rule_set_client_headers(), Path(team))
+            .await
+            .expect("list objects")
+            .0
+            .into_iter()
+            .map(|o| o.object_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_objects_omits_an_object_the_caller_cannot_view() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        assert!(!listed_ids(&pool, f.team, f.blocked).await.contains(&f.object_id));
+    }
+
+    #[tokio::test]
+    async fn list_objects_keeps_it_for_the_member_it_is_shared_with() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        let rows = list_objects(State(pool.clone()), Extension(AuthUser(f.viewer)), rule_set_client_headers(), Path(f.team))
+            .await
+            .unwrap()
+            .0;
+        let row = rows.iter().find(|o| o.object_id == f.object_id).expect("viewer sees it");
+        assert_eq!(row.rule_set_id, Some(f.rule_set));
+        assert_eq!(row.my_permissions, PERM_VIEW | PERM_CONNECT);
+    }
+
+    #[tokio::test]
+    async fn list_objects_shows_everything_to_an_administrator() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        assert!(listed_ids(&pool, f.team, f.admin).await.contains(&f.object_id));
+    }
+
+    #[tokio::test]
+    async fn list_objects_hides_everything_from_a_role_without_view() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "plain", "connection").await;
+        let role = crate::test_support::seed_role(&pool, team, "no-view", PERM_CONNECT).await;
+        let member = seed_user(&pool).await;
+        crate::test_support::add_member(&pool, team, member).await;
+        crate::test_support::assign_role(&pool, team, member, role).await;
+        assert_eq!(listed_ids(&pool, team, member).await, vec!["plain".to_string()], "unchanged until the first rule set");
+
+        seed_rule_set(&pool, team, owner, &[]).await;
+        assert!(listed_ids(&pool, team, member).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_objects_is_426_for_an_old_client_once_the_team_has_a_rule_set() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        let res = list_objects(State(pool.clone()), Extension(AuthUser(f.viewer)), axum::http::HeaderMap::new(), Path(f.team)).await;
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::UPGRADE_REQUIRED);
     }
 
     #[tokio::test]
@@ -1565,11 +1644,9 @@ mod authz_tests {
         // A real team member — `seed_team` alone does not make `owner` one.
         let caller = member_with_role(&pool, team, PERM_CONNECT).await;
 
-        // No X-Client-Version header at all. Reads must still work so an old
-        // client shows a degraded vault rather than an empty one; note that
-        // `list_objects` takes no `MinClientVersion`/`HeaderMap` at all, so
-        // there is no way to gate it even if an operator sets a floor.
-        let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+        // No X-Client-Version header, no rule set on the team: MinClientVersion
+        // never gates this route, and the rule-sets floor is a no-op until one exists.
+        let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team)).await;
 
         assert!(res.is_ok());
     }
