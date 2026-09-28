@@ -21,6 +21,8 @@ pub const PERM_JOIN_TERMINAL_SESSION: i64  = 1 << 13; // 8192
 pub const PERM_VIEW_TERMINAL_SESSIONS: i64 = 1 << 14; // 16384
 pub const PERM_MANAGE_ROLES: i64           = 1 << 15; // 32768
 pub const PERM_EDIT_SNIPPETS: i64          = 1 << 16; // 65536
+pub const PERM_VIEW: i64                   = 1 << 17; // 131072
+pub const PERM_ADMINISTRATOR: i64          = 1 << 18; // 262144
 
 pub const ALL_PERMISSIONS: i64 = PERM_VIEW_SECRETS
     | PERM_COPY_SECRETS
@@ -38,20 +40,35 @@ pub const ALL_PERMISSIONS: i64 = PERM_VIEW_SECRETS
     | PERM_JOIN_TERMINAL_SESSION
     | PERM_VIEW_TERMINAL_SESSIONS
     | PERM_MANAGE_ROLES
-    | PERM_EDIT_SNIPPETS;
+    | PERM_EDIT_SNIPPETS
+    | PERM_VIEW
+    | PERM_ADMINISTRATOR;
+
+pub const OBJECT_RULE_BITS: i64 = PERM_VIEW
+    | PERM_CONNECT
+    | PERM_VIEW_SECRETS
+    | PERM_COPY_SECRETS
+    | PERM_EDIT_CONNECTIONS
+    | PERM_EDIT_IDENTITIES
+    | PERM_EDIT_KEYS
+    | PERM_EDIT_FOLDERS
+    | PERM_EDIT_SNIPPETS
+    | PERM_MANAGE_ROLES;
+
+pub const RULE_SET_ERA_BITS: i64 = PERM_VIEW | PERM_ADMINISTRATOR;
 
 // Builtin role definitions: (name, permissions, position)
 // Every role that today grants PERM_EDIT_CONNECTIONS (bit 3 = 8) also grants
 // PERM_EDIT_SNIPPETS — Phase 2 is a zero-loss refactor.
 pub const BUILTIN_ROLES: &[(&str, i64, i32)] = &[
-    ("owner",        ALL_PERMISSIONS,             0), // all 17 bits
-    ("manager",      63487 | PERM_EDIT_SNIPPETS,  1),
-    ("editor",       28799 | PERM_EDIT_SNIPPETS,  2),
-    ("member",       28679 | PERM_EDIT_SNIPPETS,  3),
-    ("connect-only", 28676,                       4), // no edit perms today
+    ("owner",        ALL_PERMISSIONS,                          0),
+    ("manager",      63487 | PERM_EDIT_SNIPPETS | PERM_VIEW,   1),
+    ("editor",       28799 | PERM_EDIT_SNIPPETS | PERM_VIEW,   2),
+    ("member",       28679 | PERM_EDIT_SNIPPETS | PERM_VIEW,   3),
+    ("connect-only", 28676 | PERM_VIEW,                        4),
 ];
 
-const PERMISSION_JOINS: &str = r#"
+pub(crate) const PERMISSION_JOINS: &str = r#"
     FROM team_members tm
     LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
     LEFT JOIN team_roles tr ON tr.id = tmr.role_id
@@ -200,6 +217,29 @@ pub async fn has_any_team_permission(
         })?;
 
     Ok(granted)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleLayers {
+    pub everyone_allow: i64,
+    pub everyone_deny: i64,
+    pub roles_allow: i64,
+    pub roles_deny: i64,
+    pub member_allow: i64,
+    pub member_deny: i64,
+}
+
+/// Keep in sync with `resolveObjectPermissions` in the client's `src/services/permissions.ts`.
+pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>) -> i64 {
+    if base & PERM_ADMINISTRATOR != 0 {
+        return ALL_PERMISSIONS & !team_deny;
+    }
+    let Some(r) = rules else { return base };
+    let mut p = (base & !r.everyone_deny) | r.everyone_allow;
+    p = (p & !r.roles_deny) | r.roles_allow;
+    p = (p & !r.member_deny) | r.member_allow;
+    p &= !team_deny;
+    if p & PERM_VIEW == 0 { 0 } else { p }
 }
 
 #[cfg(test)]
@@ -491,5 +531,103 @@ mod db_tests {
                 .unwrap(),
             "an allow override must grant on the multi-team path"
         );
+    }
+}
+
+#[cfg(test)]
+mod object_permission_tests {
+    use super::*;
+
+    const MEMBER: i64 = PERM_VIEW | PERM_CONNECT | PERM_VIEW_SECRETS;
+
+    fn layers() -> RuleLayers {
+        RuleLayers::default()
+    }
+
+    #[test]
+    fn no_rule_set_returns_the_team_mask() {
+        assert_eq!(object_permissions(MEMBER, 0, None), MEMBER);
+    }
+
+    #[test]
+    fn a_rule_set_with_no_relevant_entries_keeps_the_team_mask() {
+        assert_eq!(object_permissions(MEMBER, 0, Some(&layers())), MEMBER);
+    }
+
+    #[test]
+    fn everyone_deny_removes_and_everyone_allow_adds() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW_SECRETS, everyone_allow: PERM_COPY_SECRETS, ..layers() };
+        assert_eq!(
+            object_permissions(MEMBER, 0, Some(&r)),
+            PERM_VIEW | PERM_CONNECT | PERM_COPY_SECRETS
+        );
+    }
+
+    #[test]
+    fn role_layer_overrides_everyone() {
+        let r = RuleLayers { everyone_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+    }
+
+    #[test]
+    fn within_the_role_layer_allow_beats_deny() {
+        let r = RuleLayers { roles_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+    }
+
+    #[test]
+    fn member_layer_overrides_roles() {
+        let r = RuleLayers { roles_allow: PERM_EDIT_CONNECTIONS, member_deny: PERM_EDIT_CONNECTIONS, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+    }
+
+    #[test]
+    fn team_deny_stays_absolute_over_a_member_allow() {
+        let base = MEMBER & !PERM_VIEW_SECRETS;
+        let r = RuleLayers { member_allow: PERM_VIEW_SECRETS, ..layers() };
+        assert_eq!(object_permissions(base, PERM_VIEW_SECRETS, Some(&r)), base);
+    }
+
+    #[test]
+    fn losing_view_zeroes_every_bit() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), 0);
+    }
+
+    #[test]
+    fn a_rule_can_grant_view_the_team_mask_lacks() {
+        let r = RuleLayers { member_allow: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r)), PERM_VIEW | PERM_CONNECT);
+    }
+
+    #[test]
+    fn administrator_ignores_every_rule() {
+        let r = RuleLayers { everyone_deny: ALL_PERMISSIONS, member_deny: ALL_PERMISSIONS, ..layers() };
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r)), ALL_PERMISSIONS);
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, None), ALL_PERMISSIONS);
+    }
+
+    #[test]
+    fn administrator_still_loses_a_team_denied_bit() {
+        assert_eq!(
+            object_permissions(PERM_ADMINISTRATOR, PERM_COPY_SECRETS, None),
+            ALL_PERMISSIONS & !PERM_COPY_SECRETS
+        );
+    }
+
+    #[test]
+    fn object_rule_bits_exclude_administrator_and_team_only_bits() {
+        assert_eq!(OBJECT_RULE_BITS & PERM_ADMINISTRATOR, 0);
+        assert_eq!(OBJECT_RULE_BITS & PERM_INVITE_MEMBERS, 0);
+        assert_eq!(OBJECT_RULE_BITS & PERM_VIEW_AUDIT_LOG, 0);
+        assert_ne!(OBJECT_RULE_BITS & PERM_MANAGE_ROLES, 0);
+    }
+
+    #[test]
+    fn every_builtin_role_has_view_and_only_owner_is_administrator() {
+        for (name, perms, _) in BUILTIN_ROLES {
+            assert_ne!(perms & PERM_VIEW, 0, "{name} lacks VIEW");
+            assert_eq!(perms & PERM_ADMINISTRATOR != 0, *name == "owner", "{name}");
+        }
     }
 }

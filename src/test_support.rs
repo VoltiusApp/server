@@ -264,7 +264,7 @@ pub async fn set_member_overrides(pool: &PgPool, team: Uuid, user: Uuid, allow: 
 pub async fn member_with_role(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
     let user = seed_user(pool).await;
     let role_name = format!("authz-test-role-{}", Uuid::new_v4());
-    let role = seed_role(pool, team, &role_name, perms).await;
+    let role = seed_role(pool, team, &role_name, perms | crate::permissions::PERM_VIEW).await;
     add_member(pool, team, user).await;
     assign_role(pool, team, user, role).await;
     user
