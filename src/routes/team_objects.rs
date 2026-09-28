@@ -441,9 +441,8 @@ pub async fn reencrypt_secrets(
     let secret_ids: Vec<String> = items.iter().map(|i| i.secret_id.clone()).collect();
     let distinct_requested: std::collections::HashSet<&String> = secret_ids.iter().collect();
 
-    // A join, not "resolve object_ids then check permissions for those ids":
-    // that two-step let an orphaned secret resolve to an empty permission set
-    // and pass vacuously (#217 review finding I7).
+    // A join, not a two-step resolve-then-check: the two-step form lets an
+    // orphaned secret resolve to an empty permission set and pass vacuously.
     let resolved: Vec<(String, String, Option<Uuid>)> = sqlx::query_as(
         r#"SELECT tvs.secret_id, tvo.object_type, tvo.rule_set_id
            FROM team_vault_secrets tvs
@@ -1954,7 +1953,7 @@ mod authz_tests {
     }
 
     /// An orphaned secret must not resolve to an empty permission set that
-    /// passes vacuously (#217 I7); simulated directly via SQL.
+    /// passes vacuously; simulated directly via SQL.
     #[tokio::test]
     async fn reencrypt_secrets_rejects_a_batch_with_an_orphaned_secret() {
         let pool = test_pool_or_skip!();
@@ -2211,8 +2210,7 @@ mod authz_tests {
         assert!(!listed_ids(&pool, f.team, f.blocked).await.contains(&f.object_id));
     }
 
-    // Deterministic proxy for a concurrent create racing a hidden row into
-    // existence: pins that the row is locked before any authorization check.
+    // Proxy for a concurrent create racing a hidden row into existence: the row must lock first.
     #[tokio::test]
     async fn creating_over_a_hidden_object_answers_404_and_does_not_overwrite() {
         let pool = test_pool_or_skip!();

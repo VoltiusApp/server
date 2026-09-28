@@ -718,7 +718,7 @@ pub struct SearchUsersQuery {
 ///   - The `NOT EXISTS` in `revoke_grants_for_departed_member`
 ///     (routes::terminal) — inlined because it binds only `$1` and needs
 ///     `tsi.invited_by`/`tsi.user_id`, not `$2`/`u.id`.
-///   - The `connection_name` redaction `CASE` in `visible_sessions`
+///   - The `connection_name` redaction `CASE` in `listed_sessions`
 ///     (routes::terminal) — inlined because that query already uses `$2` for
 ///     `PERM_VIEW_TERMINAL_SESSIONS` (an int, not a uuid), so splicing this
 ///     constant's hardcoded `$2` in would silently bind the wrong value.

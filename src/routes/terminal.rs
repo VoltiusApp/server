@@ -744,7 +744,7 @@ pub async fn create_session(
 #[derive(sqlx::FromRow)]
 struct VisibleSessionRow {
     id: Uuid,
-    /// `None` for an unaccepted stranger invitee (see the CASE in `visible_sessions`).
+    /// `None` for an unaccepted stranger invitee (see the CASE in `listed_sessions`).
     connection_name: Option<String>,
     host_user_id: Uuid,
     visibility: String,

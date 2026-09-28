@@ -245,7 +245,7 @@ impl Drop for PresenceGuard {
                 notifier.notify_presence_changed(*recipient, user_id, false);
             }
             // For each connection the user was broadcasting, fan out stop events to
-            // teammates that share at least one team owning that connection.
+            // teammates who can currently View that connection.
             for connection_id in stale_connections {
                 let recipients = crate::object_authz::connection_viewers(&pool, &connection_id, user_id)
                     .await

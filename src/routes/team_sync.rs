@@ -1567,7 +1567,7 @@ mod tests {
         assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
     }
 
-    // ─── Vault-key gate widened to any object (#387 task 6) ──────────────────
+    // ─── Vault-key gate widened to any object ─────────────────────────────────
 
     #[tokio::test]
     async fn vault_key_is_served_to_a_member_granted_connect_on_one_object_only() {
