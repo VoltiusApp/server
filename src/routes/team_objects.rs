@@ -57,10 +57,7 @@ impl TeamObjectType {
     }
 }
 
-/// A secret's own type already names the kind of object it belongs to, so the
-/// gate does not depend on an object row that may be soft-deleted or gone by the
-/// time the secret is withdrawn. Agrees with `edit_permission_for_str` for every
-/// object that can carry secrets.
+/// Gated from the secret's own type so a soft-deleted or missing owner still resolves.
 fn edit_permission_for_secret_type(secret_type: &str) -> Option<i64> {
     secret_owner_type(secret_type).and_then(edit_permission_for_str)
 }
@@ -77,13 +74,13 @@ fn secret_owner_type(secret_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Must match `localSecretKeyFromTeamSecret` in the client's `teamVaultSecretKeys.ts`.
+/// Inverse of the client's `teamSecretFromLocalKey`; a colon in a connection key id would alias `key:<id>:<part>`.
 fn canonical_secret_id(object_id: &str, secret_type: &str) -> Option<String> {
     Some(match secret_type {
         "connection_password" => format!("password:{object_id}"),
-        "connection_key" => format!("key:{object_id}"),
+        "connection_key" if !object_id.contains(':') => format!("key:{object_id}"),
         "connection_passphrase" => format!("passphrase:{object_id}"),
-        "connection_proxy_password" => format!("proxy_password:{object_id}"),
+        "connection_proxy_password" if object_id != "__global__" => format!("proxy_password:{object_id}"),
         "identity_password" => format!("identity:{object_id}:password"),
         "key_private" => format!("key:{object_id}:private"),
         "key_public" => format!("key:{object_id}:public"),
@@ -1142,6 +1139,35 @@ mod authz_tests {
             assert!(secret_owner_type(secret_type).is_some());
         }
         assert_eq!(canonical_secret_id("o", "bogus"), None);
+        assert_eq!(canonical_secret_id("k:passphrase", "connection_key"), None);
+        assert_eq!(canonical_secret_id("__global__", "connection_proxy_password"), None);
+    }
+
+    #[tokio::test]
+    async fn a_connection_named_like_a_key_part_cannot_alias_that_keys_secret() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "k:passphrase", "connection").await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let body = UpsertSecretRequest {
+            secret_id: "key:k:passphrase".to_string(),
+            object_id: "k:passphrase".to_string(),
+            secret_type: "connection_key".to_string(),
+            ciphertext: "cipher".to_string(),
+            key_version: 1,
+        };
+
+        assert_eq!(upsert_secret_body(&pool, team, caller, body).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert!(!secret_exists(&pool, team, "key:k:passphrase").await);
+    }
+
+    #[tokio::test]
+    async fn a_hidden_target_of_the_wrong_type_answers_404_not_400() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "key", PERM_EDIT_KEYS | PERM_EDIT_CONNECTIONS).await;
+        assert_eq!(secret_upsert_as(&pool, f.team, f.blocked, &f.object_id).await.unwrap_err(), StatusCode::NOT_FOUND);
+        assert_eq!(secret_upsert_as(&pool, f.team, f.viewer, &f.object_id).await.unwrap_err(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
