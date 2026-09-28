@@ -13,8 +13,8 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::object_authz::hidden_object_ids;
-use crate::permissions::{has_team_permission, PERM_CONNECT, PERM_VIEW_AUDIT_LOG};
+use crate::object_authz::{hidden_object_ids, live_rule_set_ids, object_row, ObjectAuthz};
+use crate::permissions::{has_team_permission, PERM_CONNECT, PERM_VIEW, PERM_VIEW_AUDIT_LOG, PERM_VIEW_SECRETS};
 use crate::rate_limit::RateLimiter;
 
 // ─── Rate limiter newtype ─────────────────────────────────────────────────────
@@ -417,9 +417,17 @@ pub async fn report_client_event(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    let can_connect = has_team_permission(&pool, team_id, auth.0, PERM_CONNECT).await?;
-    if !can_connect {
+    let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let live = live_rule_set_ids(&pool, team_id).await?;
+    if !authz.grants_anywhere(&live, PERM_CONNECT | PERM_VIEW_SECRETS) {
         return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(target_id) = &body.target_id {
+        if let Some(row) = object_row(&pool, team_id, target_id).await? {
+            if !authz.can(row.rule_set_id, PERM_VIEW) {
+                return Err(StatusCode::NOT_FOUND);
+            }
+        }
     }
 
     let occurred_at = DateTime::parse_from_rfc3339(&body.occurred_at)
@@ -460,7 +468,7 @@ mod authz_tests {
     use crate::auth::AuthUser;
     use crate::permissions::{PERM_CONNECT, PERM_VIEW_AUDIT_LOG};
     use crate::test_pool_or_skip;
-    use crate::test_support::{member_with_role, seed_team, seed_user};
+    use crate::test_support::{member_with_role, point_object, seed_rule_set, seed_team, seed_team_object, seed_user};
     use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
     use axum::Extension;
@@ -633,5 +641,54 @@ mod authz_tests {
 
         assert!(!text.contains("secret-host"));
         assert!(text.contains("plain-host"));
+    }
+
+    fn no_rate_limit() -> AuditClientRateLimiter {
+        AuditClientRateLimiter(RateLimiter::new(1000, std::time::Duration::from_secs(60)))
+    }
+
+    fn client_event(target_id: Option<&str>) -> ClientEventRequest {
+        ClientEventRequest {
+            action: "agent.session_opened".to_string(),
+            vault_id: None,
+            target_type: target_id.map(|_| "connection".to_string()),
+            target_id: target_id.map(str::to_string),
+            target_name: None,
+            metadata: None,
+            occurred_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    async fn report_event_as(pool: &PgPool, team: Uuid, user: Uuid, target_id: Option<&str>) -> Result<StatusCode, StatusCode> {
+        report_client_event(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(no_rate_limit()),
+            ConnectInfo("127.0.0.1:0".parse().unwrap()),
+            Path(team),
+            Json(client_event(target_id)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_junior_with_object_scoped_connect_may_report_client_events() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let junior = member_with_role(&pool, team, 0).await;
+        seed_team_object(&pool, team, owner, "obj-1", "connection").await;
+        let set = seed_rule_set(&pool, team, owner, &[("member", Some(junior), PERM_CONNECT, 0)]).await;
+        point_object(&pool, team, "obj-1", Some(set)).await;
+
+        assert_eq!(report_event_as(&pool, team, junior, None).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_member_reporting_an_event_about_a_hidden_object_gets_not_found() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+
+        assert_eq!(report_event_as(&pool, f.team, f.blocked, Some(&f.object_id)).await, Err(StatusCode::NOT_FOUND));
     }
 }
