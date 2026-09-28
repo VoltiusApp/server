@@ -588,7 +588,7 @@ mod db_tests {
         assert_eq!(sets, 0);
 
         pool.close().await;
-        sqlx::query(&format!("DROP DATABASE {db}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)")).execute(&admin).await.unwrap();
     }
 
     #[tokio::test]
