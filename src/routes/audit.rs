@@ -13,6 +13,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::object_authz::hidden_object_ids;
 use crate::permissions::{has_team_permission, PERM_CONNECT, PERM_VIEW_AUDIT_LOG};
 use crate::rate_limit::RateLimiter;
 
@@ -117,6 +118,7 @@ pub async fn list_audit_logs(
         warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to view audit logs");
         return Err(StatusCode::FORBIDDEN);
     }
+    let hidden = hidden_object_ids(&pool, team_id, auth.0).await?;
 
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(50).clamp(1, 100);
@@ -141,7 +143,8 @@ pub async fn list_audit_logs(
               AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
               AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
               AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
-              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)"#,
+              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
+              AND (al.target_id IS NULL OR NOT (al.target_id = ANY($7::text[])))"#,
     )
     .bind(team_id)
     .bind(&params.action)
@@ -149,6 +152,7 @@ pub async fn list_audit_logs(
     .bind(from_dt)
     .bind(to_dt)
     .bind(params.vault_id)
+    .bind(&hidden)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
@@ -170,6 +174,7 @@ pub async fn list_audit_logs(
               AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
               AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
               AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
+              AND (al.target_id IS NULL OR NOT (al.target_id = ANY($9::text[])))
             ORDER BY al.created_at DESC
             LIMIT $7 OFFSET $8"#,
     )
@@ -181,6 +186,7 @@ pub async fn list_audit_logs(
     .bind(params.vault_id)
     .bind(per_page)
     .bind(offset)
+    .bind(&hidden)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -204,6 +210,7 @@ pub async fn export_audit_logs(
         warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to export audit logs");
         return Err(StatusCode::FORBIDDEN);
     }
+    let hidden = hidden_object_ids(&pool, team_id, auth.0).await?;
 
     let from_dt = params
         .from
@@ -230,6 +237,7 @@ pub async fn export_audit_logs(
               AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
               AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
               AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
+              AND (al.target_id IS NULL OR NOT (al.target_id = ANY($7::text[])))
             ORDER BY al.created_at DESC"#,
     )
     .bind(team_id)
@@ -238,6 +246,7 @@ pub async fn export_audit_logs(
     .bind(from_dt)
     .bind(to_dt)
     .bind(params.vault_id)
+    .bind(&hidden)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -453,6 +462,7 @@ mod authz_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{member_with_role, seed_team, seed_user};
     use axum::extract::{Path, Query, State};
+    use axum::response::IntoResponse;
     use axum::Extension;
 
     #[test]
@@ -560,5 +570,68 @@ mod authz_tests {
 
         // export returns `Result<impl IntoResponse, StatusCode>`; the Err arm is the gate.
         assert_eq!(res.err(), Some(axum::http::StatusCode::FORBIDDEN));
+    }
+
+    async fn seed_audit_rows(pool: &sqlx::PgPool, team: Uuid, actor: Uuid, hidden_id: &str) {
+        for (target_id, name) in [(Some(hidden_id), Some("secret-host")), (Some("other"), Some("plain-host")), (None, None)] {
+            sqlx::query(
+                "INSERT INTO audit_logs (team_id, actor_id, action, source, target_type, target_id, target_name) \
+                 VALUES ($1, $2, 'connection.started', 'client', 'connection', $3, $4)",
+            )
+            .bind(team).bind(actor).bind(target_id).bind(name)
+            .execute(pool).await.unwrap();
+        }
+    }
+
+    async fn names_seen(pool: &sqlx::PgPool, team: Uuid, reader: Uuid) -> (Vec<Option<String>>, i64) {
+        let res = list_audit_logs(State(pool.clone()), Extension(AuthUser(reader)), Path(team), Query(empty_audit_query()))
+            .await
+            .expect("list audit logs")
+            .0;
+        (res.logs.into_iter().map(|l| l.target_name).collect(), res.total)
+    }
+
+    #[tokio::test]
+    async fn audit_rows_about_a_hidden_object_are_dropped_for_a_blocked_reader() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_AUDIT_LOG).await;
+        seed_audit_rows(&pool, f.team, f.owner, &f.object_id).await;
+
+        let (names, total) = names_seen(&pool, f.team, f.blocked).await;
+        assert!(!names.contains(&Some("secret-host".into())));
+        assert!(names.contains(&Some("plain-host".into())) && names.contains(&None), "unrelated and untargeted rows stay");
+        assert_eq!(total, names.len() as i64);
+
+        sqlx::query("UPDATE team_vault_objects SET deleted_at = now() WHERE team_id = $1 AND object_id = $2")
+            .bind(f.team).bind(&f.object_id).execute(&pool).await.unwrap();
+        assert!(!names_seen(&pool, f.team, f.blocked).await.0.contains(&Some("secret-host".into())));
+    }
+
+    #[tokio::test]
+    async fn the_viewer_and_the_admin_still_see_the_row() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_AUDIT_LOG).await;
+        seed_audit_rows(&pool, f.team, f.owner, &f.object_id).await;
+        let admin = member_with_role(&pool, f.team, PERM_VIEW_AUDIT_LOG | crate::permissions::PERM_ADMINISTRATOR).await;
+        assert!(names_seen(&pool, f.team, f.viewer).await.0.contains(&Some("secret-host".into())));
+        assert!(names_seen(&pool, f.team, admin).await.0.contains(&Some("secret-host".into())));
+    }
+
+    #[tokio::test]
+    async fn export_drops_the_row_for_a_blocked_reader() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_AUDIT_LOG).await;
+        seed_audit_rows(&pool, f.team, f.owner, &f.object_id).await;
+        let query = ExportQuery { format: Some("json".into()), vault_id: None, action: None, actor_id: None, from: None, to: None };
+
+        let res = export_audit_logs(State(pool.clone()), Extension(AuthUser(f.blocked)), Path(f.team), Query(query))
+            .await
+            .expect("export")
+            .into_response();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!text.contains("secret-host"));
+        assert!(text.contains("plain-host"));
     }
 }

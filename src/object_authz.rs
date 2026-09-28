@@ -200,6 +200,18 @@ pub async fn object_row(pool: &PgPool, team_id: Uuid, object_id: &str) -> Result
     .map_err(|e| db_error(e, "object_row"))
 }
 
+pub async fn hidden_object_ids(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
+    let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let rows = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "SELECT object_id, rule_set_id FROM team_vault_objects WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_error(e, "hidden_object_ids"))?;
+    Ok(rows.into_iter().filter(|(_, set)| !authz.can(*set, PERM_VIEW)).map(|(id, _)| id).collect())
+}
+
 pub async fn live_rule_set_ids(pool: &PgPool, team_id: Uuid) -> Result<Vec<Uuid>, StatusCode> {
     sqlx::query_scalar::<_, Uuid>(
         "SELECT DISTINCT rule_set_id FROM team_vault_objects \
