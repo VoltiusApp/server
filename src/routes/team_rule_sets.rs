@@ -95,11 +95,14 @@ async fn load_member(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Obje
 }
 
 /// Admin (set in team), or `bit` through a set a live object uses. View only → 403, nothing → 404.
+/// Administrator only replaces the "reachable" half of this check — team-level Deny still applies.
 async fn require_on_set(pool: &PgPool, authz: &ObjectAuthz, team_id: Uuid, set_id: Uuid, bit: i64) -> Result<(), StatusCode> {
-    if authz.is_admin() {
-        return if rule_set_in_team(pool, team_id, set_id).await? { Ok(()) } else { Err(StatusCode::NOT_FOUND) };
-    }
-    if !live_rule_set_ids(pool, team_id).await?.contains(&set_id) || !authz.can(Some(set_id), PERM_VIEW) {
+    let reachable = if authz.is_admin() {
+        rule_set_in_team(pool, team_id, set_id).await?
+    } else {
+        live_rule_set_ids(pool, team_id).await?.contains(&set_id)
+    };
+    if !reachable || !authz.can(Some(set_id), PERM_VIEW) {
         return Err(StatusCode::NOT_FOUND);
     }
     if authz.can(Some(set_id), bit) { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
@@ -184,11 +187,13 @@ pub async fn put_rule_set(
     require_on_set(&pool, &authz, team_id, set_id, PERM_MANAGE_ROLES).await?;
     let entries = validate_entries(&pool, team_id, body.entries).await?;
     let mut tx = pool.begin().await.map_err(|e| internal(e, "begin put"))?;
+    // Stamp first: the row lock this UPDATE takes serializes concurrent PUTs on
+    // the same set until commit, so a second writer's DELETE can't interleave.
+    sqlx::query("UPDATE team_rule_sets SET updated_at = now(), updated_by = $2 WHERE id = $1")
+        .bind(set_id).bind(auth.0).execute(&mut *tx).await.map_err(|e| internal(e, "stamp set"))?;
     sqlx::query("DELETE FROM team_rule_set_entries WHERE rule_set_id = $1")
         .bind(set_id).execute(&mut *tx).await.map_err(|e| internal(e, "clear entries"))?;
     insert_entries(&mut tx, set_id, &entries).await?;
-    sqlx::query("UPDATE team_rule_sets SET updated_at = now(), updated_by = $2 WHERE id = $1")
-        .bind(set_id).bind(auth.0).execute(&mut *tx).await.map_err(|e| internal(e, "stamp set"))?;
     tx.commit().await.map_err(|e| internal(e, "commit put"))?;
     notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
     Ok(StatusCode::NO_CONTENT)
@@ -297,12 +302,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_admin_whose_team_deny_removes_view_gets_404_not_a_free_pass() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        set_member_overrides(&pool, f.team, f.admin, 0, PERM_VIEW).await;
+        let res = get_rule_set(State(pool.clone()), Extension(AuthUser(f.admin)), Path((f.team, f.rule_set))).await;
+        assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
     async fn put_replaces_entries_and_changes_what_members_see() {
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
         put(&pool, f.team, f.admin, f.rule_set, vec![entry("member", Some(f.blocked), PERM_VIEW, 0)]).await.unwrap();
         let blocked = crate::object_authz::ObjectAuthz::load(&pool, f.team, f.blocked).await.unwrap().unwrap();
         assert!(blocked.can(Some(f.rule_set), PERM_VIEW));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_set_entries WHERE rule_set_id = $1")
+            .bind(f.rule_set).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "PUT must replace, not accumulate, the set's entries");
     }
 
     #[tokio::test]

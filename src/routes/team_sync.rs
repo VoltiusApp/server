@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::object_authz::{live_rule_set_ids, require_rule_set_client, team_has_rule_sets, ObjectAuthz};
-use crate::permissions::{is_team_member, PermCheck};
+use crate::permissions::{is_team_member, PermCheck, PERM_VIEW};
 use crate::self_host;
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
@@ -100,7 +100,7 @@ async fn require_admin_once_rule_sets(pool: &PgPool, team_id: Uuid, user_id: Uui
         return Ok(());
     }
     match ObjectAuthz::load(pool, team_id, user_id).await? {
-        Some(a) if a.is_admin() => Ok(()),
+        Some(a) if a.is_admin() && a.can(None, PERM_VIEW) => Ok(()),
         _ => Err(StatusCode::FORBIDDEN),
     }
 }
@@ -1553,6 +1553,20 @@ mod tests {
         let admin_member = crate::test_support::member_with_role(&pool, f.team, PERM_VIEW_SECRETS | crate::permissions::PERM_ADMINISTRATOR).await;
         let admin = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(admin_member)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
         assert!(admin.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sync_blob_refuses_an_admin_whose_team_deny_removes_view() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_SECRETS).await;
+        crate::test_support::set_user_tier(&pool, f.owner, "teams").await;
+        insert_team_blob(&pool, f.team, f.owner).await;
+
+        let admin = crate::test_support::member_with_role(&pool, f.team, PERM_VIEW_SECRETS | crate::permissions::PERM_ADMINISTRATOR).await;
+        crate::test_support::set_member_overrides(&pool, f.team, admin, 0, PERM_VIEW).await;
+
+        let res = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(admin)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
 
     #[tokio::test]
