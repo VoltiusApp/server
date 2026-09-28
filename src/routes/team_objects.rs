@@ -655,6 +655,8 @@ pub async fn upsert_secret(
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
+    let had_existing = existing.is_some();
+
     // A pre-existing secret may belong to a different object than the one
     // named in the request; that owner must be authorized too.
     let mut rows = vec![target];
@@ -687,31 +689,39 @@ pub async fn upsert_secret(
         }
     }
 
-    sqlx::query(
-        r#"INSERT INTO team_vault_secrets
-           (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           ON CONFLICT (team_id, secret_id)
-           DO UPDATE SET object_id = EXCLUDED.object_id,
-                         secret_type = EXCLUDED.secret_type,
-                         ciphertext = EXCLUDED.ciphertext,
-                         updated_at = now(),
-                         updated_by = EXCLUDED.updated_by,
-                         key_version = EXCLUDED.key_version"#,
-    )
-    .bind(team_id)
-    .bind(&body.secret_id)
-    .bind(&body.object_id)
-    .bind(&body.secret_type)
-    .bind(&body.ciphertext)
-    .bind(auth.0)
-    .bind(body.key_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, secret_id = %body.secret_id, "Failed to upsert team vault secret");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let query = if had_existing {
+        sqlx::query(
+            r#"UPDATE team_vault_secrets
+               SET object_id = $3, secret_type = $4, ciphertext = $5,
+                   updated_at = now(), updated_by = $6, key_version = $7
+               WHERE team_id = $1 AND secret_id = $2"#,
+        )
+    } else {
+        sqlx::query(
+            r#"INSERT INTO team_vault_secrets
+               (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (team_id, secret_id) DO NOTHING"#,
+        )
+    };
+    let result = query
+        .bind(team_id)
+        .bind(&body.secret_id)
+        .bind(&body.object_id)
+        .bind(&body.secret_type)
+        .bind(&body.ciphertext)
+        .bind(auth.0)
+        .bind(body.key_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, secret_id = %body.secret_id, "Failed to upsert team vault secret");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !had_existing && result.rows_affected() == 0 {
+        return Err(StatusCode::CONFLICT);
+    }
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to commit secret upsert");
@@ -2379,6 +2389,47 @@ mod authz_tests {
         .unwrap();
         assert_eq!(object_id, "visible", "the viewer may edit both objects, so the move must land");
         assert_eq!(ciphertext, "moved-cipher");
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_insert_reports_zero_rows_when_a_row_wins_the_race() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "obj-1", "connection").await;
+        let secret_id = "password:obj-1".to_string();
+
+        let mut tx = pool.begin().await.unwrap();
+        let existing = sqlx::query_as::<_, (String, String)>(
+            "SELECT object_id, secret_type FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2 FOR UPDATE",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap();
+        assert!(existing.is_none(), "no row yet, so FOR UPDATE locks nothing");
+
+        seed_secret_row(&pool, team, owner, "obj-1").await;
+
+        let result = sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (team_id, secret_id) DO NOTHING",
+        )
+        .bind(team)
+        .bind(&secret_id)
+        .bind("obj-1")
+        .bind("connection_password")
+        .bind("attacker-cipher")
+        .bind(owner)
+        .bind(1i32)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        assert_eq!(result.rows_affected(), 0, "the fix must turn the interleaved insert into a 409, not a silent overwrite");
+        tx.rollback().await.unwrap();
     }
 
     #[tokio::test]
