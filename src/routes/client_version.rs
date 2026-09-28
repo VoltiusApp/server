@@ -55,9 +55,49 @@ pub fn require_client_version(
     }
 }
 
+pub const RULE_SETS_FEATURE: &str = "rule-sets";
+
+pub fn client_supports_rule_sets(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-client-features")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|f| f.trim() == RULE_SETS_FEATURE))
+}
+
+pub fn require_rule_set_feature(headers: &axum::http::HeaderMap) -> Result<(), axum::http::StatusCode> {
+    if client_supports_rule_sets(headers) {
+        Ok(())
+    } else {
+        Err(axum::http::StatusCode::UPGRADE_REQUIRED)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_features(value: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-client-features", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn rule_sets_feature_is_read_from_a_comma_list() {
+        assert!(client_supports_rule_sets(&with_features("rule-sets")));
+        assert!(client_supports_rule_sets(&with_features("foo, rule-sets ,bar")));
+        assert!(!client_supports_rule_sets(&with_features("rule-sets-v0")));
+        assert!(!client_supports_rule_sets(&axum::http::HeaderMap::new()));
+    }
+
+    #[test]
+    fn require_rule_set_feature_answers_426_without_the_header() {
+        assert_eq!(
+            require_rule_set_feature(&axum::http::HeaderMap::new()),
+            Err(axum::http::StatusCode::UPGRADE_REQUIRED)
+        );
+        assert!(require_rule_set_feature(&with_features("rule-sets")).is_ok());
+    }
 
     #[test]
     fn unset_floor_allows_everything_including_a_missing_header() {

@@ -416,3 +416,42 @@ pub async fn point_object(pool: &PgPool, team: Uuid, object_id: &str, set: Optio
         .await
         .expect("point object");
 }
+
+pub fn rule_set_client_headers() -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("x-client-features", "rule-sets".parse().unwrap());
+    h.insert("x-client-version", "0.99.0".parse().unwrap());
+    h
+}
+
+/// A team with one object that `viewer` may see and `blocked` may not
+/// (@everyone deny VIEW, member allow VIEW for `viewer`). `admin` holds ADMINISTRATOR.
+pub struct HiddenObjectFixture {
+    pub team: Uuid,
+    pub owner: Uuid,
+    pub viewer: Uuid,
+    pub blocked: Uuid,
+    pub admin: Uuid,
+    pub object_id: String,
+    pub rule_set: Uuid,
+}
+
+pub async fn hidden_object_fixture(pool: &PgPool, object_type: &str, member_perms: i64) -> HiddenObjectFixture {
+    use crate::permissions::{PERM_ADMINISTRATOR, PERM_VIEW};
+    let owner = seed_user(pool).await;
+    let team = seed_team(pool, owner).await;
+    let viewer = member_with_role(pool, team, member_perms).await;
+    let blocked = member_with_role(pool, team, member_perms).await;
+    let admin = member_with_role(pool, team, PERM_ADMINISTRATOR).await;
+    let object_id = format!("obj-{}", Uuid::new_v4());
+    seed_team_object(pool, team, owner, &object_id, object_type).await;
+    let rule_set = seed_rule_set(
+        pool,
+        team,
+        owner,
+        &[("everyone", None, 0, PERM_VIEW), ("member", Some(viewer), PERM_VIEW, 0)],
+    )
+    .await;
+    point_object(pool, team, &object_id, Some(rule_set)).await;
+    HiddenObjectFixture { team, owner, viewer, blocked, admin, object_id, rule_set }
+}

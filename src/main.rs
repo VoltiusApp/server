@@ -6,6 +6,7 @@ mod handles;
 mod last_seen;
 mod lemonsqueezy;
 mod models;
+mod object_authz;
 mod observability;
 mod permissions;
 mod rate_limit;
