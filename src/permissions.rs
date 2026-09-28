@@ -57,6 +57,12 @@ pub const OBJECT_RULE_BITS: i64 = PERM_VIEW
 
 pub const RULE_SET_ERA_BITS: i64 = PERM_VIEW | PERM_ADMINISTRATOR;
 
+/// A client unaware of `RULE_SET_ERA_BITS` cannot set or clear them: keep
+/// whatever was already stored for those bits, take everything else from `sent`.
+pub fn keep_era_bits(sent: i64, stored: i64) -> i64 {
+    (sent & !RULE_SET_ERA_BITS) | (stored & RULE_SET_ERA_BITS)
+}
+
 // Builtin role definitions: (name, permissions, position)
 // Every role that today grants PERM_EDIT_CONNECTIONS (bit 3 = 8) also grants
 // PERM_EDIT_SNIPPETS — Phase 2 is a zero-loss refactor.
@@ -702,5 +708,21 @@ mod object_permission_tests {
             assert_ne!(perms & PERM_VIEW, 0, "{name} lacks VIEW");
             assert_eq!(perms & PERM_ADMINISTRATOR != 0, *name == "owner", "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod keep_era_bits_tests {
+    use super::*;
+
+    #[test]
+    fn a_sent_era_bit_is_dropped_in_favor_of_the_stored_one() {
+        assert_eq!(keep_era_bits(PERM_CONNECT | PERM_VIEW, 0), PERM_CONNECT);
+        assert_eq!(keep_era_bits(PERM_CONNECT, PERM_VIEW | PERM_ADMINISTRATOR), PERM_CONNECT | PERM_VIEW | PERM_ADMINISTRATOR);
+    }
+
+    #[test]
+    fn non_era_bits_pass_through_unchanged() {
+        assert_eq!(keep_era_bits(PERM_CONNECT | PERM_COPY_SECRETS, 0), PERM_CONNECT | PERM_COPY_SECRETS);
     }
 }

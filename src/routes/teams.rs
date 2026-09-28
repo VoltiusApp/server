@@ -534,6 +534,25 @@ async fn request_team_rotation(
     Ok(())
 }
 
+async fn delete_subject_rule_entries(
+    tx: &mut sqlx::PgConnection,
+    team_id: Uuid,
+    subject_type: &str,
+    subject_id: Uuid,
+) -> Result<(), StatusCode> {
+    sqlx::query(
+        "DELETE FROM team_rule_set_entries e USING team_rule_sets s \
+         WHERE e.rule_set_id = s.id AND s.team_id = $1 AND e.subject_type = $2 AND e.subject_id = $3",
+    )
+    .bind(team_id)
+    .bind(subject_type)
+    .bind(subject_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, subject_type, "Failed to remove subject rule entries"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    Ok(())
+}
+
 // ─── Remove member ────────────────────────────────────────────────────────────
 
 pub async fn remove_member(
@@ -599,15 +618,7 @@ pub async fn remove_member(
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team member roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    sqlx::query(
-        "DELETE FROM team_rule_set_entries e USING team_rule_sets s \
-         WHERE e.rule_set_id = s.id AND s.team_id = $1 AND e.subject_type = 'member' AND e.subject_id = $2",
-    )
-    .bind(team_id)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to remove member rule entries"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    delete_subject_rule_entries(&mut tx, team_id, "member", user_id).await?;
 
     request_team_rotation(&mut tx, team_id).await?;
 
@@ -974,11 +985,10 @@ pub async fn update_role(
         }
     }
 
-    use crate::permissions::{ALL_PERMISSIONS, RULE_SET_ERA_BITS};
     let legacy = !crate::routes::client_version::client_supports_rule_sets(&headers);
     let permissions = body.permissions.map(|p| {
-        let p = p & ALL_PERMISSIONS;
-        if legacy { (p & !RULE_SET_ERA_BITS) | (role_info.1 & RULE_SET_ERA_BITS) } else { p }
+        let p = p & crate::permissions::ALL_PERMISSIONS;
+        if legacy { crate::permissions::keep_era_bits(p, role_info.1) } else { p }
     });
 
     sqlx::query(
@@ -1052,15 +1062,7 @@ pub async fn delete_role(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    sqlx::query(
-        "DELETE FROM team_rule_set_entries e USING team_rule_sets s \
-         WHERE e.rule_set_id = s.id AND s.team_id = $1 AND e.subject_type = 'role' AND e.subject_id = $2",
-    )
-    .bind(team_id)
-    .bind(role_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to remove role rule entries"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    delete_subject_rule_entries(&mut tx, team_id, "role", role_id).await?;
 
     // CASCADE on team_member_roles handles removal from members automatically
     let result = sqlx::query("DELETE FROM team_roles WHERE id = $1 AND team_id = $2")
@@ -1309,6 +1311,21 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
+async fn override_masks<'e, E>(executor: E, team_id: Uuid, user_id: Uuid) -> Result<(i64, i64), StatusCode>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query_as::<_, (i64, i64)>(
+        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or((0, 0)))
+}
+
 async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Option<i32>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<i32>>(
         "SELECT MIN(tr.position) FROM team_member_roles tmr \
@@ -1349,15 +1366,7 @@ async fn override_guardrails(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let previous_allow: i64 = sqlx::query_scalar(
-        "SELECT allow_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read previous overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .unwrap_or(0);
+    let (previous_allow, _) = override_masks(pool, team_id, target_user_id).await?;
 
     let actor_effective = crate::permissions::effective_permissions(pool, team_id, actor_id).await?;
     // A target's authority can come entirely from an allow override, so the actor
@@ -1391,20 +1400,11 @@ pub async fn set_member_permissions(
     axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<SetMemberPermissionsRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    use crate::permissions::RULE_SET_ERA_BITS;
     let (allow, deny) = if crate::routes::client_version::client_supports_rule_sets(&headers) {
         (body.allow, body.deny)
     } else {
-        let (pa, pd) = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
-        )
-        .bind(team_id)
-        .bind(target_user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to read overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
-        .unwrap_or((0, 0));
-        ((body.allow & !RULE_SET_ERA_BITS) | (pa & RULE_SET_ERA_BITS), (body.deny & !RULE_SET_ERA_BITS) | (pd & RULE_SET_ERA_BITS))
+        let (pa, pd) = override_masks(&pool, team_id, target_user_id).await?;
+        (crate::permissions::keep_era_bits(body.allow, pa), crate::permissions::keep_era_bits(body.deny, pd))
     };
 
     validate_override_masks(allow, deny)?;
@@ -1437,16 +1437,7 @@ pub async fn set_member_permissions(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let previous = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides \
-         WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read existing overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .unwrap_or((0, 0));
+    let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
 
     let role_union: i64 = sqlx::query_scalar(
         "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
