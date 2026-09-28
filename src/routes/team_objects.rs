@@ -517,13 +517,7 @@ pub async fn delete_object(
     require_rule_set_client(&pool, team_id, &headers).await?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
     let row = object_row(&pool, team_id, &object_id).await?.ok_or(StatusCode::NOT_FOUND)?;
-    if !authz.can(row.rule_set_id, PERM_VIEW) {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let permission = edit_permission_for_str(&row.object_type).ok_or(StatusCode::BAD_REQUEST)?;
-    if !authz.can(row.rule_set_id, permission) {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_edit_on(&authz, &[(row.object_type, row.rule_set_id)])?;
 
     sqlx::query(
         "UPDATE team_vault_objects SET deleted_at = now(), updated_at = now(), updated_by = $3 WHERE team_id = $1 AND object_id = $2",

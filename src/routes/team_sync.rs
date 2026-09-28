@@ -712,7 +712,10 @@ mod tests {
     use crate::auth::AuthUser;
     use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, assign_role, member_with_role, seed_role, seed_team, seed_user};
+    use crate::test_support::{
+        add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_rule_set, seed_team,
+        seed_user,
+    };
     use axum::extract::{Path, State};
     use axum::Extension;
 
@@ -1039,6 +1042,50 @@ mod tests {
         let kv: i32 = sqlx::query_scalar("SELECT key_version FROM team_sync_blobs WHERE team_id = $1")
             .bind(team).fetch_one(&pool).await.unwrap();
         assert_eq!(kv, 3);
+    }
+
+    #[tokio::test]
+    async fn put_team_blob_requires_admin_once_the_team_has_a_rule_set() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        seed_rule_set(&pool, team, owner, &[]).await;
+
+        let full_edit = crate::permissions::PERM_EDIT_CONNECTIONS | crate::permissions::PERM_EDIT_IDENTITIES
+            | crate::permissions::PERM_EDIT_KEYS | crate::permissions::PERM_EDIT_FOLDERS
+            | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS;
+
+        let editor = seed_user(&pool).await;
+        add_member(&pool, team, editor).await;
+        let role = seed_role(&pool, team, "blob-writer", full_edit).await;
+        assign_role(&pool, team, editor, role).await;
+
+        let admin = member_with_role(&pool, team, full_edit | crate::permissions::PERM_ADMINISTRATOR).await;
+
+        let body_b64 = base64::engine::general_purpose::STANDARD.encode(b"new-ciphertext");
+
+        let res = put_team_blob(
+            State(pool.clone()),
+            Extension(AuthUser(editor)),
+            Extension(SyncNotifier::new()),
+            rule_set_client_headers(),
+            Path(team),
+            Json(PutTeamBlobRequest { blob: body_b64.clone(), key_version: 4 }),
+        )
+        .await;
+        assert_eq!(res, Err(StatusCode::FORBIDDEN), "the old full-edit gate must not bypass the admin-only gate once a rule set exists");
+
+        let res = put_team_blob(
+            State(pool.clone()),
+            Extension(AuthUser(admin)),
+            Extension(SyncNotifier::new()),
+            rule_set_client_headers(),
+            Path(team),
+            Json(PutTeamBlobRequest { blob: body_b64, key_version: 4 }),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
     }
 
     /// I5: a pre-#217 client's body carries no `key_version` field at all.
