@@ -220,6 +220,18 @@ pub async fn rule_set_in_team(pool: &PgPool, team_id: Uuid, set_id: Uuid) -> Res
         .map_err(|e| db_error(e, "rule_set_in_team"))
 }
 
+pub async fn gc_rule_sets(conn: &mut sqlx::PgConnection, team_id: Uuid, candidates: &[Uuid]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM team_rule_sets s WHERE s.team_id = $1 AND s.id = ANY($2) \
+         AND NOT EXISTS (SELECT 1 FROM team_vault_objects o WHERE o.team_id = s.team_id AND o.rule_set_id = s.id)",
+    )
+    .bind(team_id)
+    .bind(candidates)
+    .execute(conn)
+    .await
+    .map(|_| ())
+}
+
 pub async fn team_has_rule_sets(pool: &PgPool, team_id: Uuid) -> Result<bool, StatusCode> {
     sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM team_rule_sets WHERE team_id = $1)")
         .bind(team_id)

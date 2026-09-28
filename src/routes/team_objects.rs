@@ -10,11 +10,14 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::object_authz::{live_rule_set_ids, record_member_client, require_rule_set_client, ObjectAuthz};
+use crate::object_authz::{
+    gc_rule_sets, live_rule_set_ids, object_row, record_member_client, require_rule_set_client,
+    rule_set_in_team, ObjectAuthz,
+};
 use crate::permissions::{
     require_all_team_permissions, require_team_member, PERM_CONNECT, PERM_EDIT_CONNECTIONS,
-    PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_EDIT_SNIPPETS, PERM_VIEW,
-    PERM_VIEW_SECRETS,
+    PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_EDIT_SNIPPETS, PERM_MANAGE_ROLES,
+    PERM_VIEW, PERM_VIEW_SECRETS,
 };
 use crate::routes::client_version::{require_client_version, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
@@ -82,6 +85,10 @@ fn edit_permission_for_str(object_type: &str) -> Option<i64> {
     }
 }
 
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<Uuid>>, D::Error> {
+    Option::<Uuid>::deserialize(d).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpsertTeamObjectRequest {
     pub object_id: String,
@@ -94,6 +101,8 @@ pub struct UpsertTeamObjectRequest {
     #[allow(dead_code)]
     pub folder_id: Option<String>,
     pub metadata: serde_json::Value,
+    #[serde(default, deserialize_with = "present")]
+    pub rule_set_id: Option<Option<Uuid>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,18 +216,44 @@ pub async fn upsert_object(
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
 
-    require_all_team_permissions(
-        &pool,
-        team_id,
-        auth.0,
-        &[body.object_type.edit_permission()],
-    )
-    .await?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
+    let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let existing = object_row(&pool, team_id, &body.object_id).await?;
+    let body_edit = body.object_type.edit_permission();
 
+    if let Some(Some(target)) = body.rule_set_id {
+        if !rule_set_in_team(&pool, team_id, target).await? {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    let current = existing.as_ref().and_then(|r| r.rule_set_id);
+    let target = body.rule_set_id.unwrap_or(current);
+
+    match &existing {
+        None if !authz.can(target, body_edit) => return Err(StatusCode::FORBIDDEN),
+        None => {}
+        Some(row) => {
+            if !authz.can(current, PERM_VIEW) {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            let stored_edit = edit_permission_for_str(&row.object_type).ok_or(StatusCode::BAD_REQUEST)?;
+            if !authz.can(current, stored_edit | body_edit) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            if target != current && !(authz.can(current, PERM_MANAGE_ROLES) && authz.can(target, PERM_MANAGE_ROLES)) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open object upsert transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     sqlx::query(
         r#"INSERT INTO team_vault_objects
-           (team_id, object_id, object_type, name, vault_id, folder_id, metadata, updated_by)
-           VALUES ($1, $2, $3, NULL, $1, NULL, $4, $5)
+           (team_id, object_id, object_type, name, vault_id, folder_id, metadata, updated_by, rule_set_id)
+           VALUES ($1, $2, $3, NULL, $1, NULL, $4, $5, $6)
            ON CONFLICT (team_id, object_id)
            DO UPDATE SET object_type = EXCLUDED.object_type,
                          name = NULL,
@@ -226,17 +261,29 @@ pub async fn upsert_object(
                          metadata = EXCLUDED.metadata,
                          deleted_at = NULL,
                          updated_at = now(),
-                         updated_by = EXCLUDED.updated_by"#,
+                         updated_by = EXCLUDED.updated_by,
+                         rule_set_id = EXCLUDED.rule_set_id"#,
     )
     .bind(team_id)
     .bind(&body.object_id)
     .bind(body.object_type.as_str())
     .bind(&body.metadata)
     .bind(auth.0)
-    .execute(&pool)
+    .bind(target)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, team_id = %team_id, object_id = %body.object_id, "Failed to upsert team vault object");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if let Some(old) = current.filter(|_| target != current) {
+        gc_rule_sets(&mut tx, team_id, &[old]).await.map_err(|e| {
+            error!(error = %e, team_id = %team_id, "Failed to collect rule sets");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit object upsert");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -458,21 +505,16 @@ pub async fn delete_object(
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
 
-    let object_type = sqlx::query_scalar::<_, String>(
-        "SELECT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
-    )
-    .bind(team_id)
-    .bind(&object_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, object_id = %object_id, "Failed to fetch team vault object");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    let permission = edit_permission_for_str(&object_type).ok_or(StatusCode::BAD_REQUEST)?;
-    require_all_team_permissions(&pool, team_id, auth.0, &[permission]).await?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
+    let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let row = object_row(&pool, team_id, &object_id).await?.ok_or(StatusCode::NOT_FOUND)?;
+    if !authz.can(row.rule_set_id, PERM_VIEW) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let permission = edit_permission_for_str(&row.object_type).ok_or(StatusCode::BAD_REQUEST)?;
+    if !authz.can(row.rule_set_id, permission) {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     sqlx::query(
         "UPDATE team_vault_objects SET deleted_at = now(), updated_at = now(), updated_by = $3 WHERE team_id = $1 AND object_id = $2",
@@ -789,6 +831,7 @@ mod authz_tests {
                 name: Some("box".to_string()),
                 folder_id: None,
                 metadata: serde_json::json!({}),
+                rule_set_id: None,
             }),
         )
         .await;
@@ -816,6 +859,7 @@ mod authz_tests {
                 name: Some("box".to_string()),
                 folder_id: None,
                 metadata: serde_json::json!({}),
+                rule_set_id: None,
             }),
         )
         .await;
@@ -843,6 +887,7 @@ mod authz_tests {
                 name: Some("prod-db-master".to_string()),
                 folder_id: Some("folder-7".to_string()),
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
+                rule_set_id: None,
             }),
         )
         .await
@@ -946,6 +991,7 @@ mod authz_tests {
                 name: Some("box".to_string()),
                 folder_id: None,
                 metadata: serde_json::json!({}),
+                rule_set_id: None,
             }),
         )
         .await
@@ -1485,6 +1531,7 @@ mod authz_tests {
                 name: None,
                 folder_id: None,
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
+                rule_set_id: None,
             }),
         )
         .await
@@ -1650,6 +1697,7 @@ mod authz_tests {
                 name: None,
                 folder_id: None,
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
+                rule_set_id: None,
             }),
         )
         .await;
@@ -1681,6 +1729,7 @@ mod authz_tests {
                 name: None,
                 folder_id: None,
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
+                rule_set_id: None,
             }),
         )
         .await;
@@ -1922,5 +1971,168 @@ mod authz_tests {
         .await;
 
         assert_eq!(res, Err(StatusCode::FORBIDDEN));
+    }
+
+    // ── rule_set_id pointer semantics ─────────────────────────────────────
+
+    fn object_body(object_id: &str, rule_set_id: Option<Option<Uuid>>) -> UpsertTeamObjectRequest {
+        UpsertTeamObjectRequest {
+            object_id: object_id.to_string(),
+            object_type: TeamObjectType::Connection,
+            name: None,
+            folder_id: None,
+            metadata: serde_json::json!({ "v": 2 }),
+            rule_set_id,
+        }
+    }
+
+    async fn upsert_as(pool: &PgPool, team: Uuid, user: Uuid, headers: axum::http::HeaderMap, body: UpsertTeamObjectRequest) -> Result<StatusCode, StatusCode> {
+        upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            headers,
+            Path(team),
+            Json(body),
+        )
+        .await
+    }
+
+    async fn stored_pointer(pool: &PgPool, team: Uuid, object_id: &str) -> Option<Uuid> {
+        sqlx::query_scalar("SELECT rule_set_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2")
+            .bind(team)
+            .bind(object_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn rule_set_id_distinguishes_absent_from_null() {
+        let absent: UpsertTeamObjectRequest = serde_json::from_str(
+            r#"{"object_id":"o","object_type":"connection","metadata":{}}"#,
+        ).unwrap();
+        let null: UpsertTeamObjectRequest = serde_json::from_str(
+            r#"{"object_id":"o","object_type":"connection","metadata":{},"rule_set_id":null}"#,
+        ).unwrap();
+        assert_eq!(absent.rule_set_id, None);
+        assert_eq!(null.rule_set_id, Some(None));
+    }
+
+    #[tokio::test]
+    async fn editing_a_hidden_object_answers_404() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        let res = upsert_as(&pool, f.team, f.blocked, rule_set_client_headers(), object_body(&f.object_id, None)).await;
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_hidden_object_answers_404() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        let res = delete_object(
+            State(pool.clone()),
+            Extension(AuthUser(f.blocked)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path((f.team, f.object_id.clone())),
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_viewer_and_the_admin_can_edit_it_and_the_pointer_is_kept() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), object_body(&f.object_id, None)).await.unwrap();
+        upsert_as(&pool, f.team, f.admin, rule_set_client_headers(), object_body(&f.object_id, None)).await.unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, &f.object_id).await, Some(f.rule_set));
+    }
+
+    #[tokio::test]
+    async fn an_old_client_save_keeps_the_pointer_in_a_team_without_rule_sets_and_is_426_with_one() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        upsert_as(&pool, team, editor, axum::http::HeaderMap::new(), object_body("o-1", None)).await.unwrap();
+        assert_eq!(stored_pointer(&pool, team, "o-1").await, None);
+
+        let set = seed_rule_set(&pool, team, owner, &[]).await;
+        crate::test_support::point_object(&pool, team, "o-1", Some(set)).await;
+        let res = upsert_as(&pool, team, editor, axum::http::HeaderMap::new(), object_body("o-1", None)).await;
+        assert_eq!(res.unwrap_err(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(stored_pointer(&pool, team, "o-1").await, Some(set));
+    }
+
+    #[tokio::test]
+    async fn creating_inside_a_restricted_set_needs_edit_through_that_set() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let locked = seed_rule_set(&pool, team, owner, &[("everyone", None, 0, PERM_EDIT_CONNECTIONS)]).await;
+        let open = seed_rule_set(&pool, team, owner, &[]).await;
+
+        let denied = upsert_as(&pool, team, editor, rule_set_client_headers(), object_body("new-1", Some(Some(locked)))).await;
+        assert_eq!(denied.unwrap_err(), StatusCode::FORBIDDEN);
+        upsert_as(&pool, team, editor, rule_set_client_headers(), object_body("new-2", Some(Some(open)))).await.unwrap();
+        assert_eq!(stored_pointer(&pool, team, "new-2").await, Some(open));
+    }
+
+    #[tokio::test]
+    async fn creating_with_an_unknown_rule_set_is_400() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let res = upsert_as(&pool, team, editor, rule_set_client_headers(), object_body("new-3", Some(Some(Uuid::new_v4())))).await;
+        assert_eq!(res.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn repointing_needs_manage_on_both_sets_and_collects_the_orphan() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let manager = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS | crate::permissions::PERM_MANAGE_ROLES).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "o-2", "connection").await;
+        let old = seed_rule_set(&pool, team, owner, &[]).await;
+        let new = seed_rule_set(&pool, team, owner, &[]).await;
+        crate::test_support::point_object(&pool, team, "o-2", Some(old)).await;
+
+        let denied = upsert_as(&pool, team, editor, rule_set_client_headers(), object_body("o-2", Some(Some(new)))).await;
+        assert_eq!(denied.unwrap_err(), StatusCode::FORBIDDEN);
+
+        upsert_as(&pool, team, manager, rule_set_client_headers(), object_body("o-2", Some(Some(new)))).await.unwrap();
+        assert_eq!(stored_pointer(&pool, team, "o-2").await, Some(new));
+        let old_left: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM team_rule_sets WHERE id = $1)")
+            .bind(old).fetch_one(&pool).await.unwrap();
+        assert!(!old_left, "the set nobody points at any more is collected");
+    }
+
+    #[tokio::test]
+    async fn a_soft_deleted_restricted_object_is_restored_still_restricted() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        delete_object(
+            State(pool.clone()),
+            Extension(AuthUser(f.viewer)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path((f.team, f.object_id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, &f.object_id).await, Some(f.rule_set));
+
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), object_body(&f.object_id, None)).await.unwrap();
+        assert!(!listed_ids(&pool, f.team, f.blocked).await.contains(&f.object_id));
     }
 }
