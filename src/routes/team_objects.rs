@@ -623,12 +623,31 @@ pub async fn upsert_secret(
     require_rule_set_client(&pool, team_id, &headers).await?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
 
-    let (object_type, rule_set_id) = sqlx::query_as::<_, (String, Option<Uuid>)>(
-        "SELECT object_type, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2 AND deleted_at IS NULL",
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open secret upsert transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Locked here (not just the target below) so a concurrent write cannot
+    // repoint this secret out from under the owner check just below.
+    let existing = sqlx::query_as::<_, (String, String)>(
+        "SELECT object_id, secret_type FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2 FOR UPDATE",
+    )
+    .bind(team_id)
+    .bind(&body.secret_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, secret_id = %body.secret_id, "Failed to lock existing team vault secret");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let target = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "SELECT object_type, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2 AND deleted_at IS NULL FOR SHARE",
     )
     .bind(team_id)
     .bind(&body.object_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, team_id = %team_id, object_id = %body.object_id, "Failed to fetch object for secret write");
@@ -636,7 +655,39 @@ pub async fn upsert_secret(
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    require_edit_on(&authz, &[(object_type, rule_set_id)])?;
+    // The request names the object it wants to attach the secret to, but a
+    // pre-existing secret_id may currently belong to a different object —
+    // that owner must be authorized too, or a caller with edit on some
+    // visible object could repoint and overwrite a hidden object's secret.
+    let mut rows = vec![target];
+    let mut orphan_permission = None;
+    if let Some((owner_id, secret_type)) = existing.filter(|(owner_id, _)| owner_id != &body.object_id) {
+        let owner = sqlx::query_as::<_, (String, Option<Uuid>)>(
+            "SELECT object_type, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2 FOR SHARE",
+        )
+        .bind(team_id)
+        .bind(&owner_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, object_id = %owner_id, "Failed to fetch the secret's current owner object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        match owner {
+            Some(row) => rows.push(row),
+            None => {
+                orphan_permission =
+                    Some(edit_permission_for_secret_type(&secret_type).ok_or(StatusCode::BAD_REQUEST)?);
+            }
+        }
+    }
+
+    require_edit_on(&authz, &rows)?;
+    if let Some(permission) = orphan_permission {
+        if !authz.can(None, permission) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     sqlx::query(
         r#"INSERT INTO team_vault_secrets
@@ -657,10 +708,15 @@ pub async fn upsert_secret(
     .bind(&body.ciphertext)
     .bind(auth.0)
     .bind(body.key_version)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, team_id = %team_id, secret_id = %body.secret_id, "Failed to upsert team vault secret");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit secret upsert");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -2247,6 +2303,88 @@ mod authz_tests {
         assert_eq!(secret_upsert_as(&pool, f.team, f.blocked, &f.object_id).await.unwrap_err(), StatusCode::NOT_FOUND);
         assert!(secret_upsert_as(&pool, f.team, f.viewer, &f.object_id).await.is_ok());
         assert!(secret_upsert_as(&pool, f.team, f.admin, &f.object_id).await.is_ok());
+    }
+
+    /// C1: a caller with edit on a visible object must not be able to
+    /// repoint a *different, hidden* object's secret onto it — the ON
+    /// CONFLICT update would rewrite the hidden secret's ciphertext and
+    /// object_id, having only ever authorized the visible one.
+    #[tokio::test]
+    async fn upsert_secret_cannot_repoint_a_hidden_owner_to_a_visible_object() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        crate::test_support::seed_team_object(&pool, f.team, f.owner, "visible", "connection").await;
+        seed_secret_row(&pool, f.team, f.owner, &f.object_id).await;
+        let secret_id = format!("password:{}", f.object_id);
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(f.blocked)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path(f.team),
+            Json(UpsertSecretRequest {
+                secret_id: secret_id.clone(),
+                object_id: "visible".to_string(),
+                secret_type: "connection_password".to_string(),
+                ciphertext: "attacker-cipher".to_string(),
+                key_version: 1,
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+
+        let (object_id, ciphertext): (String, String) = sqlx::query_as(
+            "SELECT object_id, ciphertext FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
+        )
+        .bind(f.team)
+        .bind(&secret_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(object_id, f.object_id, "the hidden secret must not be repointed");
+        assert_eq!(ciphertext, "c", "the hidden secret's ciphertext must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_moves_between_two_objects_the_caller_may_edit() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        crate::test_support::seed_team_object(&pool, f.team, f.owner, "visible", "connection").await;
+        seed_secret_row(&pool, f.team, f.owner, &f.object_id).await;
+        let secret_id = format!("password:{}", f.object_id);
+
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(f.viewer)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path(f.team),
+            Json(UpsertSecretRequest {
+                secret_id: secret_id.clone(),
+                object_id: "visible".to_string(),
+                secret_type: "connection_password".to_string(),
+                ciphertext: "moved-cipher".to_string(),
+                key_version: 1,
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+
+        let (object_id, ciphertext): (String, String) = sqlx::query_as(
+            "SELECT object_id, ciphertext FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2",
+        )
+        .bind(f.team)
+        .bind(&secret_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(object_id, "visible", "the viewer may edit both objects, so the move must land");
+        assert_eq!(ciphertext, "moved-cipher");
     }
 
     #[tokio::test]
