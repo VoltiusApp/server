@@ -232,6 +232,16 @@ pub async fn gc_rule_sets(conn: &mut sqlx::PgConnection, team_id: Uuid, candidat
     .map(|_| ())
 }
 
+pub async fn sweep_unattached_rule_sets(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM team_rule_sets s WHERE s.updated_at < now() - interval '1 day' \
+         AND NOT EXISTS (SELECT 1 FROM team_vault_objects o WHERE o.team_id = s.team_id AND o.rule_set_id = s.id)",
+    )
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+}
+
 pub async fn team_has_rule_sets(pool: &PgPool, team_id: Uuid) -> Result<bool, StatusCode> {
     sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM team_rule_sets WHERE team_id = $1)")
         .bind(team_id)
