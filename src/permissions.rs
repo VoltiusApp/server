@@ -113,22 +113,15 @@ pub async fn has_team_permission(
 }
 
 /// How a set of permission bits is matched against a member's effective bits.
-///
-/// Most routes name one capability and want `All`. A route several distinct
-/// roles legitimately reach — the team vault key, which a connect-only member
-/// needs to *use* a stored credential and a secrets viewer to *read* it — wants
-/// `Any` (issue #190).
 #[derive(Clone, Copy)]
 pub enum PermCheck<'a> {
     All(&'a [i64]),
-    Any(&'a [i64]),
 }
 
 impl PermCheck<'_> {
     fn satisfied_by(self, effective: i64) -> bool {
         match self {
             PermCheck::All(bits) => bits.iter().all(|p| (effective & *p) != 0),
-            PermCheck::Any(bits) => bits.iter().any(|p| (effective & *p) != 0),
         }
     }
 }
