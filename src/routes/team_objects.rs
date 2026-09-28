@@ -62,15 +62,34 @@ impl TeamObjectType {
 /// time the secret is withdrawn. Agrees with `edit_permission_for_str` for every
 /// object that can carry secrets.
 fn edit_permission_for_secret_type(secret_type: &str) -> Option<i64> {
+    secret_owner_type(secret_type).and_then(edit_permission_for_str)
+}
+
+fn secret_owner_type(secret_type: &str) -> Option<&'static str> {
     match secret_type {
         "connection_password"
         | "connection_key"
         | "connection_passphrase"
-        | "connection_proxy_password" => Some(PERM_EDIT_CONNECTIONS),
-        "identity_password" => Some(PERM_EDIT_IDENTITIES),
-        "key_private" | "key_public" | "key_passphrase" => Some(PERM_EDIT_KEYS),
+        | "connection_proxy_password" => Some("connection"),
+        "identity_password" => Some("identity"),
+        "key_private" | "key_public" | "key_passphrase" => Some("key"),
         _ => None,
     }
+}
+
+/// Must match `localSecretKeyFromTeamSecret` in the client's `teamVaultSecretKeys.ts`.
+fn canonical_secret_id(object_id: &str, secret_type: &str) -> Option<String> {
+    Some(match secret_type {
+        "connection_password" => format!("password:{object_id}"),
+        "connection_key" => format!("key:{object_id}"),
+        "connection_passphrase" => format!("passphrase:{object_id}"),
+        "connection_proxy_password" => format!("proxy_password:{object_id}"),
+        "identity_password" => format!("identity:{object_id}:password"),
+        "key_private" => format!("key:{object_id}:private"),
+        "key_public" => format!("key:{object_id}:public"),
+        "key_passphrase" => format!("key:{object_id}:passphrase"),
+        _ => return None,
+    })
 }
 
 fn edit_permission_for_str(object_type: &str) -> Option<i64> {
@@ -615,6 +634,9 @@ pub async fn upsert_secret(
     require_client_version(&min_client_version, &headers)?;
     require_rule_set_client(&pool, team_id, &headers).await?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    if canonical_secret_id(&body.object_id, &body.secret_type).as_deref() != Some(body.secret_id.as_str()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to open secret upsert transaction");
@@ -649,6 +671,7 @@ pub async fn upsert_secret(
     .ok_or(StatusCode::NOT_FOUND)?;
 
     let had_existing = existing.is_some();
+    let target_matches_type = secret_owner_type(&body.secret_type) == Some(target.0.as_str());
 
     // A pre-existing secret may belong to a different object than the one
     // named in the request; that owner must be authorized too.
@@ -680,6 +703,9 @@ pub async fn upsert_secret(
         if !authz.can(None, permission) {
             return Err(StatusCode::FORBIDDEN);
         }
+    }
+    if !target_matches_type {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let query = if had_existing {
@@ -1078,12 +1104,95 @@ mod authz_tests {
 
     fn secret_body(object_id: &str) -> UpsertSecretRequest {
         UpsertSecretRequest {
-            secret_id: format!("sec-{}", Uuid::new_v4()),
+            secret_id: format!("password:{object_id}"),
             object_id: object_id.to_string(),
             secret_type: "connection_password".to_string(),
             ciphertext: "cipher".to_string(),
             key_version: 1,
         }
+    }
+
+    async fn upsert_secret_body(pool: &PgPool, team: Uuid, user: Uuid, body: UpsertSecretRequest) -> Result<StatusCode, StatusCode> {
+        upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path(team),
+            Json(body),
+        )
+        .await
+    }
+
+    #[test]
+    fn canonical_secret_ids_match_the_client_key_names() {
+        let cases = [
+            ("connection_password", "password:o"),
+            ("connection_key", "key:o"),
+            ("connection_passphrase", "passphrase:o"),
+            ("connection_proxy_password", "proxy_password:o"),
+            ("identity_password", "identity:o:password"),
+            ("key_private", "key:o:private"),
+            ("key_public", "key:o:public"),
+            ("key_passphrase", "key:o:passphrase"),
+        ];
+        for (secret_type, id) in cases {
+            assert_eq!(canonical_secret_id("o", secret_type).as_deref(), Some(id));
+            assert!(secret_owner_type(secret_type).is_some());
+        }
+        assert_eq!(canonical_secret_id("o", "bogus"), None);
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_rejects_a_secret_id_that_does_not_belong_to_the_object() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        for secret_id in ["sec-free-form".to_string(), "password:someone-else".to_string(), format!("key:{object_id}")] {
+            let mut body = secret_body(&object_id);
+            body.secret_id = secret_id.clone();
+            assert_eq!(
+                upsert_secret_body(&pool, team, caller, body).await.unwrap_err(),
+                StatusCode::BAD_REQUEST,
+                "{secret_id}"
+            );
+        }
+        assert!(!secret_exists(&pool, team, "password:someone-else").await);
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_rejects_a_secret_type_foreign_to_the_object() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS | PERM_EDIT_KEYS).await;
+        let body = UpsertSecretRequest {
+            secret_id: format!("key:{object_id}:private"),
+            object_id: object_id.clone(),
+            secret_type: "key_private".to_string(),
+            ciphertext: "cipher".to_string(),
+            key_version: 1,
+        };
+
+        assert_eq!(upsert_secret_body(&pool, team, caller, body).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert!(!secret_exists(&pool, team, &format!("key:{object_id}:private")).await);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_member_cannot_squat_a_hidden_objects_secret_id() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        crate::test_support::seed_team_object(&pool, f.team, f.owner, "visible", "connection").await;
+        let mut body = secret_body("visible");
+        body.secret_id = format!("password:{}", f.object_id);
+
+        assert_eq!(upsert_secret_body(&pool, f.team, f.blocked, body).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert!(!secret_exists(&pool, f.team, &format!("password:{}", f.object_id)).await);
     }
 
     #[tokio::test]
@@ -2305,13 +2414,28 @@ mod authz_tests {
         assert!(secret_upsert_as(&pool, f.team, f.admin, &f.object_id).await.is_ok());
     }
 
+    async fn seed_row_owned_by_another_object(pool: &PgPool, f: &crate::test_support::HiddenObjectFixture, named_for: &str) -> String {
+        let secret_id = format!("password:{named_for}");
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by)
+             VALUES ($1, $2, $3, 'connection_password', 'c', $4)",
+        )
+        .bind(f.team)
+        .bind(&secret_id)
+        .bind(&f.object_id)
+        .bind(f.owner)
+        .execute(pool)
+        .await
+        .unwrap();
+        secret_id
+    }
+
     #[tokio::test]
     async fn upsert_secret_cannot_repoint_a_hidden_owner_to_a_visible_object() {
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
         crate::test_support::seed_team_object(&pool, f.team, f.owner, "visible", "connection").await;
-        seed_secret_row(&pool, f.team, f.owner, &f.object_id).await;
-        let secret_id = format!("password:{}", f.object_id);
+        let secret_id = seed_row_owned_by_another_object(&pool, &f, "visible").await;
 
         let res = upsert_secret(
             State(pool.clone()),
@@ -2349,8 +2473,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
         crate::test_support::seed_team_object(&pool, f.team, f.owner, "visible", "connection").await;
-        seed_secret_row(&pool, f.team, f.owner, &f.object_id).await;
-        let secret_id = format!("password:{}", f.object_id);
+        let secret_id = seed_row_owned_by_another_object(&pool, &f, "visible").await;
 
         let res = upsert_secret(
             State(pool.clone()),
