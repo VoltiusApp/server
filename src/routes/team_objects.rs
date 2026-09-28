@@ -10,11 +10,11 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::object_authz::{record_member_client, require_rule_set_client, ObjectAuthz};
+use crate::object_authz::{live_rule_set_ids, record_member_client, require_rule_set_client, ObjectAuthz};
 use crate::permissions::{
-    require_all_team_permissions, require_team_member, require_team_permissions, PermCheck,
-    PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
-    PERM_EDIT_SNIPPETS, PERM_VIEW, PERM_VIEW_SECRETS,
+    require_all_team_permissions, require_team_member, PERM_CONNECT, PERM_EDIT_CONNECTIONS,
+    PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS, PERM_EDIT_SNIPPETS, PERM_VIEW,
+    PERM_VIEW_SECRETS,
 };
 use crate::routes::client_version::{require_client_version, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
@@ -519,24 +519,22 @@ pub async fn delete_object(
 pub async fn list_secrets(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<TeamSecretResponse>>, StatusCode> {
-    // Ciphertext only, and useless without the vault key, which is gated the
-    // same way. A connect-only member fetches these to *use* a credential;
-    // VIEW_SECRETS is what lets a member read one back (issue #190).
-    require_team_permissions(
-        &pool,
-        team_id,
-        auth.0,
-        PermCheck::Any(&[PERM_CONNECT, PERM_VIEW_SECRETS]),
-    )
-    .await?;
+    let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
+    const USE_OR_READ: i64 = PERM_CONNECT | PERM_VIEW_SECRETS;
+    if !authz.grants_anywhere(&live_rule_set_ids(&pool, team_id).await?, USE_OR_READ) {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
-    let rows = sqlx::query_as::<_, (String, String, String, String, i32, DateTime<Utc>)>(
-        r#"SELECT secret_id, object_id, secret_type, ciphertext, key_version, updated_at
-           FROM team_vault_secrets
-           WHERE team_id = $1
-           ORDER BY updated_at ASC"#,
+    let rows = sqlx::query_as::<_, (String, String, String, String, i32, DateTime<Utc>, Option<Uuid>)>(
+        r#"SELECT s.secret_id, s.object_id, s.secret_type, s.ciphertext, s.key_version, s.updated_at, o.rule_set_id
+           FROM team_vault_secrets s
+           LEFT JOIN team_vault_objects o ON o.team_id = s.team_id AND o.object_id = s.object_id
+           WHERE s.team_id = $1
+           ORDER BY s.updated_at ASC"#,
     )
     .bind(team_id)
     .fetch_all(&pool)
@@ -548,6 +546,7 @@ pub async fn list_secrets(
 
     Ok(Json(
         rows.into_iter()
+            .filter(|row| authz.can_any(row.6, USE_OR_READ))
             .map(|row| TeamSecretResponse {
                 secret_id: row.0,
                 object_id: row.1,
@@ -869,9 +868,62 @@ mod authz_tests {
         let team = seed_team(&pool, owner).await;
         let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await; // no VIEW_SECRETS
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team)).await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    async fn listed_secret_objects(pool: &PgPool, team: Uuid, user: Uuid) -> Result<Vec<String>, axum::http::StatusCode> {
+        list_secrets(State(pool.clone()), Extension(AuthUser(user)), rule_set_client_headers(), Path(team))
+            .await
+            .map(|r| r.0.into_iter().map(|s| s.object_id).collect())
+    }
+
+    async fn seed_secret_row(pool: &PgPool, team: Uuid, owner: Uuid, object_id: &str) {
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by)
+             VALUES ($1, $2, $3, 'connection_password', 'c', $4)",
+        )
+        .bind(team)
+        .bind(format!("password:{object_id}"))
+        .bind(object_id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_secrets_omits_secrets_of_a_hidden_object() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        seed_secret_row(&pool, f.team, f.owner, &f.object_id).await;
+        assert!(!listed_secret_objects(&pool, f.team, f.blocked).await.unwrap().contains(&f.object_id));
+    }
+
+    #[tokio::test]
+    async fn list_secrets_serves_them_to_the_viewer_and_the_admin() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        seed_secret_row(&pool, f.team, f.owner, &f.object_id).await;
+        assert!(listed_secret_objects(&pool, f.team, f.viewer).await.unwrap().contains(&f.object_id));
+        assert!(listed_secret_objects(&pool, f.team, f.admin).await.unwrap().contains(&f.object_id));
+    }
+
+    #[tokio::test]
+    async fn list_secrets_serves_a_junior_the_one_host_granted_to_them() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let junior = member_with_role(&pool, team, 0).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "granted", "connection").await;
+        crate::test_support::seed_team_object(&pool, team, owner, "other", "connection").await;
+        seed_secret_row(&pool, team, owner, "granted").await;
+        seed_secret_row(&pool, team, owner, "other").await;
+        let set = seed_rule_set(&pool, team, owner, &[("member", Some(junior), PERM_CONNECT, 0)]).await;
+        crate::test_support::point_object(&pool, team, "granted", Some(set)).await;
+
+        assert_eq!(listed_secret_objects(&pool, team, junior).await.unwrap(), vec!["granted".to_string()]);
     }
 
     // ── upsert_secret gates on the *object's* edit permission, not VIEW_SECRETS ──
@@ -1219,7 +1271,7 @@ mod authz_tests {
         // it left the role unable to connect to any host with a stored secret.
         let caller = member_with_role(&pool, team, PERM_CONNECT).await;
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team))
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team))
             .await
             .expect("list secrets ok")
             .0;
@@ -1252,7 +1304,7 @@ mod authz_tests {
         )
         .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed epoch-3 secret");
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team))
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team))
             .await
             .expect("list secrets ok")
             .0;
@@ -1271,7 +1323,7 @@ mod authz_tests {
         // Edit rights on snippets grant neither bit.
         let caller = member_with_role(&pool, team, PERM_EDIT_SNIPPETS).await;
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), Path(team)).await;
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team)).await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
