@@ -200,7 +200,7 @@ pub async fn list_objects(
         rows.into_iter()
             .filter_map(|row| {
                 let my_permissions = authz.mask(row.8);
-                (my_permissions & PERM_VIEW != 0).then(|| TeamObjectResponse {
+                (my_permissions & PERM_VIEW != 0).then_some(TeamObjectResponse {
                     object_id: row.0,
                     object_type: row.1,
                     name: row.2,
