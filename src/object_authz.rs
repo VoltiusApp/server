@@ -200,6 +200,59 @@ pub async fn object_row(pool: &PgPool, team_id: Uuid, object_id: &str) -> Result
     .map_err(|e| db_error(e, "object_row"))
 }
 
+pub async fn connection_viewers(pool: &PgPool, connection_id: &str, exclude: Uuid) -> Result<Vec<Uuid>, StatusCode> {
+    let owners = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        "SELECT team_id, rule_set_id FROM team_vault_objects \
+         WHERE object_id = $1 AND object_type = 'connection' AND deleted_at IS NULL",
+    )
+    .bind(connection_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_error(e, "connection owners"))?;
+    let mut viewers = Vec::new();
+    for (team_id, set) in owners {
+        let entries = rule_entries(pool, team_id, set.as_ref().map(std::slice::from_ref)).await?;
+        let enforced = team_has_rule_sets(pool, team_id).await?;
+        for member in member_contexts(pool, team_id, None).await? {
+            let user_id = member.user_id;
+            if user_id != exclude && ObjectAuthz::for_member(member, entries.clone(), enforced).can(set, PERM_VIEW) {
+                viewers.push(user_id);
+            }
+        }
+    }
+    viewers.sort();
+    viewers.dedup();
+    Ok(viewers)
+}
+
+pub async fn visible_connection_ids(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+        "SELECT tvo.team_id, tvo.object_id, tvo.rule_set_id FROM team_vault_objects tvo \
+         JOIN team_members tm ON tm.team_id = tvo.team_id \
+         WHERE tm.user_id = $1 AND tvo.object_type = 'connection' AND tvo.deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_error(e, "visible connections"))?;
+    let mut authz: HashMap<Uuid, Option<ObjectAuthz>> = HashMap::new();
+    let mut visible = Vec::new();
+    for (team_id, object_id, set) in rows {
+        let entry = match authz.entry(team_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(ObjectAuthz::load(pool, team_id, user_id).await?)
+            }
+        };
+        if entry.as_ref().is_some_and(|a| a.can(set, PERM_VIEW)) {
+            visible.push(object_id);
+        }
+    }
+    visible.sort();
+    visible.dedup();
+    Ok(visible)
+}
+
 pub async fn hidden_object_ids(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
     let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
     let rows = sqlx::query_as::<_, (String, Option<Uuid>)>(
@@ -452,6 +505,16 @@ mod tests {
             Err(axum::http::StatusCode::UPGRADE_REQUIRED)
         );
         assert!(require_rule_set_client(&pool, team, &rule_set_client_headers()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connection_viewers_excludes_blocked_members_and_the_excluded_user() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        let viewers = connection_viewers(&pool, &f.object_id, f.viewer).await.unwrap();
+        assert!(viewers.contains(&f.admin));
+        assert!(!viewers.contains(&f.blocked));
+        assert!(!viewers.contains(&f.viewer));
     }
 
     #[tokio::test]

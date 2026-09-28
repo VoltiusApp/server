@@ -28,22 +28,7 @@ pub async fn get_connection_usage(
     Extension(auth): Extension<AuthUser>,
     Extension(usage_map): Extension<UsageMap>,
 ) -> Result<Json<Vec<ConnectionUsageEntry>>, StatusCode> {
-    // Connections the caller can see (their own teams' team-vault connections).
-    let accessible: Vec<String> = sqlx::query_scalar(
-        r#"SELECT DISTINCT tvo.object_id
-           FROM team_vault_objects tvo
-           JOIN team_members tm ON tm.team_id = tvo.team_id
-           WHERE tm.user_id = $1
-             AND tvo.object_type = 'connection'
-             AND tvo.deleted_at IS NULL"#,
-    )
-    .bind(auth.0)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to list accessible connections for presence snapshot");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let accessible = crate::object_authz::visible_connection_ids(&pool, auth.0).await?;
 
     if accessible.is_empty() {
         return Ok(Json(Vec::new()));
@@ -143,6 +128,11 @@ pub async fn post_connection_usage(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let viewers = crate::object_authz::connection_viewers(&pool, &body.connection_id, Uuid::nil()).await?;
+    if !viewers.contains(&auth.0) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     // Mutate the in-memory map. If the resulting set is empty, drop the entry.
     if body.in_use {
         usage_map
@@ -160,26 +150,8 @@ pub async fn post_connection_usage(
         }
     }
 
-    // Fan out to teammates that share at least one owning team (and aren't the caller).
-    let recipients: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT user_id FROM team_members WHERE team_id = ANY($1) AND user_id != $2",
-    )
-    .bind(&owning_teams)
-    .bind(auth.0)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to list usage fan-out recipients");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    for recipient in recipients {
-        notifier.notify_connection_usage_changed(
-            recipient,
-            auth.0,
-            body.connection_id.clone(),
-            body.in_use,
-        );
+    for recipient in viewers.into_iter().filter(|u| *u != auth.0) {
+        notifier.notify_connection_usage_changed(recipient, auth.0, body.connection_id.clone(), body.in_use);
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -281,6 +253,45 @@ mod authz_tests {
         ).await.unwrap().0;
 
         assert!(res.is_empty());
+    }
+
+    async fn announce(pool: &sqlx::PgPool, usage: &UsageMap, user: Uuid, connection_id: &str) -> Result<StatusCode, StatusCode> {
+        post_connection_usage(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(usage.clone()),
+            Extension(SyncNotifier::new()),
+            Json(ConnectionUsageRequest { connection_id: connection_id.into(), in_use: true }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn post_usage_on_a_hidden_connection_answers_404() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", crate::permissions::PERM_CONNECT).await;
+        let usage = empty_usage();
+        assert_eq!(announce(&pool, &usage, f.blocked, &f.object_id).await.unwrap_err(), StatusCode::NOT_FOUND);
+        assert_eq!(announce(&pool, &usage, f.viewer, &f.object_id).await.unwrap(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_omits_a_hidden_connection() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", crate::permissions::PERM_CONNECT).await;
+        let usage = empty_usage();
+        announce(&pool, &usage, f.viewer, &f.object_id).await.unwrap();
+        let snapshot = |user: Uuid| {
+            let (pool, usage) = (pool.clone(), usage.clone());
+            async move {
+                get_connection_usage(State(pool), Extension(AuthUser(user)), Extension(usage)).await.unwrap().0
+            }
+        };
+
+        assert!(snapshot(f.blocked).await.iter().all(|e| e.connection_id != f.object_id));
+        let for_admin = snapshot(f.admin).await;
+        let entry = for_admin.iter().find(|e| e.connection_id == f.object_id).expect("admin sees it");
+        assert_eq!(entry.user_ids, vec![f.viewer]);
     }
 
     #[tokio::test]
