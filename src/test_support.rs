@@ -373,3 +373,46 @@ pub async fn seed_team_object(
     .await
     .expect("seed team object");
 }
+
+/// Insert a rule set for `team` with `(subject_type, subject_id, allow, deny)` entries.
+pub async fn seed_rule_set(
+    pool: &PgPool,
+    team: Uuid,
+    author: Uuid,
+    entries: &[(&str, Option<Uuid>, i64, i64)],
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO team_rule_sets (team_id, updated_by) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(team)
+    .bind(author)
+    .fetch_one(pool)
+    .await
+    .expect("seed rule set");
+    for (subject_type, subject_id, allow, deny) in entries {
+        sqlx::query(
+            "INSERT INTO team_rule_set_entries (rule_set_id, subject_type, subject_id, allow_mask, deny_mask)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(*subject_type)
+        .bind(*subject_id)
+        .bind(*allow)
+        .bind(*deny)
+        .execute(pool)
+        .await
+        .expect("seed rule entry");
+    }
+    id
+}
+
+/// Point an existing team object at `set` (or back at team-wide permissions with `None`).
+pub async fn point_object(pool: &PgPool, team: Uuid, object_id: &str, set: Option<Uuid>) {
+    sqlx::query("UPDATE team_vault_objects SET rule_set_id = $3 WHERE team_id = $1 AND object_id = $2")
+        .bind(team)
+        .bind(object_id)
+        .bind(set)
+        .execute(pool)
+        .await
+        .expect("point object");
+}

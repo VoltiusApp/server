@@ -2666,6 +2666,29 @@ mod authz_tests {
             Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
         }
     }
+
+    #[tokio::test]
+    async fn delete_team_succeeds_with_rule_sets_and_pointed_objects() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = crate::test_support::seed_team_with_roles(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "o-1", "connection").await;
+        let set = crate::test_support::seed_rule_set(
+            &pool, team, owner, &[("everyone", None, 0, crate::permissions::PERM_VIEW)],
+        )
+        .await;
+        crate::test_support::point_object(&pool, team, "o-1", Some(set)).await;
+
+        let res = delete_team(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Path(team)).await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_sets WHERE team_id = $1")
+            .bind(team)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
 }
 
 #[cfg(test)]

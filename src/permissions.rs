@@ -532,6 +532,86 @@ mod db_tests {
             "an allow override must grant on the multi-team path"
         );
     }
+
+    #[tokio::test]
+    async fn migration_045_backfills_view_and_owner_administrator_and_creates_no_rule_sets() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let admin = PgPool::connect(&url).await.expect("connect admin");
+        let db = format!("mig045_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {db}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{db}", url.rsplit_once('/').unwrap().0);
+        let pool = PgPool::connect(&db_url).await.expect("connect scratch db");
+
+        let full = sqlx::migrate!("./migrations");
+        let before_045 = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                full.migrations.iter().filter(|m| m.version < 45).cloned().collect(),
+            ),
+            ..sqlx::migrate!("./migrations")
+        };
+        before_045.run(&pool).await.expect("migrate to 044");
+
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let legacy_all: i64 = (1 << 17) - 1;
+        let owner_role: Uuid = sqlx::query_scalar(
+            "INSERT INTO team_roles (team_id, name, permissions, is_builtin, position)
+             VALUES ($1, 'owner', $2, TRUE, 0) RETURNING id",
+        )
+        .bind(team)
+        .bind(legacy_all)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let custom = seed_role(&pool, team, "legacy", PERM_CONNECT).await;
+
+        full.run(&pool).await.expect("migrate to head");
+
+        let perms = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT permissions FROM team_roles WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(perms(owner_role).await, legacy_all | PERM_VIEW | PERM_ADMINISTRATOR);
+        assert_eq!(perms(custom).await, PERM_CONNECT | PERM_VIEW);
+        let sets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_sets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sets, 0);
+
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {db}")).execute(&admin).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_object_cannot_point_at_another_teams_rule_set() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team_a = seed_team(&pool, owner).await;
+        let team_b = seed_team(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team_a, owner, "o-1", "connection").await;
+        let foreign = crate::test_support::seed_rule_set(&pool, team_b, owner, &[]).await;
+
+        let res = sqlx::query(
+            "UPDATE team_vault_objects SET rule_set_id = $3 WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team_a)
+        .bind("o-1")
+        .bind(foreign)
+        .execute(&pool)
+        .await;
+
+        assert!(res.is_err(), "the composite FK must refuse a cross-team pointer");
+    }
 }
 
 #[cfg(test)]
