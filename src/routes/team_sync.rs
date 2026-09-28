@@ -61,9 +61,17 @@ async fn current_epoch(pool: &PgPool, team_id: Uuid) -> Result<i32, StatusCode> 
     Ok(max.unwrap_or(1))
 }
 
-/// Membership + Teams-tier + permission preamble shared by every team vault route.
+/// Membership + Teams-tier preamble shared by every team vault route.
 ///
 /// `action` names the attempted operation so the non-member warning stays greppable.
+async fn require_vault_member(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
+    if !is_team_member(pool, team_id, user_id).await? {
+        warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_teams_tier_for_vault(pool, team_id).await
+}
+
 async fn require_vault_access(
     pool: &PgPool,
     team_id: Uuid,
@@ -71,24 +79,16 @@ async fn require_vault_access(
     action: &str,
     check: PermCheck<'_>,
 ) -> Result<(), StatusCode> {
-    if !is_team_member(pool, team_id, user_id).await? {
-        warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(pool, team_id).await?;
+    require_vault_member(pool, team_id, user_id, action).await?;
     crate::permissions::require_team_permissions(pool, team_id, user_id, check).await
 }
 
 /// Team-level `CONNECT`/`VIEW_SECRETS`, or either bit on any live object: one granted host still needs the key.
 async fn require_vault_key_access(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
-    if !is_team_member(pool, team_id, user_id).await? {
-        warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(pool, team_id).await?;
+    require_vault_member(pool, team_id, user_id, action).await?;
     let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
     let live = live_rule_set_ids(pool, team_id).await?;
-    if authz.grants_anywhere(&live, crate::permissions::PERM_CONNECT | crate::permissions::PERM_VIEW_SECRETS) {
+    if authz.holds_vault_key_gate(&live) {
         Ok(())
     } else {
         Err(StatusCode::FORBIDDEN)

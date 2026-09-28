@@ -5,7 +5,10 @@ use sqlx::PgPool;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::permissions::{object_permissions, RuleLayers, PERMISSION_JOINS, PERM_ADMINISTRATOR, PERM_VIEW};
+use crate::permissions::{
+    object_permissions, RuleLayers, PERMISSION_JOINS, PERM_ADMINISTRATOR, PERM_CONNECT, PERM_VIEW,
+    PERM_VIEW_SECRETS,
+};
 use crate::routes::client_version::client_supports_rule_sets;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +166,21 @@ impl ObjectAuthz {
     pub fn grants_anywhere(&self, live_sets: &[Uuid], bits: i64) -> bool {
         self.can_any(None, bits) || live_sets.iter().any(|s| self.can_any(Some(*s), bits))
     }
+
+    pub fn holds_vault_key_gate(&self, live: &[Uuid]) -> bool {
+        holds_vault_key_gate(self.member.clone(), self.entries.clone(), self.enforced, live)
+    }
+}
+
+/// Team-level `CONNECT`/`VIEW_SECRETS`, or either bit on any live object.
+pub fn holds_vault_key_gate(
+    member: MemberContext,
+    entries: HashMap<Uuid, Vec<RuleEntry>>,
+    enforced: bool,
+    live: &[Uuid],
+) -> bool {
+    ObjectAuthz::for_member(member, entries, enforced)
+        .grants_anywhere(live, PERM_CONNECT | PERM_VIEW_SECRETS)
 }
 
 pub struct ObjectRow {
