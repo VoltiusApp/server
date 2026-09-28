@@ -218,25 +218,44 @@ pub async fn upsert_object(
 
     require_rule_set_client(&pool, team_id, &headers).await?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
-    let existing = object_row(&pool, team_id, &body.object_id).await?;
-    let body_edit = body.object_type.edit_permission();
 
     if let Some(Some(target)) = body.rule_set_id {
         if !rule_set_in_team(&pool, team_id, target).await? {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
-    let current = existing.as_ref().and_then(|r| r.rule_set_id);
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open object upsert transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Locked here so a concurrent repoint/create of the same row cannot
+    // commit between this read and our write below.
+    let existing = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "SELECT object_type, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND object_id = $2 FOR UPDATE",
+    )
+    .bind(team_id)
+    .bind(&body.object_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, object_id = %body.object_id, "Failed to lock team vault object");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let body_edit = body.object_type.edit_permission();
+    let current = existing.as_ref().and_then(|(_, rule_set_id)| *rule_set_id);
     let target = body.rule_set_id.unwrap_or(current);
 
     match &existing {
         None if !authz.can(target, body_edit) => return Err(StatusCode::FORBIDDEN),
         None => {}
-        Some(row) => {
+        Some((object_type, _)) => {
             if !authz.can(current, PERM_VIEW) {
                 return Err(StatusCode::NOT_FOUND);
             }
-            let stored_edit = edit_permission_for_str(&row.object_type).ok_or(StatusCode::BAD_REQUEST)?;
+            let stored_edit = edit_permission_for_str(object_type).ok_or(StatusCode::BAD_REQUEST)?;
             if !authz.can(current, stored_edit | body_edit) {
                 return Err(StatusCode::FORBIDDEN);
             }
@@ -246,36 +265,39 @@ pub async fn upsert_object(
         }
     }
 
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!(error = %e, team_id = %team_id, "Failed to open object upsert transaction");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    sqlx::query(
-        r#"INSERT INTO team_vault_objects
-           (team_id, object_id, object_type, name, vault_id, folder_id, metadata, updated_by, rule_set_id)
-           VALUES ($1, $2, $3, NULL, $1, NULL, $4, $5, $6)
-           ON CONFLICT (team_id, object_id)
-           DO UPDATE SET object_type = EXCLUDED.object_type,
-                         name = NULL,
-                         folder_id = NULL,
-                         metadata = EXCLUDED.metadata,
-                         deleted_at = NULL,
-                         updated_at = now(),
-                         updated_by = EXCLUDED.updated_by,
-                         rule_set_id = EXCLUDED.rule_set_id"#,
-    )
-    .bind(team_id)
-    .bind(&body.object_id)
-    .bind(body.object_type.as_str())
-    .bind(&body.metadata)
-    .bind(auth.0)
-    .bind(target)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, object_id = %body.object_id, "Failed to upsert team vault object");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let query = if existing.is_some() {
+        sqlx::query(
+            r#"UPDATE team_vault_objects
+               SET object_type = $3, name = NULL, folder_id = NULL, metadata = $4,
+                   deleted_at = NULL, updated_at = now(), updated_by = $5, rule_set_id = $6
+               WHERE team_id = $1 AND object_id = $2"#,
+        )
+    } else {
+        sqlx::query(
+            r#"INSERT INTO team_vault_objects
+               (team_id, object_id, object_type, name, vault_id, folder_id, metadata, updated_by, rule_set_id)
+               VALUES ($1, $2, $3, NULL, $1, NULL, $4, $5, $6)
+               ON CONFLICT (team_id, object_id) DO NOTHING"#,
+        )
+    };
+    let result = query
+        .bind(team_id)
+        .bind(&body.object_id)
+        .bind(body.object_type.as_str())
+        .bind(&body.metadata)
+        .bind(auth.0)
+        .bind(target)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, object_id = %body.object_id, "Failed to upsert team vault object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if existing.is_none() && result.rows_affected() == 0 {
+        return Err(StatusCode::CONFLICT);
+    }
+
     if let Some(old) = current.filter(|_| target != current) {
         gc_rule_sets(&mut tx, team_id, &[old]).await.map_err(|e| {
             error!(error = %e, team_id = %team_id, "Failed to collect rule sets");
@@ -2134,5 +2156,77 @@ mod authz_tests {
 
         upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), object_body(&f.object_id, None)).await.unwrap();
         assert!(!listed_ids(&pool, f.team, f.blocked).await.contains(&f.object_id));
+    }
+
+    // Deterministic proxy for a concurrent create racing a hidden row into
+    // existence: pins that the row is locked before any authorization check.
+    #[tokio::test]
+    async fn creating_over_a_hidden_object_answers_404_and_does_not_overwrite() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        let res = upsert_as(&pool, f.team, f.blocked, rule_set_client_headers(), object_body(&f.object_id, None)).await;
+        assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+        assert_eq!(stored_pointer(&pool, f.team, &f.object_id).await, Some(f.rule_set));
+    }
+
+    #[tokio::test]
+    async fn repointing_to_team_wide_still_needs_manage_on_the_current_set() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let manager = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS | crate::permissions::PERM_MANAGE_ROLES).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "o-4", "connection").await;
+        let locked = seed_rule_set(&pool, team, owner, &[("everyone", None, 0, crate::permissions::PERM_MANAGE_ROLES)]).await;
+        crate::test_support::point_object(&pool, team, "o-4", Some(locked)).await;
+
+        let res = upsert_as(&pool, team, manager, rule_set_client_headers(), object_body("o-4", Some(None))).await;
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+        assert_eq!(stored_pointer(&pool, team, "o-4").await, Some(locked));
+    }
+
+    #[tokio::test]
+    async fn changing_the_stored_type_needs_edit_on_both_types() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "k-1", "key").await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+
+        let res = upsert_as(&pool, team, caller, rule_set_client_headers(), object_body("k-1", None)).await;
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+        let stored_type: String = sqlx::query_scalar(
+            "SELECT object_type FROM team_vault_objects WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team)
+        .bind("k-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_type, "key");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_without_edit_gets_forbidden_not_missing_on_upsert_and_delete() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let viewer = member_with_role(&pool, team, 0).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "v-1", "connection").await;
+        let set = seed_rule_set(&pool, team, owner, &[]).await;
+        crate::test_support::point_object(&pool, team, "v-1", Some(set)).await;
+
+        let res = upsert_as(&pool, team, viewer, rule_set_client_headers(), object_body("v-1", None)).await;
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+
+        let res = delete_object(
+            State(pool.clone()),
+            Extension(AuthUser(viewer)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path((team, "v-1".to_string())),
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }
