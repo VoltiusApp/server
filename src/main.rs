@@ -6,6 +6,7 @@ mod handles;
 mod last_seen;
 mod lemonsqueezy;
 mod models;
+mod object_authz;
 mod observability;
 mod permissions;
 mod rate_limit;
@@ -140,6 +141,11 @@ async fn main() {
             {
                 Ok(r) => tracing::info!(deleted = r.rows_affected(), retention_days = sync_blob_retention_days, "Stale sync blob cleanup completed"),
                 Err(e) => tracing::error!(error = %e, "Stale sync blob cleanup failed"),
+            }
+
+            match object_authz::sweep_unattached_rule_sets(&retention_pool).await {
+                Ok(n) => tracing::info!(deleted = n, "Unattached rule set sweep completed"),
+                Err(e) => tracing::error!(error = %e, "Unattached rule set sweep failed"),
             }
         }
     });
@@ -510,6 +516,22 @@ async fn main() {
         .route(
             "/v1/teams/:team_id/secrets/reencrypt",
             put(routes::team_objects::reencrypt_secrets),
+        )
+        .route(
+            "/v1/teams/:team_id/rule-sets",
+            post(routes::team_rule_sets::create_rule_set),
+        )
+        .route(
+            "/v1/teams/:team_id/rule-sets/:set_id",
+            get(routes::team_rule_sets::get_rule_set),
+        )
+        .route(
+            "/v1/teams/:team_id/rule-sets/:set_id",
+            put(routes::team_rule_sets::put_rule_set),
+        )
+        .route(
+            "/v1/teams/:team_id/rule-sets/:set_id/copy",
+            post(routes::team_rule_sets::copy_rule_set),
         )
         // Terminal sessions (REST) — Pro-gated at handler level via claims
         .route(

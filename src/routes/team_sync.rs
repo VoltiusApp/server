@@ -11,7 +11,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::permissions::{is_team_member, PermCheck};
+use crate::object_authz::{live_rule_set_ids, require_rule_set_client, team_has_rule_sets, ObjectAuthz};
+use crate::permissions::{is_team_member, PermCheck, PERM_VIEW};
 use crate::self_host;
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
@@ -60,9 +61,17 @@ async fn current_epoch(pool: &PgPool, team_id: Uuid) -> Result<i32, StatusCode> 
     Ok(max.unwrap_or(1))
 }
 
-/// Membership + Teams-tier + permission preamble shared by every team vault route.
+/// Membership + Teams-tier preamble shared by every team vault route.
 ///
 /// `action` names the attempted operation so the non-member warning stays greppable.
+async fn require_vault_member(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
+    if !is_team_member(pool, team_id, user_id).await? {
+        warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_teams_tier_for_vault(pool, team_id).await
+}
+
 async fn require_vault_access(
     pool: &PgPool,
     team_id: Uuid,
@@ -70,22 +79,31 @@ async fn require_vault_access(
     action: &str,
     check: PermCheck<'_>,
 ) -> Result<(), StatusCode> {
-    if !is_team_member(pool, team_id, user_id).await? {
-        warn!(team_id = %team_id, user_id = %user_id, action, "Non-member tried to access team vault");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    require_teams_tier_for_vault(pool, team_id).await?;
+    require_vault_member(pool, team_id, user_id, action).await?;
     crate::permissions::require_team_permissions(pool, team_id, user_id, check).await
 }
 
-/// A connect-only member needs the vault key to decrypt the credentials they
-/// are allowed to *use*; VIEW_SECRETS is what lets a member *read* one
-/// (issue #190). Shared by every route that gates on this pair — the
-/// whole-vault ciphertext stays VIEW_SECRETS-only, see `get_team_blob`.
-const CONNECT_OR_VIEW_SECRETS: PermCheck<'static> = PermCheck::Any(&[
-    crate::permissions::PERM_CONNECT,
-    crate::permissions::PERM_VIEW_SECRETS,
-]);
+/// Team-level `CONNECT`/`VIEW_SECRETS`, or either bit on any live object: one granted host still needs the key.
+async fn require_vault_key_access(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
+    require_vault_member(pool, team_id, user_id, action).await?;
+    let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let live = live_rule_set_ids(pool, team_id).await?;
+    if authz.holds_vault_key_gate(&live) {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+async fn require_admin_once_rule_sets(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<(), StatusCode> {
+    if !team_has_rule_sets(pool, team_id).await? {
+        return Ok(());
+    }
+    match ObjectAuthz::load(pool, team_id, user_id).await? {
+        Some(a) if a.is_admin() && a.can(None, PERM_VIEW) => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
 
 // ─── GET /v1/teams/:team_id/vault-key ────────────────────────────────────────
 
@@ -99,16 +117,11 @@ pub struct VaultKeyResponse {
 pub async fn get_my_vault_key(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<VaultKeyResponse>, StatusCode> {
-    require_vault_access(
-        &pool,
-        team_id,
-        auth.0,
-        "get_vault_key",
-        CONNECT_OR_VIEW_SECRETS,
-    )
-    .await?;
+    require_vault_key_access(&pool, team_id, auth.0, "get_vault_key").await?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
 
     let row = sqlx::query_as::<_, (String, Uuid, i32)>(
         "SELECT wrapped_key, wrapped_by, key_version FROM team_vault_keys \
@@ -145,16 +158,11 @@ pub async fn get_my_vault_key(
 pub async fn get_vault_key_at_version(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    headers: axum::http::HeaderMap,
     Path((team_id, version)): Path<(Uuid, i32)>,
 ) -> Result<Json<VaultKeyResponse>, StatusCode> {
-    require_vault_access(
-        &pool,
-        team_id,
-        auth.0,
-        "get_vault_key_at_version",
-        CONNECT_OR_VIEW_SECRETS,
-    )
-    .await?;
+    require_vault_key_access(&pool, team_id, auth.0, "get_vault_key_at_version").await?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
 
     let row = sqlx::query_as::<_, (String, Uuid)>(
         "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = $3",
@@ -223,14 +231,7 @@ pub async fn get_rotation_status(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<RotationStatusResponse>, StatusCode> {
-    require_vault_access(
-        &pool,
-        team_id,
-        auth.0,
-        "get_rotation_status",
-        CONNECT_OR_VIEW_SECRETS,
-    )
-    .await?;
+    require_vault_key_access(&pool, team_id, auth.0, "get_rotation_status").await?;
 
     let epoch = current_epoch(&pool, team_id).await?;
 
@@ -542,6 +543,7 @@ pub struct TeamBlobResponse {
 pub async fn get_team_blob(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<TeamBlobResponse>, StatusCode> {
     // The legacy blob carries every object AND every secret in one ciphertext, so
@@ -555,6 +557,8 @@ pub async fn get_team_blob(
         PermCheck::All(&[crate::permissions::PERM_VIEW_SECRETS]),
     )
     .await?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_admin_once_rule_sets(&pool, team_id, auth.0).await?;
 
     let row = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>, i32)>(
         "SELECT blob, updated_at, key_version FROM team_sync_blobs WHERE team_id = $1",
@@ -598,6 +602,7 @@ pub async fn put_team_blob(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(sync_notifier): axum::Extension<SyncNotifier>,
+    headers: axum::http::HeaderMap,
     Path(team_id): Path<Uuid>,
     Json(body): Json<PutTeamBlobRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -619,6 +624,8 @@ pub async fn put_team_blob(
         ]),
     )
     .await?;
+    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_admin_once_rule_sets(&pool, team_id, auth.0).await?;
 
     let blob_bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.blob)
@@ -703,9 +710,12 @@ mod tests {
     // ─── GET /v1/teams/:team_id/vault-key/holders (issue #41) ────────────────
 
     use crate::auth::AuthUser;
-    use crate::permissions::PERM_CONNECT;
+    use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, assign_role, member_with_role, seed_role, seed_team, seed_user};
+    use crate::test_support::{
+        add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_rule_set, seed_team,
+        seed_user,
+    };
     use axum::extract::{Path, State};
     use axum::Extension;
 
@@ -849,7 +859,7 @@ mod tests {
         add_member(&pool, team, connect_only).await;
         grant_connect_only(&pool, team, connect_only).await;
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), axum::http::HeaderMap::new(), Path(team)).await;
 
         // `.err()` rather than `unwrap_err()`: TeamBlobResponse has no Debug.
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -864,7 +874,7 @@ mod tests {
         grant_view_secrets(&pool, team, owner).await;
         insert_team_blob(&pool, team, owner).await;
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path(team))
             .await
             .expect("blob ok")
             .0;
@@ -894,7 +904,7 @@ mod tests {
         grant_connect_only(&pool, team, connect_only).await;
         insert_vault_key(&pool, team, connect_only, owner).await;
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team))
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(connect_only)), axum::http::HeaderMap::new(), Path(team))
             .await
             .expect("vault key ok")
             .0;
@@ -920,7 +930,7 @@ mod tests {
         )
         .bind(team).bind(owner).execute(&pool).await.expect("epoch 2");
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path(team))
             .await
             .expect("vault key ok")
             .0;
@@ -939,7 +949,7 @@ mod tests {
         add_member(&pool, team, member).await;
         insert_vault_key(&pool, team, member, owner).await;
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await;
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), axum::http::HeaderMap::new(), Path(team)).await;
 
         // `.err()` rather than `unwrap_err()`: VaultKeyResponse has no Debug.
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -952,7 +962,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         let outsider = seed_user(&pool).await;
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(outsider)), axum::http::HeaderMap::new(), Path(team)).await;
 
         // `.err()` rather than `unwrap_err()`: VaultKeyResponse has no Debug.
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -973,7 +983,7 @@ mod tests {
         grant_connect_only(&pool, team, connect_only).await;
         insert_vault_key(&pool, team, connect_only, owner).await;
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), Path(team)).await;
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), axum::http::HeaderMap::new(), Path(team)).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
@@ -992,7 +1002,7 @@ mod tests {
         .bind(team).bind(b"ciphertext".to_vec()).bind(10_i32).bind(owner).bind(2_i32)
         .execute(&pool).await.expect("insert blob at epoch 2");
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path(team))
             .await
             .expect("blob ok")
             .0;
@@ -1021,6 +1031,7 @@ mod tests {
             State(pool.clone()),
             Extension(AuthUser(owner)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(PutTeamBlobRequest { blob: body_b64, key_version: 3 }),
         )
@@ -1031,6 +1042,50 @@ mod tests {
         let kv: i32 = sqlx::query_scalar("SELECT key_version FROM team_sync_blobs WHERE team_id = $1")
             .bind(team).fetch_one(&pool).await.unwrap();
         assert_eq!(kv, 3);
+    }
+
+    #[tokio::test]
+    async fn put_team_blob_requires_admin_once_the_team_has_a_rule_set() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        seed_rule_set(&pool, team, owner, &[]).await;
+
+        let full_edit = crate::permissions::PERM_EDIT_CONNECTIONS | crate::permissions::PERM_EDIT_IDENTITIES
+            | crate::permissions::PERM_EDIT_KEYS | crate::permissions::PERM_EDIT_FOLDERS
+            | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS;
+
+        let editor = seed_user(&pool).await;
+        add_member(&pool, team, editor).await;
+        let role = seed_role(&pool, team, "blob-writer", full_edit).await;
+        assign_role(&pool, team, editor, role).await;
+
+        let admin = member_with_role(&pool, team, full_edit | crate::permissions::PERM_ADMINISTRATOR).await;
+
+        let body_b64 = base64::engine::general_purpose::STANDARD.encode(b"new-ciphertext");
+
+        let res = put_team_blob(
+            State(pool.clone()),
+            Extension(AuthUser(editor)),
+            Extension(SyncNotifier::new()),
+            rule_set_client_headers(),
+            Path(team),
+            Json(PutTeamBlobRequest { blob: body_b64.clone(), key_version: 4 }),
+        )
+        .await;
+        assert_eq!(res, Err(StatusCode::FORBIDDEN), "the old full-edit gate must not bypass the admin-only gate once a rule set exists");
+
+        let res = put_team_blob(
+            State(pool.clone()),
+            Extension(AuthUser(admin)),
+            Extension(SyncNotifier::new()),
+            rule_set_client_headers(),
+            Path(team),
+            Json(PutTeamBlobRequest { blob: body_b64, key_version: 4 }),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
     }
 
     /// I5: a pre-#217 client's body carries no `key_version` field at all.
@@ -1064,7 +1119,7 @@ mod tests {
         )
         .bind(team).bind(owner).execute(&pool).await.expect("epoch 2");
 
-        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), Path((team, 1)))
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path((team, 1)))
             .await
             .expect("epoch 1 ok")
             .0;
@@ -1087,7 +1142,7 @@ mod tests {
         )
         .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 only");
 
-        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), Path((team, 1))).await;
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path((team, 1))).await;
 
         assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
     }
@@ -1099,7 +1154,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         let outsider = seed_user(&pool).await;
 
-        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), Path((team, 1))).await;
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), axum::http::HeaderMap::new(), Path((team, 1))).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
@@ -1510,6 +1565,64 @@ mod tests {
         let res = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await;
 
         assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    // ─── Vault-key gate widened to any object ─────────────────────────────────
+
+    #[tokio::test]
+    async fn vault_key_is_served_to_a_member_granted_connect_on_one_object_only() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        let junior = member_with_role(&pool, team, 0).await;
+        insert_vault_key(&pool, team, junior, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "h-1", "connection").await;
+        let set = crate::test_support::seed_rule_set(&pool, team, owner, &[("member", Some(junior), PERM_CONNECT, 0)]).await;
+
+        let before = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(junior)), crate::test_support::rule_set_client_headers(), Path(team)).await;
+        assert_eq!(before.err(), Some(StatusCode::FORBIDDEN));
+
+        crate::test_support::point_object(&pool, team, "h-1", Some(set)).await;
+        let after = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(junior)), crate::test_support::rule_set_client_headers(), Path(team)).await;
+        assert!(after.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sync_blob_is_admin_only_once_the_team_has_a_rule_set() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_SECRETS).await;
+        crate::test_support::set_user_tier(&pool, f.owner, "teams").await;
+        insert_team_blob(&pool, f.team, f.owner).await;
+
+        let member = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(f.viewer)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
+        assert_eq!(member.err(), Some(StatusCode::FORBIDDEN));
+        let admin_member = crate::test_support::member_with_role(&pool, f.team, PERM_VIEW_SECRETS | crate::permissions::PERM_ADMINISTRATOR).await;
+        let admin = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(admin_member)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
+        assert!(admin.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sync_blob_refuses_an_admin_whose_team_deny_removes_view() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_SECRETS).await;
+        crate::test_support::set_user_tier(&pool, f.owner, "teams").await;
+        insert_team_blob(&pool, f.team, f.owner).await;
+
+        let admin = crate::test_support::member_with_role(&pool, f.team, PERM_VIEW_SECRETS | crate::permissions::PERM_ADMINISTRATOR).await;
+        crate::test_support::set_member_overrides(&pool, f.team, admin, 0, PERM_VIEW).await;
+
+        let res = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(admin)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn vault_key_is_426_for_an_old_client_once_the_team_has_a_rule_set() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        crate::test_support::set_user_tier(&pool, f.owner, "teams").await;
+        let res = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(f.viewer)), axum::http::HeaderMap::new(), Path(f.team)).await;
+        assert_eq!(res.err(), Some(StatusCode::UPGRADE_REQUIRED));
     }
 }
 

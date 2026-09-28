@@ -62,21 +62,9 @@ pub async fn upsert_object_pref(
     Path((team_id, object_id)): Path<(Uuid, String)>,
     Json(body): Json<UpsertPrefRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    require_team_member(&pool, team_id, auth.0).await?;
-
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM team_vault_objects WHERE team_id = $1 AND object_id = $2)",
-    )
-    .bind(team_id)
-    .bind(&object_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, object_id = %object_id, "Failed to check team vault object existence");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !exists {
+    let authz = crate::object_authz::ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let row = crate::object_authz::object_row(&pool, team_id, &object_id).await?.ok_or(StatusCode::NOT_FOUND)?;
+    if !authz.can(row.rule_set_id, crate::permissions::PERM_VIEW) {
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -219,6 +207,21 @@ mod authz_tests {
         ).await;
 
         assert_eq!(res.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pinning_a_hidden_object_answers_404() {
+        let pool = test_pool_or_skip!();
+        let f = crate::test_support::hidden_object_fixture(&pool, "connection", crate::permissions::PERM_CONNECT).await;
+        let pin = |user: Uuid| {
+            let pool = pool.clone();
+            let object_id = f.object_id.clone();
+            async move {
+                upsert_object_pref(State(pool), Extension(AuthUser(user)), Path((f.team, object_id)), Json(UpsertPrefRequest { pinned: Some(true) })).await
+            }
+        };
+        assert_eq!(pin(f.blocked).await.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+        assert!(pin(f.viewer).await.is_ok());
     }
 
     #[tokio::test]

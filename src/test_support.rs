@@ -264,7 +264,7 @@ pub async fn set_member_overrides(pool: &PgPool, team: Uuid, user: Uuid, allow: 
 pub async fn member_with_role(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
     let user = seed_user(pool).await;
     let role_name = format!("authz-test-role-{}", Uuid::new_v4());
-    let role = seed_role(pool, team, &role_name, perms).await;
+    let role = seed_role(pool, team, &role_name, perms | crate::permissions::PERM_VIEW).await;
     add_member(pool, team, user).await;
     assign_role(pool, team, user, role).await;
     user
@@ -372,4 +372,86 @@ pub async fn seed_team_object(
     .execute(pool)
     .await
     .expect("seed team object");
+}
+
+/// Insert a rule set for `team` with `(subject_type, subject_id, allow, deny)` entries.
+pub async fn seed_rule_set(
+    pool: &PgPool,
+    team: Uuid,
+    author: Uuid,
+    entries: &[(&str, Option<Uuid>, i64, i64)],
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO team_rule_sets (team_id, updated_by) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(team)
+    .bind(author)
+    .fetch_one(pool)
+    .await
+    .expect("seed rule set");
+    for (subject_type, subject_id, allow, deny) in entries {
+        sqlx::query(
+            "INSERT INTO team_rule_set_entries (rule_set_id, subject_type, subject_id, allow_mask, deny_mask)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(*subject_type)
+        .bind(*subject_id)
+        .bind(*allow)
+        .bind(*deny)
+        .execute(pool)
+        .await
+        .expect("seed rule entry");
+    }
+    id
+}
+
+/// Point an existing team object at `set` (or back at team-wide permissions with `None`).
+pub async fn point_object(pool: &PgPool, team: Uuid, object_id: &str, set: Option<Uuid>) {
+    sqlx::query("UPDATE team_vault_objects SET rule_set_id = $3 WHERE team_id = $1 AND object_id = $2")
+        .bind(team)
+        .bind(object_id)
+        .bind(set)
+        .execute(pool)
+        .await
+        .expect("point object");
+}
+
+pub fn rule_set_client_headers() -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("x-client-features", "rule-sets".parse().unwrap());
+    h.insert("x-client-version", "0.99.0".parse().unwrap());
+    h
+}
+
+/// A team with one object that `viewer` may see and `blocked` may not
+/// (@everyone deny VIEW, member allow VIEW for `viewer`). `admin` holds ADMINISTRATOR.
+pub struct HiddenObjectFixture {
+    pub team: Uuid,
+    pub owner: Uuid,
+    pub viewer: Uuid,
+    pub blocked: Uuid,
+    pub admin: Uuid,
+    pub object_id: String,
+    pub rule_set: Uuid,
+}
+
+pub async fn hidden_object_fixture(pool: &PgPool, object_type: &str, member_perms: i64) -> HiddenObjectFixture {
+    use crate::permissions::{PERM_ADMINISTRATOR, PERM_VIEW};
+    let owner = seed_user(pool).await;
+    let team = seed_team(pool, owner).await;
+    let viewer = member_with_role(pool, team, member_perms).await;
+    let blocked = member_with_role(pool, team, member_perms).await;
+    let admin = member_with_role(pool, team, PERM_ADMINISTRATOR).await;
+    let object_id = format!("obj-{}", Uuid::new_v4());
+    seed_team_object(pool, team, owner, &object_id, object_type).await;
+    let rule_set = seed_rule_set(
+        pool,
+        team,
+        owner,
+        &[("everyone", None, 0, PERM_VIEW), ("member", Some(viewer), PERM_VIEW, 0)],
+    )
+    .await;
+    point_object(pool, team, &object_id, Some(rule_set)).await;
+    HiddenObjectFixture { team, owner, viewer, blocked, admin, object_id, rule_set }
 }

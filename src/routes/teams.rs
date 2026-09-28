@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
+use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries, team_has_rule_sets, MemberContext};
 use crate::routes::audit::write_audit_event;
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
@@ -332,12 +333,14 @@ pub async fn list_members(
         (
             Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>,
             String, String, Option<String>, Option<Uuid>, i64, i64,
+            Option<String>, bool,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.handle AS invited_by_display_name, tm.joined_at,
                u.handle AS display_name, u.handle, u.public_key, tmr.role_id,
-               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
+               tm.last_client_version, tm.last_client_rule_sets
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
@@ -358,7 +361,7 @@ pub async fn list_members(
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
     for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key,
-         role_id, permission_allow, permission_deny) in rows
+         role_id, permission_allow, permission_deny, last_client_version, last_client_rule_sets) in rows
     {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
@@ -380,6 +383,8 @@ pub async fn list_members(
                         role_ids: role_id.into_iter().collect(),
                         permission_allow,
                         permission_deny,
+                        last_client_version,
+                        last_client_rule_sets,
                     },
                 });
             }
@@ -529,6 +534,25 @@ async fn request_team_rotation(
     Ok(())
 }
 
+async fn delete_subject_rule_entries(
+    tx: &mut sqlx::PgConnection,
+    team_id: Uuid,
+    subject_type: &str,
+    subject_id: Uuid,
+) -> Result<(), StatusCode> {
+    sqlx::query(
+        "DELETE FROM team_rule_set_entries e USING team_rule_sets s \
+         WHERE e.rule_set_id = s.id AND s.team_id = $1 AND e.subject_type = $2 AND e.subject_id = $3",
+    )
+    .bind(team_id)
+    .bind(subject_type)
+    .bind(subject_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, subject_type, "Failed to remove subject rule entries"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    Ok(())
+}
+
 // ─── Remove member ────────────────────────────────────────────────────────────
 
 pub async fn remove_member(
@@ -593,6 +617,8 @@ pub async fn remove_member(
         .execute(&mut *tx)
         .await
         .map_err(|e| { error!(error = %e, "Failed to remove team member roles"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    delete_subject_rule_entries(&mut tx, team_id, "member", user_id).await?;
 
     request_team_rotation(&mut tx, team_id).await?;
 
@@ -692,7 +718,7 @@ pub struct SearchUsersQuery {
 ///   - The `NOT EXISTS` in `revoke_grants_for_departed_member`
 ///     (routes::terminal) — inlined because it binds only `$1` and needs
 ///     `tsi.invited_by`/`tsi.user_id`, not `$2`/`u.id`.
-///   - The `connection_name` redaction `CASE` in `visible_sessions`
+///   - The `connection_name` redaction `CASE` in `listed_sessions`
 ///     (routes::terminal) — inlined because that query already uses `$2` for
 ///     `PERM_VIEW_TERMINAL_SESSIONS` (an int, not a uuid), so splicing this
 ///     constant's hardcoded `$2` in would silently bind the wrong value.
@@ -849,6 +875,7 @@ pub async fn create_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<TeamRole>), StatusCode> {
@@ -867,6 +894,11 @@ pub async fn create_role(
     }
 
     let permissions = body.permissions & crate::permissions::ALL_PERMISSIONS;
+    let permissions = if crate::routes::client_version::client_supports_rule_sets(&headers) {
+        permissions
+    } else {
+        permissions | crate::permissions::PERM_VIEW
+    };
 
     let role = sqlx::query_as::<_, TeamRole>(
         r#"INSERT INTO team_roles (team_id, name, color, permissions, is_builtin, position)
@@ -918,6 +950,7 @@ pub async fn update_role(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateRoleBody>,
 ) -> Result<StatusCode, StatusCode> {
@@ -931,8 +964,8 @@ pub async fn update_role(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let role_info = sqlx::query_as::<_, (bool,)>(
-        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
+    let role_info = sqlx::query_as::<_, (bool, i64)>(
+        "SELECT is_builtin, permissions FROM team_roles WHERE id = $1 AND team_id = $2",
     )
     .bind(role_id)
     .bind(team_id)
@@ -952,7 +985,11 @@ pub async fn update_role(
         }
     }
 
-    let permissions = body.permissions.map(|p| p & crate::permissions::ALL_PERMISSIONS);
+    let legacy = !crate::routes::client_version::client_supports_rule_sets(&headers);
+    let permissions = body.permissions.map(|p| {
+        let p = p & crate::permissions::ALL_PERMISSIONS;
+        if legacy { crate::permissions::keep_era_bits(p, role_info.1) } else { p }
+    });
 
     sqlx::query(
         r#"UPDATE team_roles
@@ -1020,17 +1057,29 @@ pub async fn delete_role(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin delete_role transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    delete_subject_rule_entries(&mut tx, team_id, "role", role_id).await?;
+
     // CASCADE on team_member_roles handles removal from members automatically
     let result = sqlx::query("DELETE FROM team_roles WHERE id = $1 AND team_id = $2")
         .bind(role_id)
         .bind(team_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| { error!(error = %e, "Failed to delete role"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit delete_role transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     info!(team_id = %team_id, role_id = %role_id, "Custom role deleted");
     tokio::spawn(write_audit_event(
@@ -1262,6 +1311,21 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
+async fn override_masks<'e, E>(executor: E, team_id: Uuid, user_id: Uuid) -> Result<(i64, i64), StatusCode>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query_as::<_, (i64, i64)>(
+        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .unwrap_or((0, 0)))
+}
+
 async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Option<i32>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<i32>>(
         "SELECT MIN(tr.position) FROM team_member_roles tmr \
@@ -1302,15 +1366,7 @@ async fn override_guardrails(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let previous_allow: i64 = sqlx::query_scalar(
-        "SELECT allow_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read previous overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .unwrap_or(0);
+    let (previous_allow, _) = override_masks(pool, team_id, target_user_id).await?;
 
     let actor_effective = crate::permissions::effective_permissions(pool, team_id, actor_id).await?;
     // A target's authority can come entirely from an allow override, so the actor
@@ -1340,10 +1396,18 @@ pub async fn set_member_permissions(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path((team_id, target_user_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<SetMemberPermissionsRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    validate_override_masks(body.allow, body.deny)?;
+    let (allow, deny) = if crate::routes::client_version::client_supports_rule_sets(&headers) {
+        (body.allow, body.deny)
+    } else {
+        let (pa, pd) = override_masks(&pool, team_id, target_user_id).await?;
+        (crate::permissions::keep_era_bits(body.allow, pa), crate::permissions::keep_era_bits(body.deny, pd))
+    };
+
+    validate_override_masks(allow, deny)?;
 
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_MEMBERS,
@@ -1366,23 +1430,14 @@ pub async fn set_member_permissions(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    override_guardrails(&pool, team_id, auth.0, target_user_id, body.allow).await?;
+    override_guardrails(&pool, team_id, auth.0, target_user_id, allow).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin set_member_permissions transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let previous = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides \
-         WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read existing overrides"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .unwrap_or((0, 0));
+    let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
 
     let role_union: i64 = sqlx::query_scalar(
         "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
@@ -1395,7 +1450,16 @@ pub async fn set_member_permissions(
     .await
     .map_err(|e| { error!(error = %e, "Failed to read target role union"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    if body.allow == 0 && body.deny == 0 {
+    let target_role_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2",
+    )
+    .bind(team_id)
+    .bind(target_user_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| { error!(error = %e, "Failed to read target role ids"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    if allow == 0 && deny == 0 {
         sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
             .bind(team_id)
             .bind(target_user_id)
@@ -1412,21 +1476,33 @@ pub async fn set_member_permissions(
         )
         .bind(team_id)
         .bind(target_user_id)
-        .bind(body.allow)
-        .bind(body.deny)
+        .bind(allow)
+        .bind(deny)
         .bind(auth.0)
         .execute(&mut *tx)
         .await
         .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
     }
 
-    // Mirrors get_my_vault_key's CONNECT_OR_VIEW_SECRETS gate (team_sync.rs), which is
-    // Any: only crossing from holding one of these to holding neither revokes key access.
-    const KEY_GATING: i64 = crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_CONNECT;
+    let entries = rule_entries(&pool, team_id, None).await?;
+    let enforced = team_has_rule_sets(&pool, team_id).await?;
+    let live = live_rule_set_ids(&pool, team_id).await?;
 
-    let prev_effective = (role_union | previous.0) & !previous.1;
-    let next_effective = (role_union | body.allow) & !body.deny;
-    if (prev_effective & KEY_GATING) != 0 && (next_effective & KEY_GATING) == 0 {
+    let prev_ctx = MemberContext {
+        user_id: target_user_id,
+        base: (role_union | previous.0) & !previous.1,
+        team_deny: previous.1,
+        role_ids: target_role_ids.clone(),
+    };
+    let next_ctx = MemberContext {
+        user_id: target_user_id,
+        base: (role_union | allow) & !deny,
+        team_deny: deny,
+        role_ids: target_role_ids,
+    };
+    let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), enforced, &live);
+    let held_after = holds_vault_key_gate(next_ctx, entries, enforced, &live);
+    if held_before && !held_after {
         request_team_rotation(&mut tx, team_id).await?;
     }
 
@@ -1441,7 +1517,7 @@ pub async fn set_member_permissions(
         .await
         .unwrap_or(None);
 
-    info!(team_id = %team_id, target_user_id = %target_user_id, allow = body.allow, deny = body.deny, "Member permission overrides set");
+    info!(team_id = %team_id, target_user_id = %target_user_id, allow, deny, "Member permission overrides set");
     tokio::spawn(write_audit_event(
         pool.clone(),
         team_id,
@@ -1453,8 +1529,8 @@ pub async fn set_member_permissions(
         Some(json!({
             "previous_allow": previous.0,
             "previous_deny": previous.1,
-            "allow": body.allow,
-            "deny": body.deny,
+            "allow": allow,
+            "deny": deny,
         })),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
@@ -2339,6 +2415,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(CreateRoleRequest {
                 name: "custom".to_string(),
@@ -2385,6 +2462,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(CreateRoleRequest {
                 name: "custom".to_string(),
@@ -2410,6 +2488,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path(team),
             Json(CreateRoleRequest {
                 name: "custom".to_string(),
@@ -2439,6 +2518,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, Uuid::new_v4())),
             Json(UpdateRoleBody {
                 name: Some("renamed".to_string()),
@@ -2465,6 +2545,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, Uuid::new_v4())),
             Json(UpdateRoleBody {
                 name: Some("renamed".to_string()),
@@ -2492,6 +2573,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, role)),
             Json(UpdateRoleBody {
                 name: Some("renamed".to_string()),
@@ -2665,6 +2747,29 @@ mod authz_tests {
             Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
             Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
         }
+    }
+
+    #[tokio::test]
+    async fn delete_team_succeeds_with_rule_sets_and_pointed_objects() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = crate::test_support::seed_team_with_roles(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "o-1", "connection").await;
+        let set = crate::test_support::seed_rule_set(
+            &pool, team, owner, &[("everyone", None, 0, crate::permissions::PERM_VIEW)],
+        )
+        .await;
+        crate::test_support::point_object(&pool, team, "o-1", Some(set)).await;
+
+        let res = delete_team(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Path(team)).await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_sets WHERE team_id = $1")
+            .bind(team)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }
 
@@ -2853,7 +2958,9 @@ mod override_response_tests {
     use crate::auth::AuthUser;
     use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
     use crate::sync_notifier::SyncNotifier;
-    use crate::test_support::{assign_role, seed_builtin_roles, seed_role, seed_team_with_roles};
+    use crate::test_support::{
+        assign_role, rule_set_client_headers, seed_builtin_roles, seed_role, seed_team_with_roles,
+    };
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
@@ -2963,6 +3070,7 @@ mod override_response_tests {
                 State(pool.clone()),
                 Extension(AuthUser(weak_manager)),
                 Extension(SyncNotifier::new()),
+                axum::http::HeaderMap::new(),
                 Path((team, contractor)),
                 Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
             )
@@ -2983,6 +3091,7 @@ mod override_response_tests {
                 State(pool.clone()),
                 Extension(AuthUser(strong_manager)),
                 Extension(SyncNotifier::new()),
+                axum::http::HeaderMap::new(),
                 Path((team, contractor)),
                 Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
             )
@@ -3065,6 +3174,7 @@ mod override_response_tests {
                 State(pool.clone()),
                 Extension(AuthUser(owner)),
                 Extension(SyncNotifier::new()),
+                axum::http::HeaderMap::new(),
                 Path((team, owner)),
                 Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
             )
@@ -3097,6 +3207,7 @@ mod override_response_tests {
                 State(pool.clone()),
                 Extension(AuthUser(actor)),
                 Extension(SyncNotifier::new()),
+                axum::http::HeaderMap::new(),
                 Path((team, target)),
                 Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
             )
@@ -3137,6 +3248,7 @@ mod override_response_tests {
             State(pool.clone()),
             Extension(AuthUser(actor)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, target)),
             Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
         )
@@ -3148,6 +3260,7 @@ mod override_response_tests {
             State(pool.clone()),
             Extension(AuthUser(actor)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, target)),
             Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
         )
@@ -3175,6 +3288,7 @@ mod override_response_tests {
             State(pool.clone()),
             Extension(AuthUser(actor)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, target)),
             Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_EDIT_CONNECTIONS }),
         )
@@ -3213,6 +3327,7 @@ mod override_response_tests {
             State(pool.clone()),
             Extension(AuthUser(actor)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, target)),
             Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
         )
@@ -3255,6 +3370,7 @@ mod override_response_tests {
             State(pool.clone()),
             Extension(AuthUser(actor)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, target)),
             Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
         )
@@ -3284,6 +3400,7 @@ mod override_response_tests {
             State(pool.clone()),
             Extension(AuthUser(owner)),
             Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
             Path((team, contractor)),
             Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
         )
@@ -3298,6 +3415,84 @@ mod override_response_tests {
         .await
         .unwrap();
         assert_eq!(count, 1, "clearing a roleless member's only read-class allow must still revoke key access");
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_queues_rotation_when_denying_view_drops_the_widened_gate() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = seed_user(&pool).await;
+        let target_role = seed_role(&pool, team, "connect-role", PERM_CONNECT | crate::permissions::PERM_VIEW).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+        crate::test_support::seed_rule_set(&pool, team, owner, &[]).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            rule_set_client_headers(),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_VIEW }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "denying VIEW drops the widened gate's team-level path even though CONNECT is nominally still allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_member_permissions_handler_queues_rotation_when_a_team_deny_wipes_an_object_grant() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = seed_user(&pool).await;
+        add_member(&pool, team, target).await;
+
+        crate::test_support::seed_team_object(&pool, team, owner, "obj-1", "connection").await;
+        let set = crate::test_support::seed_rule_set(
+            &pool,
+            team,
+            owner,
+            &[("member", Some(target), PERM_CONNECT | crate::permissions::PERM_VIEW, 0)],
+        )
+        .await;
+        crate::test_support::point_object(&pool, team, "obj-1", Some(set)).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_CONNECT }),
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "a team-level deny wipes even an object-level grant of the same bit, dropping the widened gate"
+        );
     }
 
     #[tokio::test]
@@ -3328,5 +3523,165 @@ mod override_response_tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+}
+
+#[cfg(test)]
+mod rule_set_era_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::permissions::*;
+    use crate::sync_notifier::SyncNotifier;
+    use crate::terminal_manager::TerminalManager;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{
+        add_member as add_team_member, assign_role, env_lock, member_with_role, rule_set_client_headers,
+        seed_role, seed_rule_set, seed_team, seed_team_with_roles, seed_user, set_member_overrides,
+        EnvLockGuard,
+    };
+    use axum::extract::{Path, State};
+    use axum::{Extension, Json};
+
+    async fn entries_for(pool: &PgPool, subject_type: &str, subject: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_set_entries WHERE subject_type = $1 AND subject_id = $2")
+            .bind(subject_type)
+            .bind(subject)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remove_member_deletes_their_rule_entries() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_CONNECT).await;
+        let set = seed_rule_set(&pool, team, owner, &[("everyone", None, 0, PERM_VIEW), ("member", Some(member), PERM_VIEW, 0)]).await;
+
+        remove_member(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Extension(TerminalManager::new()),
+            Path((team, member)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries_for(&pool, "member", member).await, 0);
+        let everyone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_set_entries WHERE rule_set_id = $1")
+            .bind(set).fetch_one(&pool).await.unwrap();
+        assert_eq!(everyone, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_role_deletes_its_rule_entries() {
+        let _env = EnvLockGuard(env_lock());
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let role = seed_role(&pool, team, "ops", PERM_VIEW).await;
+        seed_rule_set(&pool, team, owner, &[("role", Some(role), PERM_CONNECT, 0)]).await;
+
+        delete_role(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Path((team, role)))
+            .await
+            .unwrap();
+
+        assert_eq!(entries_for(&pool, "role", role).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_client_role_gets_view_and_a_current_one_does_not() {
+        let _env = EnvLockGuard(env_lock());
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let body = |name: &str| Json(CreateRoleRequest { name: name.into(), color: None, permissions: PERM_CONNECT });
+
+        let (_, Json(legacy)) = create_role(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), axum::http::HeaderMap::new(), Path(team), body("legacy"))
+            .await
+            .unwrap();
+        let (_, Json(current)) = create_role(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), rule_set_client_headers(), Path(team), body("current"))
+            .await
+            .unwrap();
+
+        assert_eq!(legacy.permissions, PERM_CONNECT | PERM_VIEW);
+        assert_eq!(current.permissions, PERM_CONNECT);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_client_role_edit_keeps_view_and_administrator() {
+        let _env = EnvLockGuard(env_lock());
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let role = seed_role(&pool, team, "admins", PERM_CONNECT | PERM_VIEW | PERM_ADMINISTRATOR).await;
+
+        update_role(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
+            Path((team, role)),
+            Json(UpdateRoleBody { name: None, color: None, permissions: Some(PERM_EDIT_KEYS), position: None }),
+        )
+        .await
+        .unwrap();
+
+        let stored: i64 = sqlx::query_scalar("SELECT permissions FROM team_roles WHERE id = $1")
+            .bind(role).fetch_one(&pool).await.unwrap();
+        assert_eq!(stored, PERM_EDIT_KEYS | PERM_VIEW | PERM_ADMINISTRATOR);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_client_override_edit_keeps_a_view_deny() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let actor = seed_user(&pool).await;
+        let target = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let actor_role = seed_role(&pool, team, "manager", PERM_MANAGE_MEMBERS).await;
+        sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
+        add_team_member(&pool, team, actor).await;
+        assign_role(&pool, team, actor, actor_role).await;
+        let target_role = seed_role(&pool, team, "viewer", PERM_VIEW_SECRETS).await;
+        sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
+        add_team_member(&pool, team, target).await;
+        assign_role(&pool, team, target, target_role).await;
+        set_member_overrides(&pool, team, target, 0, PERM_VIEW).await;
+
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            axum::http::HeaderMap::new(),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
+        )
+        .await
+        .unwrap();
+
+        let deny: i64 = sqlx::query_scalar("SELECT deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(target).fetch_one(&pool).await.unwrap();
+        assert_eq!(deny, PERM_COPY_SECRETS | PERM_VIEW);
+    }
+
+    #[tokio::test]
+    async fn list_members_reports_the_last_client() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        crate::object_authz::record_member_client(&pool, team, owner, &rule_set_client_headers()).await;
+        let presence: crate::PresenceMap = std::sync::Arc::new(dashmap::DashMap::new());
+
+        let members = list_members(State(pool.clone()), Extension(AuthUser(owner)), Extension(presence), Path(team))
+            .await
+            .unwrap()
+            .0;
+
+        let me = members.iter().find(|m| m.member.user_id == owner).unwrap();
+        assert_eq!(me.member.last_client_version.as_deref(), Some("0.99.0"));
+        assert!(me.member.last_client_rule_sets);
     }
 }

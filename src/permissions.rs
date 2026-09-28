@@ -21,6 +21,8 @@ pub const PERM_JOIN_TERMINAL_SESSION: i64  = 1 << 13; // 8192
 pub const PERM_VIEW_TERMINAL_SESSIONS: i64 = 1 << 14; // 16384
 pub const PERM_MANAGE_ROLES: i64           = 1 << 15; // 32768
 pub const PERM_EDIT_SNIPPETS: i64          = 1 << 16; // 65536
+pub const PERM_VIEW: i64                   = 1 << 17; // 131072
+pub const PERM_ADMINISTRATOR: i64          = 1 << 18; // 262144
 
 pub const ALL_PERMISSIONS: i64 = PERM_VIEW_SECRETS
     | PERM_COPY_SECRETS
@@ -38,20 +40,41 @@ pub const ALL_PERMISSIONS: i64 = PERM_VIEW_SECRETS
     | PERM_JOIN_TERMINAL_SESSION
     | PERM_VIEW_TERMINAL_SESSIONS
     | PERM_MANAGE_ROLES
-    | PERM_EDIT_SNIPPETS;
+    | PERM_EDIT_SNIPPETS
+    | PERM_VIEW
+    | PERM_ADMINISTRATOR;
+
+pub const OBJECT_RULE_BITS: i64 = PERM_VIEW
+    | PERM_CONNECT
+    | PERM_VIEW_SECRETS
+    | PERM_COPY_SECRETS
+    | PERM_EDIT_CONNECTIONS
+    | PERM_EDIT_IDENTITIES
+    | PERM_EDIT_KEYS
+    | PERM_EDIT_FOLDERS
+    | PERM_EDIT_SNIPPETS
+    | PERM_MANAGE_ROLES;
+
+pub const RULE_SET_ERA_BITS: i64 = PERM_VIEW | PERM_ADMINISTRATOR;
+
+/// A client unaware of `RULE_SET_ERA_BITS` cannot set or clear them: keep
+/// whatever was already stored for those bits, take everything else from `sent`.
+pub fn keep_era_bits(sent: i64, stored: i64) -> i64 {
+    (sent & !RULE_SET_ERA_BITS) | (stored & RULE_SET_ERA_BITS)
+}
 
 // Builtin role definitions: (name, permissions, position)
 // Every role that today grants PERM_EDIT_CONNECTIONS (bit 3 = 8) also grants
 // PERM_EDIT_SNIPPETS — Phase 2 is a zero-loss refactor.
 pub const BUILTIN_ROLES: &[(&str, i64, i32)] = &[
-    ("owner",        ALL_PERMISSIONS,             0), // all 17 bits
-    ("manager",      63487 | PERM_EDIT_SNIPPETS,  1),
-    ("editor",       28799 | PERM_EDIT_SNIPPETS,  2),
-    ("member",       28679 | PERM_EDIT_SNIPPETS,  3),
-    ("connect-only", 28676,                       4), // no edit perms today
+    ("owner",        ALL_PERMISSIONS,                          0),
+    ("manager",      63487 | PERM_EDIT_SNIPPETS | PERM_VIEW,   1),
+    ("editor",       28799 | PERM_EDIT_SNIPPETS | PERM_VIEW,   2),
+    ("member",       28679 | PERM_EDIT_SNIPPETS | PERM_VIEW,   3),
+    ("connect-only", 28676 | PERM_VIEW,                        4),
 ];
 
-const PERMISSION_JOINS: &str = r#"
+pub(crate) const PERMISSION_JOINS: &str = r#"
     FROM team_members tm
     LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
     LEFT JOIN team_roles tr ON tr.id = tmr.role_id
@@ -96,22 +119,15 @@ pub async fn has_team_permission(
 }
 
 /// How a set of permission bits is matched against a member's effective bits.
-///
-/// Most routes name one capability and want `All`. A route several distinct
-/// roles legitimately reach — the team vault key, which a connect-only member
-/// needs to *use* a stored credential and a secrets viewer to *read* it — wants
-/// `Any` (issue #190).
 #[derive(Clone, Copy)]
 pub enum PermCheck<'a> {
     All(&'a [i64]),
-    Any(&'a [i64]),
 }
 
 impl PermCheck<'_> {
     fn satisfied_by(self, effective: i64) -> bool {
         match self {
             PermCheck::All(bits) => bits.iter().all(|p| (effective & *p) != 0),
-            PermCheck::Any(bits) => bits.iter().any(|p| (effective & *p) != 0),
         }
     }
 }
@@ -200,6 +216,29 @@ pub async fn has_any_team_permission(
         })?;
 
     Ok(granted)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleLayers {
+    pub everyone_allow: i64,
+    pub everyone_deny: i64,
+    pub roles_allow: i64,
+    pub roles_deny: i64,
+    pub member_allow: i64,
+    pub member_deny: i64,
+}
+
+/// Keep in sync with `resolveObjectPermissions` in the client's `src/services/permissions.ts`.
+pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>) -> i64 {
+    if base & PERM_ADMINISTRATOR != 0 {
+        return ALL_PERMISSIONS & !team_deny;
+    }
+    let Some(r) = rules else { return base };
+    let mut p = (base & !r.everyone_deny) | r.everyone_allow;
+    p = (p & !r.roles_deny) | r.roles_allow;
+    p = (p & !r.member_deny) | r.member_allow;
+    p &= !team_deny;
+    if p & PERM_VIEW == 0 { 0 } else { p }
 }
 
 #[cfg(test)]
@@ -491,5 +530,199 @@ mod db_tests {
                 .unwrap(),
             "an allow override must grant on the multi-team path"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_045_backfills_view_and_owner_administrator_and_creates_no_rule_sets() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let admin = PgPool::connect(&url).await.expect("connect admin");
+        let db = format!("mig045_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {db}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{db}", url.rsplit_once('/').unwrap().0);
+        let pool = PgPool::connect(&db_url).await.expect("connect scratch db");
+
+        let full = sqlx::migrate!("./migrations");
+        let before_045 = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                full.migrations.iter().filter(|m| m.version < 45).cloned().collect(),
+            ),
+            ..sqlx::migrate!("./migrations")
+        };
+        before_045.run(&pool).await.expect("migrate to 044");
+
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let legacy_all: i64 = (1 << 17) - 1;
+        let owner_role: Uuid = sqlx::query_scalar(
+            "INSERT INTO team_roles (team_id, name, permissions, is_builtin, position)
+             VALUES ($1, 'owner', $2, TRUE, 0) RETURNING id",
+        )
+        .bind(team)
+        .bind(legacy_all)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let custom = seed_role(&pool, team, "legacy", PERM_CONNECT).await;
+
+        full.run(&pool).await.expect("migrate to head");
+
+        let perms = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT permissions FROM team_roles WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(perms(owner_role).await, legacy_all | PERM_VIEW | PERM_ADMINISTRATOR);
+        assert_eq!(perms(custom).await, PERM_CONNECT | PERM_VIEW);
+        let sets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_sets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sets, 0);
+
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)")).execute(&admin).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_object_cannot_point_at_another_teams_rule_set() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team_a = seed_team(&pool, owner).await;
+        let team_b = seed_team(&pool, owner).await;
+        crate::test_support::seed_team_object(&pool, team_a, owner, "o-1", "connection").await;
+        let foreign = crate::test_support::seed_rule_set(&pool, team_b, owner, &[]).await;
+
+        let res = sqlx::query(
+            "UPDATE team_vault_objects SET rule_set_id = $3 WHERE team_id = $1 AND object_id = $2",
+        )
+        .bind(team_a)
+        .bind("o-1")
+        .bind(foreign)
+        .execute(&pool)
+        .await;
+
+        assert!(res.is_err(), "the composite FK must refuse a cross-team pointer");
+    }
+}
+
+#[cfg(test)]
+mod object_permission_tests {
+    use super::*;
+
+    const MEMBER: i64 = PERM_VIEW | PERM_CONNECT | PERM_VIEW_SECRETS;
+
+    fn layers() -> RuleLayers {
+        RuleLayers::default()
+    }
+
+    #[test]
+    fn no_rule_set_returns_the_team_mask() {
+        assert_eq!(object_permissions(MEMBER, 0, None), MEMBER);
+    }
+
+    #[test]
+    fn a_rule_set_with_no_relevant_entries_keeps_the_team_mask() {
+        assert_eq!(object_permissions(MEMBER, 0, Some(&layers())), MEMBER);
+    }
+
+    #[test]
+    fn everyone_deny_removes_and_everyone_allow_adds() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW_SECRETS, everyone_allow: PERM_COPY_SECRETS, ..layers() };
+        assert_eq!(
+            object_permissions(MEMBER, 0, Some(&r)),
+            PERM_VIEW | PERM_CONNECT | PERM_COPY_SECRETS
+        );
+    }
+
+    #[test]
+    fn role_layer_overrides_everyone() {
+        let r = RuleLayers { everyone_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+    }
+
+    #[test]
+    fn within_the_role_layer_allow_beats_deny() {
+        let r = RuleLayers { roles_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+    }
+
+    #[test]
+    fn member_layer_overrides_roles() {
+        let r = RuleLayers { roles_allow: PERM_EDIT_CONNECTIONS, member_deny: PERM_EDIT_CONNECTIONS, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+    }
+
+    #[test]
+    fn team_deny_stays_absolute_over_a_member_allow() {
+        let base = MEMBER & !PERM_VIEW_SECRETS;
+        let r = RuleLayers { member_allow: PERM_VIEW_SECRETS, ..layers() };
+        assert_eq!(object_permissions(base, PERM_VIEW_SECRETS, Some(&r)), base);
+    }
+
+    #[test]
+    fn losing_view_zeroes_every_bit() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), 0);
+    }
+
+    #[test]
+    fn a_rule_can_grant_view_the_team_mask_lacks() {
+        let r = RuleLayers { member_allow: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r)), PERM_VIEW | PERM_CONNECT);
+    }
+
+    #[test]
+    fn administrator_ignores_every_rule() {
+        let r = RuleLayers { everyone_deny: ALL_PERMISSIONS, member_deny: ALL_PERMISSIONS, ..layers() };
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r)), ALL_PERMISSIONS);
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, None), ALL_PERMISSIONS);
+    }
+
+    #[test]
+    fn administrator_still_loses_a_team_denied_bit() {
+        assert_eq!(
+            object_permissions(PERM_ADMINISTRATOR, PERM_COPY_SECRETS, None),
+            ALL_PERMISSIONS & !PERM_COPY_SECRETS
+        );
+    }
+
+    #[test]
+    fn object_rule_bits_exclude_administrator_and_team_only_bits() {
+        assert_eq!(OBJECT_RULE_BITS & PERM_ADMINISTRATOR, 0);
+        assert_eq!(OBJECT_RULE_BITS & PERM_INVITE_MEMBERS, 0);
+        assert_eq!(OBJECT_RULE_BITS & PERM_VIEW_AUDIT_LOG, 0);
+        assert_ne!(OBJECT_RULE_BITS & PERM_MANAGE_ROLES, 0);
+    }
+
+    #[test]
+    fn every_builtin_role_has_view_and_only_owner_is_administrator() {
+        for (name, perms, _) in BUILTIN_ROLES {
+            assert_ne!(perms & PERM_VIEW, 0, "{name} lacks VIEW");
+            assert_eq!(perms & PERM_ADMINISTRATOR != 0, *name == "owner", "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod keep_era_bits_tests {
+    use super::*;
+
+    #[test]
+    fn a_sent_era_bit_is_dropped_in_favor_of_the_stored_one() {
+        assert_eq!(keep_era_bits(PERM_CONNECT | PERM_VIEW, 0), PERM_CONNECT);
+        assert_eq!(keep_era_bits(PERM_CONNECT, PERM_VIEW | PERM_ADMINISTRATOR), PERM_CONNECT | PERM_VIEW | PERM_ADMINISTRATOR);
+    }
+
+    #[test]
+    fn non_era_bits_pass_through_unchanged() {
+        assert_eq!(keep_era_bits(PERM_CONNECT | PERM_COPY_SECRETS, 0), PERM_CONNECT | PERM_COPY_SECRETS);
     }
 }

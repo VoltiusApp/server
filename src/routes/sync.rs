@@ -245,22 +245,11 @@ impl Drop for PresenceGuard {
                 notifier.notify_presence_changed(*recipient, user_id, false);
             }
             // For each connection the user was broadcasting, fan out stop events to
-            // teammates that share at least one team owning that connection.
+            // teammates who can currently View that connection.
             for connection_id in stale_connections {
-                let recipients: Vec<Uuid> = sqlx::query_scalar(
-                    r#"SELECT DISTINCT tm.user_id
-                       FROM team_members tm
-                       JOIN team_vault_objects tvo ON tvo.team_id = tm.team_id
-                       WHERE tvo.object_id = $1
-                         AND tvo.object_type = 'connection'
-                         AND tvo.deleted_at IS NULL
-                         AND tm.user_id != $2"#,
-                )
-                .bind(&connection_id)
-                .bind(user_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
+                let recipients = crate::object_authz::connection_viewers(&pool, &connection_id, user_id)
+                    .await
+                    .unwrap_or_default();
                 for recipient in recipients {
                     notifier.notify_connection_usage_changed(
                         recipient,
