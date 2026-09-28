@@ -628,8 +628,8 @@ pub async fn upsert_secret(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Locked here (not just the target below) so a concurrent write cannot
-    // repoint this secret out from under the owner check just below.
+    // Locks the row if one already exists, so a concurrent write cannot
+    // repoint it before the owner check below runs.
     let existing = sqlx::query_as::<_, (String, String)>(
         "SELECT object_id, secret_type FROM team_vault_secrets WHERE team_id = $1 AND secret_id = $2 FOR UPDATE",
     )
@@ -655,10 +655,8 @@ pub async fn upsert_secret(
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    // The request names the object it wants to attach the secret to, but a
-    // pre-existing secret_id may currently belong to a different object —
-    // that owner must be authorized too, or a caller with edit on some
-    // visible object could repoint and overwrite a hidden object's secret.
+    // A pre-existing secret may belong to a different object than the one
+    // named in the request; that owner must be authorized too.
     let mut rows = vec![target];
     let mut orphan_permission = None;
     if let Some((owner_id, secret_type)) = existing.filter(|(owner_id, _)| owner_id != &body.object_id) {
@@ -2305,10 +2303,6 @@ mod authz_tests {
         assert!(secret_upsert_as(&pool, f.team, f.admin, &f.object_id).await.is_ok());
     }
 
-    /// C1: a caller with edit on a visible object must not be able to
-    /// repoint a *different, hidden* object's secret onto it — the ON
-    /// CONFLICT update would rewrite the hidden secret's ciphertext and
-    /// object_id, having only ever authorized the visible one.
     #[tokio::test]
     async fn upsert_secret_cannot_repoint_a_hidden_owner_to_a_visible_object() {
         let pool = test_pool_or_skip!();
