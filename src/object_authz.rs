@@ -161,9 +161,7 @@ impl ObjectAuthz {
     }
 
     pub fn grants_anywhere(&self, live_sets: &[Uuid], bits: i64) -> bool {
-        self.is_admin()
-            || self.member.base & bits != 0
-            || live_sets.iter().any(|s| self.can_any(Some(*s), bits))
+        self.can_any(None, bits) || live_sets.iter().any(|s| self.can_any(Some(*s), bits))
     }
 }
 
@@ -359,6 +357,33 @@ mod tests {
 
         point_object(&pool, team, "h-1", Some(set)).await;
         assert!(authz.grants_anywhere(&live_rule_set_ids(&pool, team).await.unwrap(), PERM_CONNECT));
+    }
+
+    #[tokio::test]
+    async fn grants_anywhere_sees_a_team_wide_grant_without_a_pointed_object() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        let authz = ObjectAuthz::load(&pool, team, member).await.unwrap().unwrap();
+        assert!(authz.grants_anywhere(&[], PERM_CONNECT));
+    }
+
+    #[tokio::test]
+    async fn grants_anywhere_requires_view_on_the_team_wide_path() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let role = seed_role(&pool, team, "connect-no-view", PERM_CONNECT).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        assign_role(&pool, team, member, role).await;
+        seed_rule_set(&pool, team, owner, &[]).await;
+
+        let authz = ObjectAuthz::load(&pool, team, member).await.unwrap().unwrap();
+        let live = live_rule_set_ids(&pool, team).await.unwrap();
+        assert!(!authz.grants_anywhere(&live, PERM_CONNECT));
     }
 
     #[tokio::test]
