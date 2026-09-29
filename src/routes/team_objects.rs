@@ -11,14 +11,13 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::object_authz::{
-    gc_rule_sets, live_rule_set_ids, object_row, record_member_client, require_rule_set_client,
-    rule_set_in_team, ObjectAuthz,
+    gc_rule_sets, live_rule_set_ids, object_row, record_member_client, rule_set_in_team, ObjectAuthz,
 };
 use crate::permissions::{
     PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
     PERM_EDIT_SNIPPETS, PERM_MANAGE_ROLES, PERM_VIEW, PERM_VIEW_SECRETS,
 };
-use crate::routes::client_version::{require_client_version, MinClientVersion};
+use crate::routes::client_version::{require_client_version, require_rule_set_feature, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -182,7 +181,7 @@ pub async fn list_objects(
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<TeamObjectResponse>>, StatusCode> {
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
     record_member_client(&pool, team_id, auth.0, &headers).await;
 
     let rows = sqlx::query_as::<
@@ -244,7 +243,7 @@ pub async fn upsert_object(
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
 
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
 
     if let Some(Some(target)) = body.rule_set_id {
@@ -369,7 +368,7 @@ pub async fn reencrypt_objects(
     Json(items): Json<Vec<ReencryptItem>>,
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
 
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
 
@@ -443,7 +442,7 @@ pub async fn reencrypt_secrets(
     Path(team_id): Path<Uuid>,
     Json(items): Json<Vec<ReencryptSecretItem>>,
 ) -> Result<StatusCode, StatusCode> {
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
 
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
 
@@ -529,7 +528,7 @@ pub async fn delete_object(
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
 
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
     let row = object_row(&pool, team_id, &object_id).await?.ok_or(StatusCode::NOT_FOUND)?;
     require_edit_on(&authz, &[(row.object_type, row.rule_set_id)])?;
@@ -583,7 +582,7 @@ pub async fn list_secrets(
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<TeamSecretResponse>>, StatusCode> {
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
     const USE_OR_READ: i64 = PERM_CONNECT | PERM_VIEW_SECRETS;
     if !authz.grants_anywhere(&live_rule_set_ids(&pool, team_id).await?, USE_OR_READ) {
         return Err(StatusCode::FORBIDDEN);
@@ -629,7 +628,7 @@ pub async fn upsert_secret(
     Json(body): Json<UpsertSecretRequest>,
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
     if canonical_secret_id(&body.object_id, &body.secret_type).as_deref() != Some(body.secret_id.as_str()) {
         return Err(StatusCode::BAD_REQUEST);
@@ -760,7 +759,7 @@ pub async fn delete_secret(
     Path((team_id, secret_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, StatusCode> {
     require_client_version(&min_client_version, &headers)?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
 
     let (secret_type, object) = sqlx::query_as::<_, (String, Option<String>, Option<Uuid>)>(
@@ -841,7 +840,7 @@ mod authz_tests {
         let res = list_objects(
             State(pool.clone()),
             Extension(AuthUser(outsider)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
         )
         .await;
@@ -896,17 +895,16 @@ mod authz_tests {
         let member = seed_user(&pool).await;
         crate::test_support::add_member(&pool, team, member).await;
         crate::test_support::assign_role(&pool, team, member, role).await;
-        assert_eq!(listed_ids(&pool, team, member).await, vec!["plain".to_string()], "unchanged until the first rule set");
-
-        seed_rule_set(&pool, team, owner, &[]).await;
         assert!(listed_ids(&pool, team, member).await.is_empty());
     }
 
     #[tokio::test]
-    async fn list_objects_is_426_for_an_old_client_once_the_team_has_a_rule_set() {
+    async fn list_objects_is_426_for_an_old_client_on_a_team_without_rule_sets() {
         let pool = test_pool_or_skip!();
-        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
-        let res = list_objects(State(pool.clone()), Extension(AuthUser(f.viewer)), axum::http::HeaderMap::new(), Path(f.team)).await;
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_CONNECT).await;
+        let res = list_objects(State(pool.clone()), Extension(AuthUser(member)), axum::http::HeaderMap::new(), Path(team)).await;
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::UPGRADE_REQUIRED);
     }
 
@@ -923,7 +921,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -951,7 +949,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-2".to_string(),
@@ -979,7 +977,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -1013,7 +1011,7 @@ mod authz_tests {
         let team = seed_team(&pool, owner).await;
         let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await; // no VIEW_SECRETS
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team)).await;
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), rule_set_client_headers(), Path(team)).await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
@@ -1083,7 +1081,7 @@ mod authz_tests {
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: object_id.clone(),
@@ -1235,7 +1233,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(secret_body(&object_id)),
         )
@@ -1259,7 +1257,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(body),
         )
@@ -1303,7 +1301,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(body),
         )
@@ -1327,7 +1325,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -1357,7 +1355,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(body),
         )
@@ -1396,7 +1394,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(secret_body("does-not-exist")),
         )
@@ -1425,7 +1423,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(body),
         )
@@ -1462,7 +1460,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(body),
         )
@@ -1478,7 +1476,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(update),
         )
@@ -1507,7 +1505,7 @@ mod authz_tests {
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(body),
         )
@@ -1529,7 +1527,7 @@ mod authz_tests {
         // it left the role unable to connect to any host with a stored secret.
         let caller = member_with_role(&pool, team, PERM_CONNECT).await;
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team))
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), rule_set_client_headers(), Path(team))
             .await
             .expect("list secrets ok")
             .0;
@@ -1562,7 +1560,7 @@ mod authz_tests {
         )
         .bind(team).bind(&object_id).bind(owner).execute(&pool).await.expect("seed epoch-3 secret");
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team))
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), rule_set_client_headers(), Path(team))
             .await
             .expect("list secrets ok")
             .0;
@@ -1581,7 +1579,7 @@ mod authz_tests {
         // Edit rights on snippets grant neither bit.
         let caller = member_with_role(&pool, team, PERM_EDIT_SNIPPETS).await;
 
-        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team)).await;
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(caller)), rule_set_client_headers(), Path(team)).await;
 
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
@@ -1611,7 +1609,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -1634,7 +1632,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -1666,7 +1664,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path((team, secret_id.clone())),
         )
         .await;
@@ -1687,7 +1685,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path((team, "does-not-exist".to_string())),
         )
         .await;
@@ -1711,7 +1709,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path((team, object_id.clone())),
         )
         .await;
@@ -1735,7 +1733,7 @@ mod authz_tests {
             Extension(AuthUser(author)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(UpsertTeamObjectRequest {
                 object_id: "obj-1".to_string(),
@@ -1763,7 +1761,7 @@ mod authz_tests {
             Extension(AuthUser(migrator)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "obj-1".to_string(),
@@ -1823,7 +1821,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![
                 ReencryptItem {
@@ -1872,7 +1870,7 @@ mod authz_tests {
             Extension(AuthUser(outsider)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "does-not-exist".to_string(),
@@ -1893,7 +1891,7 @@ mod authz_tests {
         let team = seed_team(&pool, owner).await;
         let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
 
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = rule_set_client_headers();
         headers.insert("x-client-version", "0.32.1".parse().unwrap());
 
         let res = upsert_object(
@@ -1925,7 +1923,7 @@ mod authz_tests {
         let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
 
         // Exactly the floor — the boundary case worth pinning.
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = rule_set_client_headers();
         headers.insert("x-client-version", "0.33.0".parse().unwrap());
 
         let res = upsert_object(
@@ -1957,9 +1955,9 @@ mod authz_tests {
         // A real team member — `seed_team` alone does not make `owner` one.
         let caller = member_with_role(&pool, team, PERM_CONNECT).await;
 
-        // No X-Client-Version header, no rule set on the team: MinClientVersion
-        // never gates this route, and the rule-sets floor is a no-op until one exists.
-        let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), axum::http::HeaderMap::new(), Path(team)).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-features", "rule-sets".parse().unwrap());
+        let res = list_objects(State(pool.clone()), Extension(AuthUser(caller)), headers, Path(team)).await;
 
         assert!(res.is_ok());
     }
@@ -1983,7 +1981,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(items),
         )
@@ -2004,7 +2002,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "does-not-exist".to_string(),
@@ -2036,7 +2034,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(editor)),
             Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptSecretItem {
                 secret_id: "sec-1".to_string(),
@@ -2074,7 +2072,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptSecretItem {
                 secret_id: "sec-1".to_string(),
@@ -2107,7 +2105,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptSecretItem {
                 secret_id: "sec-orphan".to_string(),
@@ -2142,7 +2140,7 @@ mod authz_tests {
             State(pool.clone()),
             Extension(AuthUser(outsider)),
             Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptSecretItem {
                 secret_id: "does-not-exist".to_string(),
@@ -2170,7 +2168,7 @@ mod authz_tests {
             Extension(AuthUser(outsider)),
             Extension(SyncNotifier::new()),
             Extension(MinClientVersion(None)),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(vec![ReencryptItem {
                 object_id: "does-not-exist".to_string(),
@@ -2263,19 +2261,16 @@ mod authz_tests {
     }
 
     #[tokio::test]
-    async fn an_old_client_save_keeps_the_pointer_in_a_team_without_rule_sets_and_is_426_with_one() {
+    async fn an_old_client_save_is_426_on_a_team_without_rule_sets() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
-        upsert_as(&pool, team, editor, axum::http::HeaderMap::new(), object_body("o-1", None)).await.unwrap();
-        assert_eq!(stored_pointer(&pool, team, "o-1").await, None);
+        upsert_as(&pool, team, editor, rule_set_client_headers(), object_body("o-1", None)).await.unwrap();
 
-        let set = seed_rule_set(&pool, team, owner, &[]).await;
-        crate::test_support::point_object(&pool, team, "o-1", Some(set)).await;
-        let res = upsert_as(&pool, team, editor, axum::http::HeaderMap::new(), object_body("o-1", None)).await;
+        let res = upsert_as(&pool, team, editor, axum::http::HeaderMap::new(), object_body("o-2", None)).await;
         assert_eq!(res.unwrap_err(), StatusCode::UPGRADE_REQUIRED);
-        assert_eq!(stored_pointer(&pool, team, "o-1").await, Some(set));
+        assert_eq!(listed_ids(&pool, team, editor).await, vec!["o-1".to_string()]);
     }
 
     #[tokio::test]
