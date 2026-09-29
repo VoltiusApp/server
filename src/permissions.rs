@@ -592,6 +592,53 @@ mod db_tests {
     }
 
     #[tokio::test]
+    async fn migration_046_regrants_view_only_on_teams_without_rule_sets() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let admin = PgPool::connect(&url).await.expect("connect admin");
+        let db = format!("mig046_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {db}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{db}", url.rsplit_once('/').unwrap().0);
+        let pool = PgPool::connect(&db_url).await.expect("connect scratch db");
+
+        let full = sqlx::migrate!("./migrations");
+        let before_046 = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                full.migrations.iter().filter(|m| m.version < 46).cloned().collect(),
+            ),
+            ..sqlx::migrate!("./migrations")
+        };
+        before_046.run(&pool).await.expect("migrate to 045");
+
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let saved_by_old_app = seed_role(&pool, team, "legacy-edit", PERM_CONNECT).await;
+        let ruled_team = seed_team(&pool, owner).await;
+        crate::test_support::seed_rule_set(&pool, ruled_team, owner, &[]).await;
+        let deliberately_viewless = seed_role(&pool, ruled_team, "no-view", PERM_CONNECT).await;
+
+        full.run(&pool).await.expect("migrate to head");
+
+        let perms = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT permissions FROM team_roles WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(perms(saved_by_old_app).await, PERM_CONNECT | PERM_VIEW);
+        assert_eq!(perms(deliberately_viewless).await, PERM_CONNECT);
+
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)")).execute(&admin).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn an_object_cannot_point_at_another_teams_rule_set() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;

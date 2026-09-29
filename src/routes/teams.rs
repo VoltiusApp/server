@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
-use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries, team_has_rule_sets, MemberContext};
+use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries, MemberContext};
 use crate::routes::audit::write_audit_event;
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
@@ -1485,7 +1485,6 @@ pub async fn set_member_permissions(
     }
 
     let entries = rule_entries(&pool, team_id, None).await?;
-    let enforced = team_has_rule_sets(&pool, team_id).await?;
     let live = live_rule_set_ids(&pool, team_id).await?;
 
     let prev_ctx = MemberContext {
@@ -1500,8 +1499,8 @@ pub async fn set_member_permissions(
         team_deny: deny,
         role_ids: target_role_ids,
     };
-    let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), enforced, &live);
-    let held_after = holds_vault_key_gate(next_ctx, entries, enforced, &live);
+    let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), &live);
+    let held_after = holds_vault_key_gate(next_ctx, entries, &live);
     if held_before && !held_after {
         request_team_rotation(&mut tx, team_id).await?;
     }
@@ -3229,7 +3228,7 @@ mod override_response_tests {
         sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
         add_member(&pool, team, actor).await;
         assign_role(&pool, team, actor, actor_role).await;
-        let target_role = seed_role(&pool, team, "viewer", PERM_VIEW_SECRETS).await;
+        let target_role = seed_role(&pool, team, "viewer", PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW).await;
         sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
@@ -3394,7 +3393,7 @@ mod override_response_tests {
         let team = seed_team_with_roles(&pool, owner).await;
         let contractor = seed_user(&pool).await;
         add_member(&pool, team, contractor).await;
-        crate::test_support::set_member_overrides(&pool, team, contractor, PERM_VIEW_SECRETS, 0).await;
+        crate::test_support::set_member_overrides(&pool, team, contractor, PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW, 0).await;
 
         set_member_permissions(
             State(pool.clone()),

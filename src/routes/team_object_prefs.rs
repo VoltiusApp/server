@@ -133,7 +133,7 @@ mod authz_tests {
     use super::*;
     use crate::auth::AuthUser;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, seed_team, seed_team_object, seed_user};
+    use crate::test_support::{member_with_role, seed_team, seed_team_object, seed_user};
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
@@ -155,10 +155,8 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let alice = seed_user(&pool).await;
-        let bob = seed_user(&pool).await;
-        add_member(&pool, team, alice).await;
-        add_member(&pool, team, bob).await;
+        let alice = member_with_role(&pool, team, 0).await;
+        let bob = member_with_role(&pool, team, 0).await;
         seed_team_object(&pool, team, owner, "obj-a", "connection").await;
         seed_team_object(&pool, team, owner, "obj-b", "connection").await;
 
@@ -198,8 +196,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let member = seed_user(&pool).await;
-        add_member(&pool, team, member).await;
+        let member = member_with_role(&pool, team, 0).await;
 
         let res = upsert_object_pref(
             State(pool.clone()), Extension(AuthUser(member)),
@@ -229,8 +226,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let member = seed_user(&pool).await;
-        add_member(&pool, team, member).await;
+        let member = member_with_role(&pool, team, 0).await;
         seed_team_object(&pool, team, owner, "obj-1", "connection").await;
 
         // Set pinned=true → NO_CONTENT, and it shows up in the list read-back.
@@ -272,8 +268,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let member = seed_user(&pool).await;
-        add_member(&pool, team, member).await;
+        let member = member_with_role(&pool, team, 0).await;
         seed_team_object(&pool, team, owner, "obj-2", "connection").await;
         upsert_object_pref(
             State(pool.clone()), Extension(AuthUser(member)),

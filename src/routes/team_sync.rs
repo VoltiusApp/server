@@ -11,8 +11,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::object_authz::{live_rule_set_ids, require_rule_set_client, team_has_rule_sets, ObjectAuthz};
+use crate::object_authz::{live_rule_set_ids, ObjectAuthz};
 use crate::permissions::{is_team_member, PermCheck, PERM_VIEW};
+use crate::routes::client_version::require_rule_set_feature;
 use crate::self_host;
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
 
@@ -95,10 +96,7 @@ async fn require_vault_key_access(pool: &PgPool, team_id: Uuid, user_id: Uuid, a
     }
 }
 
-async fn require_admin_once_rule_sets(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<(), StatusCode> {
-    if !team_has_rule_sets(pool, team_id).await? {
-        return Ok(());
-    }
+async fn require_admin(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<(), StatusCode> {
     match ObjectAuthz::load(pool, team_id, user_id).await? {
         Some(a) if a.is_admin() && a.can(None, PERM_VIEW) => Ok(()),
         _ => Err(StatusCode::FORBIDDEN),
@@ -121,7 +119,7 @@ pub async fn get_my_vault_key(
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<VaultKeyResponse>, StatusCode> {
     require_vault_key_access(&pool, team_id, auth.0, "get_vault_key").await?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
 
     let row = sqlx::query_as::<_, (String, Uuid, i32)>(
         "SELECT wrapped_key, wrapped_by, key_version FROM team_vault_keys \
@@ -162,7 +160,7 @@ pub async fn get_vault_key_at_version(
     Path((team_id, version)): Path<(Uuid, i32)>,
 ) -> Result<Json<VaultKeyResponse>, StatusCode> {
     require_vault_key_access(&pool, team_id, auth.0, "get_vault_key_at_version").await?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
+    require_rule_set_feature(&headers)?;
 
     let row = sqlx::query_as::<_, (String, Uuid)>(
         "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = $3",
@@ -557,8 +555,8 @@ pub async fn get_team_blob(
         PermCheck::All(&[crate::permissions::PERM_VIEW_SECRETS]),
     )
     .await?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
-    require_admin_once_rule_sets(&pool, team_id, auth.0).await?;
+    require_rule_set_feature(&headers)?;
+    require_admin(&pool, team_id, auth.0).await?;
 
     let row = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>, i32)>(
         "SELECT blob, updated_at, key_version FROM team_sync_blobs WHERE team_id = $1",
@@ -624,8 +622,8 @@ pub async fn put_team_blob(
         ]),
     )
     .await?;
-    require_rule_set_client(&pool, team_id, &headers).await?;
-    require_admin_once_rule_sets(&pool, team_id, auth.0).await?;
+    require_rule_set_feature(&headers)?;
+    require_admin(&pool, team_id, auth.0).await?;
 
     let blob_bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.blob)
@@ -713,7 +711,7 @@ mod tests {
     use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_rule_set, seed_team,
+        add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_team,
         seed_user,
     };
     use axum::extract::{Path, State};
@@ -721,7 +719,7 @@ mod tests {
 
     /// Give `user` a role granting PERM_VIEW_SECRETS in `team`.
     async fn grant_view_secrets(pool: &PgPool, team: Uuid, user: Uuid) {
-        let role = seed_role(pool, team, "viewer", crate::permissions::PERM_VIEW_SECRETS).await;
+        let role = seed_role(pool, team, "viewer", crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW).await;
         assign_role(pool, team, user, role).await;
     }
 
@@ -732,9 +730,14 @@ mod tests {
             pool,
             team,
             "key-distributor",
-            crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS,
+            crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS | crate::permissions::PERM_VIEW,
         )
         .await;
+        assign_role(pool, team, user, role).await;
+    }
+
+    async fn grant_admin(pool: &PgPool, team: Uuid, user: Uuid) {
+        let role = seed_role(pool, team, "admin", crate::permissions::PERM_ADMINISTRATOR | crate::permissions::PERM_VIEW).await;
         assign_role(pool, team, user, role).await;
     }
 
@@ -859,22 +862,23 @@ mod tests {
         add_member(&pool, team, connect_only).await;
         grant_connect_only(&pool, team, connect_only).await;
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), axum::http::HeaderMap::new(), Path(team)).await;
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), rule_set_client_headers(), Path(team)).await;
 
         // `.err()` rather than `unwrap_err()`: TeamBlobResponse has no Debug.
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
 
     #[tokio::test]
-    async fn blob_readable_with_view_secrets_permission() {
+    async fn blob_readable_by_an_administrator_with_view_secrets() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
+        grant_admin(&pool, team, owner).await;
         insert_team_blob(&pool, team, owner).await;
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path(team))
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path(team))
             .await
             .expect("blob ok")
             .0;
@@ -886,7 +890,7 @@ mod tests {
 
     /// Give `user` a connect-only role: PERM_CONNECT and nothing else.
     async fn grant_connect_only(pool: &PgPool, team: Uuid, user: Uuid) {
-        let role = seed_role(pool, team, "connect-only", PERM_CONNECT).await;
+        let role = seed_role(pool, team, "connect-only", PERM_CONNECT | crate::permissions::PERM_VIEW).await;
         assign_role(pool, team, user, role).await;
     }
 
@@ -904,7 +908,7 @@ mod tests {
         grant_connect_only(&pool, team, connect_only).await;
         insert_vault_key(&pool, team, connect_only, owner).await;
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(connect_only)), axum::http::HeaderMap::new(), Path(team))
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(connect_only)), rule_set_client_headers(), Path(team))
             .await
             .expect("vault key ok")
             .0;
@@ -930,7 +934,7 @@ mod tests {
         )
         .bind(team).bind(owner).execute(&pool).await.expect("epoch 2");
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path(team))
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path(team))
             .await
             .expect("vault key ok")
             .0;
@@ -949,7 +953,7 @@ mod tests {
         add_member(&pool, team, member).await;
         insert_vault_key(&pool, team, member, owner).await;
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), axum::http::HeaderMap::new(), Path(team)).await;
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), rule_set_client_headers(), Path(team)).await;
 
         // `.err()` rather than `unwrap_err()`: VaultKeyResponse has no Debug.
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -962,7 +966,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         let outsider = seed_user(&pool).await;
 
-        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(outsider)), axum::http::HeaderMap::new(), Path(team)).await;
+        let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(outsider)), rule_set_client_headers(), Path(team)).await;
 
         // `.err()` rather than `unwrap_err()`: VaultKeyResponse has no Debug.
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -983,7 +987,7 @@ mod tests {
         grant_connect_only(&pool, team, connect_only).await;
         insert_vault_key(&pool, team, connect_only, owner).await;
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), axum::http::HeaderMap::new(), Path(team)).await;
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), rule_set_client_headers(), Path(team)).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
@@ -995,6 +999,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
+        grant_admin(&pool, team, owner).await;
 
         sqlx::query(
             "INSERT INTO team_sync_blobs (team_id, blob, size_bytes, updated_by, key_version) VALUES ($1, $2, $3, $4, $5)",
@@ -1002,7 +1007,7 @@ mod tests {
         .bind(team).bind(b"ciphertext".to_vec()).bind(10_i32).bind(owner).bind(2_i32)
         .execute(&pool).await.expect("insert blob at epoch 2");
 
-        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path(team))
+        let res = get_team_blob(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path(team))
             .await
             .expect("blob ok")
             .0;
@@ -1017,6 +1022,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets_and_copy(&pool, team, owner).await;
+        grant_admin(&pool, team, owner).await;
         // put_team_blob also requires EDIT_* — grant the full set the route checks.
         let role = seed_role(&pool, team, "blob-writer", crate::permissions::PERM_EDIT_CONNECTIONS
             | crate::permissions::PERM_EDIT_IDENTITIES | crate::permissions::PERM_EDIT_KEYS
@@ -1031,7 +1037,7 @@ mod tests {
             State(pool.clone()),
             Extension(AuthUser(owner)),
             Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
+            rule_set_client_headers(),
             Path(team),
             Json(PutTeamBlobRequest { blob: body_b64, key_version: 3 }),
         )
@@ -1045,12 +1051,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_team_blob_requires_admin_once_the_team_has_a_rule_set() {
+    async fn put_team_blob_requires_admin_on_a_team_without_rule_sets() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
-        seed_rule_set(&pool, team, owner, &[]).await;
 
         let full_edit = crate::permissions::PERM_EDIT_CONNECTIONS | crate::permissions::PERM_EDIT_IDENTITIES
             | crate::permissions::PERM_EDIT_KEYS | crate::permissions::PERM_EDIT_FOLDERS
@@ -1058,7 +1063,7 @@ mod tests {
 
         let editor = seed_user(&pool).await;
         add_member(&pool, team, editor).await;
-        let role = seed_role(&pool, team, "blob-writer", full_edit).await;
+        let role = seed_role(&pool, team, "blob-writer", full_edit | crate::permissions::PERM_VIEW).await;
         assign_role(&pool, team, editor, role).await;
 
         let admin = member_with_role(&pool, team, full_edit | crate::permissions::PERM_ADMINISTRATOR).await;
@@ -1074,7 +1079,7 @@ mod tests {
             Json(PutTeamBlobRequest { blob: body_b64.clone(), key_version: 4 }),
         )
         .await;
-        assert_eq!(res, Err(StatusCode::FORBIDDEN), "the old full-edit gate must not bypass the admin-only gate once a rule set exists");
+        assert_eq!(res, Err(StatusCode::FORBIDDEN), "the full-edit gate alone must not reach the legacy blob");
 
         let res = put_team_blob(
             State(pool.clone()),
@@ -1119,7 +1124,7 @@ mod tests {
         )
         .bind(team).bind(owner).execute(&pool).await.expect("epoch 2");
 
-        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path((team, 1)))
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path((team, 1)))
             .await
             .expect("epoch 1 ok")
             .0;
@@ -1142,7 +1147,7 @@ mod tests {
         )
         .bind(team).bind(owner).execute(&pool).await.expect("epoch 2 only");
 
-        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), axum::http::HeaderMap::new(), Path((team, 1))).await;
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path((team, 1))).await;
 
         assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
     }
@@ -1154,7 +1159,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         let outsider = seed_user(&pool).await;
 
-        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), axum::http::HeaderMap::new(), Path((team, 1))).await;
+        let res = get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(outsider)), rule_set_client_headers(), Path((team, 1))).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }
@@ -1589,16 +1594,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_blob_is_admin_only_once_the_team_has_a_rule_set() {
+    async fn sync_blob_is_admin_only_on_a_team_without_rule_sets() {
         let pool = test_pool_or_skip!();
-        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_VIEW_SECRETS).await;
-        crate::test_support::set_user_tier(&pool, f.owner, "teams").await;
-        insert_team_blob(&pool, f.team, f.owner).await;
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        insert_team_blob(&pool, team, owner).await;
 
-        let member = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(f.viewer)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
+        let viewer = member_with_role(&pool, team, PERM_VIEW_SECRETS).await;
+        let member = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(viewer)), rule_set_client_headers(), Path(team)).await;
         assert_eq!(member.err(), Some(StatusCode::FORBIDDEN));
-        let admin_member = crate::test_support::member_with_role(&pool, f.team, PERM_VIEW_SECRETS | crate::permissions::PERM_ADMINISTRATOR).await;
-        let admin = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(admin_member)), crate::test_support::rule_set_client_headers(), Path(f.team)).await;
+        let admin_member = member_with_role(&pool, team, PERM_VIEW_SECRETS | crate::permissions::PERM_ADMINISTRATOR).await;
+        let admin = get_team_blob(State(pool.clone()), axum::Extension(AuthUser(admin_member)), rule_set_client_headers(), Path(team)).await;
         assert!(admin.is_ok());
     }
 
@@ -1617,11 +1624,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vault_key_is_426_for_an_old_client_once_the_team_has_a_rule_set() {
+    async fn vault_key_is_426_for_an_old_client_on_a_team_without_rule_sets() {
         let pool = test_pool_or_skip!();
-        let f = crate::test_support::hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
-        crate::test_support::set_user_tier(&pool, f.owner, "teams").await;
-        let res = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(f.viewer)), axum::http::HeaderMap::new(), Path(f.team)).await;
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_CONNECT).await;
+        insert_vault_key(&pool, team, member, owner).await;
+        let res = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(member)), axum::http::HeaderMap::new(), Path(team)).await;
         assert_eq!(res.err(), Some(StatusCode::UPGRADE_REQUIRED));
     }
 }

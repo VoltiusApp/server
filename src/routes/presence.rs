@@ -163,7 +163,7 @@ mod authz_tests {
     use crate::auth::AuthUser;
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, seed_team, seed_team_object, seed_user};
+    use crate::test_support::{member_with_role, seed_team, seed_team_object, seed_user};
     use crate::UsageMap;
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -216,8 +216,7 @@ mod authz_tests {
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         seed_team_object(&pool, team, owner, "conn-2", "connection").await;
-        let member = seed_user(&pool).await;
-        add_member(&pool, team, member).await;
+        let member = member_with_role(&pool, team, 0).await;
         let usage = empty_usage();
 
         let set = post_connection_usage(
@@ -300,10 +299,8 @@ mod authz_tests {
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         seed_team_object(&pool, team, owner, "conn-3", "connection").await;
-        let me = seed_user(&pool).await;
-        let mate = seed_user(&pool).await;
-        add_member(&pool, team, me).await;
-        add_member(&pool, team, mate).await;
+        let me = member_with_role(&pool, team, 0).await;
+        let mate = member_with_role(&pool, team, 0).await;
 
         // Teammate is broadcasting conn-3; I am NOT (self must be excluded).
         let usage: UsageMap = Arc::new(DashMap::new());

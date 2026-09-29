@@ -121,7 +121,6 @@ pub async fn rule_entries(
 pub struct ObjectAuthz {
     member: MemberContext,
     entries: HashMap<Uuid, Vec<RuleEntry>>,
-    enforced: bool,
 }
 
 impl ObjectAuthz {
@@ -130,12 +129,11 @@ impl ObjectAuthz {
             return Ok(None);
         };
         let entries = rule_entries(pool, team_id, None).await?;
-        let enforced = team_has_rule_sets(pool, team_id).await?;
-        Ok(Some(Self::for_member(member, entries, enforced)))
+        Ok(Some(Self::for_member(member, entries)))
     }
 
-    pub fn for_member(member: MemberContext, entries: HashMap<Uuid, Vec<RuleEntry>>, enforced: bool) -> Self {
-        Self { member, entries, enforced }
+    pub fn for_member(member: MemberContext, entries: HashMap<Uuid, Vec<RuleEntry>>) -> Self {
+        Self { member, entries }
     }
 
     pub fn is_admin(&self) -> bool {
@@ -149,8 +147,7 @@ impl ObjectAuthz {
                 .map(|es| layers_for(es, &self.member.role_ids, self.member.user_id))
                 .unwrap_or_default()
         });
-        let m = object_permissions(self.member.base, self.member.team_deny, layers.as_ref());
-        if self.enforced { m } else { m | PERM_VIEW }
+        object_permissions(self.member.base, self.member.team_deny, layers.as_ref())
     }
 
     pub fn can(&self, set: Option<Uuid>, bits: i64) -> bool {
@@ -168,19 +165,13 @@ impl ObjectAuthz {
     }
 
     pub fn holds_vault_key_gate(&self, live: &[Uuid]) -> bool {
-        holds_vault_key_gate(self.member.clone(), self.entries.clone(), self.enforced, live)
+        holds_vault_key_gate(self.member.clone(), self.entries.clone(), live)
     }
 }
 
 /// Team-level `CONNECT`/`VIEW_SECRETS`, or either bit on any live object.
-pub fn holds_vault_key_gate(
-    member: MemberContext,
-    entries: HashMap<Uuid, Vec<RuleEntry>>,
-    enforced: bool,
-    live: &[Uuid],
-) -> bool {
-    ObjectAuthz::for_member(member, entries, enforced)
-        .grants_anywhere(live, PERM_CONNECT | PERM_VIEW_SECRETS)
+pub fn holds_vault_key_gate(member: MemberContext, entries: HashMap<Uuid, Vec<RuleEntry>>, live: &[Uuid]) -> bool {
+    ObjectAuthz::for_member(member, entries).grants_anywhere(live, PERM_CONNECT | PERM_VIEW_SECRETS)
 }
 
 pub struct ObjectRow {
@@ -212,10 +203,9 @@ pub async fn connection_viewers(pool: &PgPool, connection_id: &str, exclude: Uui
     let mut viewers = Vec::new();
     for (team_id, set) in owners {
         let entries = rule_entries(pool, team_id, set.as_ref().map(std::slice::from_ref)).await?;
-        let enforced = team_has_rule_sets(pool, team_id).await?;
         for member in member_contexts(pool, team_id, None).await? {
             let user_id = member.user_id;
-            if user_id != exclude && ObjectAuthz::for_member(member, entries.clone(), enforced).can(set, PERM_VIEW) {
+            if user_id != exclude && ObjectAuthz::for_member(member, entries.clone()).can(set, PERM_VIEW) {
                 viewers.push(user_id);
             }
         }
@@ -307,22 +297,6 @@ pub async fn sweep_unattached_rule_sets(pool: &PgPool) -> Result<u64, sqlx::Erro
     .map(|r| r.rows_affected())
 }
 
-pub async fn team_has_rule_sets(pool: &PgPool, team_id: Uuid) -> Result<bool, StatusCode> {
-    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM team_rule_sets WHERE team_id = $1)")
-        .bind(team_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| db_error(e, "team_has_rule_sets"))
-}
-
-pub async fn require_rule_set_client(pool: &PgPool, team_id: Uuid, headers: &HeaderMap) -> Result<(), StatusCode> {
-    if client_supports_rule_sets(headers) || !team_has_rule_sets(pool, team_id).await? {
-        Ok(())
-    } else {
-        Err(StatusCode::UPGRADE_REQUIRED)
-    }
-}
-
 pub async fn record_member_client(pool: &PgPool, team_id: Uuid, user_id: Uuid, headers: &HeaderMap) {
     let version = headers
         .get("x-client-version")
@@ -403,19 +377,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforcement_starts_with_the_first_rule_set() {
+    async fn a_role_without_view_sees_nothing_on_a_team_without_rule_sets() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let roleless = seed_user(&pool).await;
-        add_member(&pool, team, roleless).await;
+        let role = seed_role(&pool, team, "no-view", PERM_CONNECT).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        assign_role(&pool, team, member, role).await;
 
-        let before = ObjectAuthz::load(&pool, team, roleless).await.unwrap().unwrap();
-        assert!(before.can(None, PERM_VIEW), "no rule set yet: everyone sees everything, as before");
+        let authz = ObjectAuthz::load(&pool, team, member).await.unwrap().unwrap();
 
-        seed_rule_set(&pool, team, owner, &[]).await;
-        let after = ObjectAuthz::load(&pool, team, roleless).await.unwrap().unwrap();
-        assert!(!after.can(None, PERM_VIEW), "a member without VIEW sees nothing once rules exist");
+        assert!(!authz.can(None, PERM_VIEW));
+        assert_eq!(authz.mask(None), PERM_CONNECT);
     }
 
     #[tokio::test]
@@ -489,22 +463,6 @@ mod tests {
         let authz = ObjectAuthz::load(&pool, team, member).await.unwrap().unwrap();
         let live = live_rule_set_ids(&pool, team).await.unwrap();
         assert!(!authz.grants_anywhere(&live, PERM_CONNECT));
-    }
-
-    #[tokio::test]
-    async fn floor_applies_only_once_the_team_has_a_rule_set() {
-        let pool = test_pool_or_skip!();
-        let owner = seed_user(&pool).await;
-        let team = seed_team(&pool, owner).await;
-        let old = axum::http::HeaderMap::new();
-
-        assert!(require_rule_set_client(&pool, team, &old).await.is_ok());
-        seed_rule_set(&pool, team, owner, &[]).await;
-        assert_eq!(
-            require_rule_set_client(&pool, team, &old).await,
-            Err(axum::http::StatusCode::UPGRADE_REQUIRED)
-        );
-        assert!(require_rule_set_client(&pool, team, &rule_set_client_headers()).await.is_ok());
     }
 
     #[tokio::test]
