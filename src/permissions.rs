@@ -592,7 +592,7 @@ mod db_tests {
     }
 
     #[tokio::test]
-    async fn migration_046_regrants_view_to_a_role_saved_without_it() {
+    async fn migration_046_regrants_view_only_on_teams_without_rule_sets() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
             return;
@@ -615,15 +615,24 @@ mod db_tests {
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         let saved_by_old_app = seed_role(&pool, team, "legacy-edit", PERM_CONNECT).await;
+        let ruled_team = seed_team(&pool, owner).await;
+        crate::test_support::seed_rule_set(&pool, ruled_team, owner, &[]).await;
+        let deliberately_viewless = seed_role(&pool, ruled_team, "no-view", PERM_CONNECT).await;
 
         full.run(&pool).await.expect("migrate to head");
 
-        let perms: i64 = sqlx::query_scalar("SELECT permissions FROM team_roles WHERE id = $1")
-            .bind(saved_by_old_app)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(perms, PERM_CONNECT | PERM_VIEW);
+        let perms = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT permissions FROM team_roles WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(perms(saved_by_old_app).await, PERM_CONNECT | PERM_VIEW);
+        assert_eq!(perms(deliberately_viewless).await, PERM_CONNECT);
 
         pool.close().await;
         sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)")).execute(&admin).await.unwrap();
