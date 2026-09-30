@@ -101,7 +101,7 @@ pub async fn effective_permissions(
         .bind(user_id)
         .fetch_optional(pool)
         .await
-        .map(|v| v.unwrap_or(0))
+        .map(|v| with_dependencies(v.unwrap_or(0)))
         .map_err(|e| {
             error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permission");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -231,14 +231,19 @@ pub struct RuleLayers {
 /// Keep in sync with `resolveObjectPermissions` in the client's `src/services/permissions.ts`.
 pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>) -> i64 {
     if base & PERM_ADMINISTRATOR != 0 {
-        return ALL_PERMISSIONS & !team_deny;
+        return with_dependencies(ALL_PERMISSIONS & !team_deny);
     }
-    let Some(r) = rules else { return base };
+    let Some(r) = rules else { return with_dependencies(base) };
     let mut p = (base & !r.everyone_deny) | r.everyone_allow;
     p = (p & !r.roles_deny) | r.roles_allow;
     p = (p & !r.member_deny) | r.member_allow;
     p &= !team_deny;
-    if p & PERM_VIEW == 0 { 0 } else { p }
+    if p & PERM_VIEW == 0 { 0 } else { with_dependencies(p) }
+}
+
+/// A secret that can be read can be used, so reading one requires `CONNECT` (or Administrator).
+pub fn with_dependencies(p: i64) -> i64 {
+    if p & (PERM_CONNECT | PERM_ADMINISTRATOR) == 0 { p & !(PERM_VIEW_SECRETS | PERM_COPY_SECRETS) } else { p }
 }
 
 #[cfg(test)]
@@ -274,14 +279,14 @@ mod db_tests {
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
         let team = seed_team(&pool, user).await;
-        let role_a = seed_role(&pool, team, "a", PERM_VIEW_SECRETS).await;
+        let role_a = seed_role(&pool, team, "a", PERM_CONNECT).await;
         let role_b = seed_role(&pool, team, "b", PERM_MANAGE_ROLES).await;
         add_member(&pool, team, user).await;
         assign_role(&pool, team, user, role_a).await;
         assign_role(&pool, team, user, role_b).await;
 
         // Bits from either role are effective (bit_or).
-        assert!(has_team_permission(&pool, team, user, PERM_VIEW_SECRETS)
+        assert!(has_team_permission(&pool, team, user, PERM_CONNECT)
             .await
             .unwrap());
         assert!(has_team_permission(&pool, team, user, PERM_MANAGE_ROLES)
@@ -724,6 +729,31 @@ mod object_permission_tests {
     fn a_rule_can_grant_view_the_team_mask_lacks() {
         let r = RuleLayers { member_allow: PERM_VIEW, ..layers() };
         assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r)), PERM_VIEW | PERM_CONNECT);
+    }
+
+    #[test]
+    fn denying_connect_on_an_object_also_removes_its_secrets() {
+        let r = RuleLayers { everyone_deny: PERM_CONNECT, ..layers() };
+        let base = MEMBER | PERM_COPY_SECRETS;
+        assert_eq!(object_permissions(base, 0, Some(&r)), PERM_VIEW);
+    }
+
+    #[test]
+    fn secrets_without_connect_grant_nothing_on_the_team_mask() {
+        let base = PERM_VIEW | PERM_VIEW_SECRETS | PERM_COPY_SECRETS;
+        assert_eq!(object_permissions(base, 0, None), PERM_VIEW);
+    }
+
+    #[test]
+    fn a_member_allow_of_secrets_needs_connect_too() {
+        let r = RuleLayers { member_deny: PERM_CONNECT, member_allow: PERM_VIEW_SECRETS, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), PERM_VIEW);
+    }
+
+    #[test]
+    fn administrator_satisfies_the_connect_dependency() {
+        let p = PERM_ADMINISTRATOR | PERM_VIEW_SECRETS | PERM_COPY_SECRETS;
+        assert_eq!(with_dependencies(p), p);
     }
 
     #[test]

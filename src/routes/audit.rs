@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::object_authz::{hidden_object_ids, live_rule_set_ids, object_row, ObjectAuthz};
-use crate::permissions::{has_team_permission, PERM_CONNECT, PERM_VIEW, PERM_VIEW_AUDIT_LOG, PERM_VIEW_SECRETS};
+use crate::permissions::{has_team_permission, PERM_CONNECT, PERM_VIEW, PERM_VIEW_AUDIT_LOG};
 use crate::rate_limit::RateLimiter;
 
 // ─── Rate limiter newtype ─────────────────────────────────────────────────────
@@ -419,7 +419,7 @@ pub async fn report_client_event(
 
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
     let live = live_rule_set_ids(&pool, team_id).await?;
-    if !authz.grants_anywhere(&live, PERM_CONNECT | PERM_VIEW_SECRETS) {
+    if !authz.grants_anywhere(&live, PERM_CONNECT) {
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(target_id) = &body.target_id {

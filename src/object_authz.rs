@@ -7,7 +7,6 @@ use uuid::Uuid;
 
 use crate::permissions::{
     object_permissions, RuleLayers, PERMISSION_JOINS, PERM_ADMINISTRATOR, PERM_CONNECT, PERM_VIEW,
-    PERM_VIEW_SECRETS,
 };
 use crate::routes::client_version::client_supports_rule_sets;
 
@@ -169,9 +168,9 @@ impl ObjectAuthz {
     }
 }
 
-/// Team-level `CONNECT`/`VIEW_SECRETS`, or either bit on any live object.
+/// Team-level `CONNECT`, or `CONNECT` on any live object.
 pub fn holds_vault_key_gate(member: MemberContext, entries: HashMap<Uuid, Vec<RuleEntry>>, live: &[Uuid]) -> bool {
-    ObjectAuthz::for_member(member, entries).grants_anywhere(live, PERM_CONNECT | PERM_VIEW_SECRETS)
+    ObjectAuthz::for_member(member, entries).grants_anywhere(live, PERM_CONNECT)
 }
 
 pub struct ObjectRow {
@@ -401,11 +400,11 @@ mod tests {
         let member = seed_user(&pool).await;
         add_member(&pool, team, member).await;
         assign_role(&pool, team, member, role).await;
-        let set = seed_rule_set(&pool, team, owner, &[("role", Some(role), PERM_VIEW_SECRETS, 0)]).await;
+        let set = seed_rule_set(&pool, team, owner, &[("role", Some(role), PERM_CONNECT, 0)]).await;
 
         let authz = ObjectAuthz::load(&pool, team, member).await.unwrap().unwrap();
 
-        assert_eq!(authz.mask(Some(set)), PERM_VIEW | PERM_VIEW_SECRETS);
+        assert_eq!(authz.mask(Some(set)), PERM_VIEW | PERM_CONNECT);
     }
 
     #[tokio::test]
