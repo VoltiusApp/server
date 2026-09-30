@@ -518,7 +518,7 @@ pub async fn add_member(
     Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
 }
 
-async fn request_team_rotation(
+pub(crate) async fn request_team_rotation(
     conn: &mut sqlx::PgConnection,
     team_id: Uuid,
 ) -> Result<(), StatusCode> {

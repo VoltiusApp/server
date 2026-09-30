@@ -1,10 +1,15 @@
 use axum::http::StatusCode;
 use sqlx::PgPool;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::entitlement::{effective_tier_of, TierRow, OWNER_PLAN_COLUMNS};
+use crate::object_authz::{
+    holds_vault_key_gate, live_rule_set_ids, member_rows, rule_entries, MemberRow,
+};
+use crate::routes::teams::{notify_team_members_changed, request_team_rotation};
 use crate::self_host;
+use crate::sync_notifier::SyncNotifier;
 
 pub fn plan_from_row(row: &TierRow) -> String {
     if self_host::is_self_hosted() {
@@ -33,6 +38,77 @@ pub async fn team_plan(pool: &PgPool, team_id: Uuid) -> Result<String, StatusCod
 
 pub async fn team_locked(pool: &PgPool, team_id: Uuid) -> Result<bool, StatusCode> {
     Ok(team_plan(pool, team_id).await? != "business")
+}
+
+pub async fn reconcile_team_plan(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    team_id: Uuid,
+) -> Result<(), StatusCode> {
+    let locked_now = team_locked(pool, team_id).await?;
+    let db = |e: sqlx::Error| {
+        error!(error = %e, team_id = %team_id, "Failed to reconcile team plan");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let mut tx = pool.begin().await.map_err(db)?;
+    let stored: Option<bool> =
+        sqlx::query_scalar("SELECT granular_locked FROM teams WHERE id = $1 FOR UPDATE")
+            .bind(team_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+    if stored.is_none_or(|s| s == locked_now) {
+        return Ok(());
+    }
+    let members = member_rows(pool, team_id, None).await?;
+    if locked_now {
+        let entries = rule_entries(pool, team_id, None).await?;
+        let live = live_rule_set_ids(pool, team_id).await?;
+        let gate =
+            |m: &MemberRow, locked| holds_vault_key_gate(m.context(locked), entries.clone(), &live);
+        if members.iter().any(|m| gate(m, false) && !gate(m, true)) {
+            request_team_rotation(&mut tx, team_id).await?;
+        }
+    }
+    sqlx::query("UPDATE teams SET granular_locked = $2 WHERE id = $1")
+        .bind(team_id)
+        .bind(locked_now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    info!(team_id = %team_id, locked = locked_now, "Team plan transition reconciled");
+    notify_team_members_changed(pool, notifier, team_id).await;
+    if !locked_now {
+        for m in &members {
+            notifier.notify_vault_key_changed(m.user_id);
+        }
+    }
+    Ok(())
+}
+
+pub async fn reconcile_all_teams(pool: &PgPool, notifier: &SyncNotifier) {
+    if self_host::is_self_hosted() {
+        return;
+    }
+    let rows = sqlx::query_as::<_, (Uuid, bool, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
+        "SELECT t.id, t.granular_locked, {OWNER_PLAN_COLUMNS} FROM teams t JOIN users u ON u.id = t.owner_id"
+    ))
+    .fetch_all(pool)
+    .await;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return error!(error = %e, "Failed to list teams for plan reconcile"),
+    };
+    for (team_id, stored, tier, trial_ends_at, admin_override, ls_sub) in rows {
+        let locked_now =
+            plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub)) != "business";
+        if locked_now != stored {
+            if let Err(status) = reconcile_team_plan(pool, notifier, team_id).await {
+                error!(team_id = %team_id, %status, "Team plan reconcile failed");
+            }
+        }
+    }
 }
 
 pub async fn require_granular(
@@ -91,5 +167,91 @@ mod tests {
         assert!(!narrows_masks((0b001, 0), (0b011, 0)));
         assert!(!narrows_masks((0, 0b01), (0, 0b11)));
         assert!(!narrows_masks((0b01, 0), (0, 0b01)));
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use crate::permissions::{PERM_CONNECT, PERM_VIEW};
+    use crate::sync_notifier::{SyncEvent, SyncNotifier};
+    use crate::test_support::*;
+
+    async fn rotation_requests(pool: &PgPool, team: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
+            .bind(team)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn stored_lock(pool: &PgPool, team: Uuid) -> bool {
+        sqlx::query_scalar("SELECT granular_locked FROM teams WHERE id = $1")
+            .bind(team)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn downgrade_that_drops_a_key_gate_queues_one_rotation() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        member_with_role(&pool, team, PERM_CONNECT).await;
+        let notifier = SyncNotifier::new();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert!(stored_lock(&pool, team).await);
+        assert_eq!(rotation_requests(&pool, team).await, 1);
+    }
+
+    #[tokio::test]
+    async fn downgrade_without_a_gate_loss_does_not_rotate() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        reconcile_team_plan(&pool, &SyncNotifier::new(), team)
+            .await
+            .unwrap();
+        assert!(stored_lock(&pool, team).await);
+        assert_eq!(rotation_requests(&pool, team).await, 0);
+    }
+
+    #[tokio::test]
+    async fn upgrade_clears_the_lock_and_tells_members_to_refetch_keys() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_VIEW | PERM_CONNECT).await;
+        let notifier = SyncNotifier::new();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        set_user_tier(&pool, owner, "business").await;
+        let mut rx = notifier.subscribe();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert!(!stored_lock(&pool, team).await);
+        let mut key_changed = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let SyncEvent::VaultKeyChanged { user_id } = ev {
+                key_changed.push(user_id);
+            }
+        }
+        assert!(key_changed.contains(&member));
+    }
+
+    #[tokio::test]
+    async fn self_hosted_never_locks() {
+        let _mode = BillingMode::self_hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        reconcile_all_teams(&pool, &SyncNotifier::new()).await;
+        assert!(!stored_lock(&pool, team).await);
     }
 }
