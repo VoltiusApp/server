@@ -564,4 +564,38 @@ mod tests {
         assert_eq!(version.as_deref(), Some("0.99.0"));
         assert!(rule_sets);
     }
+
+    #[tokio::test]
+    async fn lapsed_team_hides_objects_from_custom_role_holders() {
+        let _mode = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        set_user_tier(&pool, f.owner, "teams").await;
+        for user in [f.viewer, f.blocked, f.admin] {
+            let hidden = hidden_object_ids(&pool, f.team, user).await.unwrap();
+            assert!(hidden.contains(&f.object_id), "{user} must not see it");
+        }
+        set_user_tier(&pool, f.owner, "business").await;
+        assert!(!hidden_object_ids(&pool, f.team, f.viewer).await.unwrap().contains(&f.object_id));
+    }
+
+    #[tokio::test]
+    async fn lapsed_team_keeps_a_deny_only_rule() {
+        let _mode = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let (kept, denied) = (seed_user(&pool).await, seed_user(&pool).await);
+        for u in [kept, denied] {
+            add_member(&pool, team, u).await;
+            grant_builtin_role(&pool, team, u, "member").await;
+        }
+        let object_id = format!("obj-{}", Uuid::new_v4());
+        seed_team_object(&pool, team, owner, &object_id, "connection").await;
+        let set = seed_rule_set(&pool, team, owner, &[("member", Some(denied), 0, PERM_VIEW)]).await;
+        point_object(&pool, team, &object_id, Some(set)).await;
+        assert!(!hidden_object_ids(&pool, team, kept).await.unwrap().contains(&object_id));
+        assert!(hidden_object_ids(&pool, team, denied).await.unwrap().contains(&object_id));
+    }
 }

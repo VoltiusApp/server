@@ -1635,6 +1635,26 @@ mod tests {
         let res = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(member)), axum::http::HeaderMap::new(), Path(team)).await;
         assert_eq!(res.err(), Some(StatusCode::UPGRADE_REQUIRED));
     }
+
+    #[tokio::test]
+    async fn lapsed_allow_override_loses_the_vault_key_until_upgrade() {
+        let _mode = crate::test_support::BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        crate::test_support::set_member_overrides(&pool, team, member, crate::permissions::PERM_VIEW | PERM_CONNECT, 0).await;
+        insert_vault_key(&pool, team, member, owner).await;
+
+        let call = || get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), rule_set_client_headers(), Path(team));
+        assert_eq!(call().await.err(), Some(StatusCode::FORBIDDEN));
+
+        crate::test_support::set_user_tier(&pool, owner, "business").await;
+        assert_eq!(call().await.expect("key after upgrade").0.wrapped_key, "wrapped");
+    }
 }
 
 #[cfg(test)]
