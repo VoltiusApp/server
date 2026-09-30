@@ -858,7 +858,7 @@ mod authz_tests {
     }
 
     #[tokio::test]
-    async fn a_downgraded_team_keeps_a_new_object_in_a_hidden_folder_hidden() {
+    async fn a_downgraded_team_can_point_a_new_object_at_a_hidden_set() {
         let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
@@ -885,6 +885,7 @@ mod authz_tests {
 
         let blocked_sees = listed_ids(&pool, f.team, f.blocked).await;
         assert!(!blocked_sees.contains(&"child-host".to_string()));
+        assert!(listed_ids(&pool, f.team, f.viewer).await.contains(&"child-host".to_string()));
     }
 
     #[tokio::test]
