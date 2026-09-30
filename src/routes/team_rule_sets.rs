@@ -108,6 +108,24 @@ async fn require_on_set(pool: &PgPool, authz: &ObjectAuthz, team_id: Uuid, set_i
     if authz.can(Some(set_id), bit) { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
 }
 
+async fn load_entries<'e, E: sqlx::PgExecutor<'e>>(executor: E, set_id: Uuid) -> Result<Vec<RuleEntryBody>, StatusCode> {
+    Ok(sqlx::query_as::<_, (String, Option<Uuid>, i64, i64)>(
+        "SELECT subject_type, subject_id, allow_mask, deny_mask FROM team_rule_set_entries \
+         WHERE rule_set_id = $1 ORDER BY subject_type, subject_id",
+    )
+    .bind(set_id)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| internal(e, "read entries"))?
+    .into_iter()
+    .map(|(subject_type, subject_id, allow, deny)| RuleEntryBody { subject_type, subject_id, allow, deny })
+    .collect())
+}
+
+fn entries_subset(current: &[RuleEntryBody], next: &[RuleEntryBody]) -> bool {
+    next.iter().all(|e| current.contains(e))
+}
+
 async fn new_set(conn: &mut sqlx::PgConnection, team_id: Uuid, author: Uuid) -> Result<Uuid, StatusCode> {
     sqlx::query_scalar("INSERT INTO team_rule_sets (team_id, updated_by) VALUES ($1, $2) RETURNING id")
         .bind(team_id).bind(author).fetch_one(&mut *conn).await.map_err(|e| internal(e, "insert rule set"))
@@ -126,6 +144,7 @@ pub async fn create_rule_set(
         return Err(StatusCode::FORBIDDEN);
     }
     let entries = validate_entries(&pool, team_id, body.entries).await?;
+    crate::team_plan::require_granular(&pool, team_id, entries.is_empty()).await?;
     let mut tx = pool.begin().await.map_err(|e| internal(e, "begin create"))?;
     let id = new_set(&mut tx, team_id, auth.0).await?;
     insert_entries(&mut tx, id, &entries).await?;
@@ -163,14 +182,7 @@ pub async fn get_rule_set(
     let (updated_at, updated_by): (DateTime<Utc>, Uuid) =
         sqlx::query_as("SELECT updated_at, updated_by FROM team_rule_sets WHERE id = $1")
             .bind(set_id).fetch_one(&pool).await.map_err(|e| internal(e, "read set"))?;
-    let entries = sqlx::query_as::<_, (String, Option<Uuid>, i64, i64)>(
-        "SELECT subject_type, subject_id, allow_mask, deny_mask FROM team_rule_set_entries \
-         WHERE rule_set_id = $1 ORDER BY subject_type, subject_id",
-    )
-    .bind(set_id).fetch_all(&pool).await.map_err(|e| internal(e, "read entries"))?
-    .into_iter()
-    .map(|(subject_type, subject_id, allow, deny)| RuleEntryBody { subject_type, subject_id, allow, deny })
-    .collect();
+    let entries = load_entries(&pool, set_id).await?;
     Ok(Json(RuleSetResponse { id: set_id, entries, updated_at, updated_by }))
 }
 
@@ -191,6 +203,8 @@ pub async fn put_rule_set(
     // the same set until commit, so a second writer's DELETE can't interleave.
     sqlx::query("UPDATE team_rule_sets SET updated_at = now(), updated_by = $2 WHERE id = $1")
         .bind(set_id).bind(auth.0).execute(&mut *tx).await.map_err(|e| internal(e, "stamp set"))?;
+    let current = load_entries(&mut *tx, set_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, entries_subset(&current, &entries)).await?;
     sqlx::query("DELETE FROM team_rule_set_entries WHERE rule_set_id = $1")
         .bind(set_id).execute(&mut *tx).await.map_err(|e| internal(e, "clear entries"))?;
     insert_entries(&mut tx, set_id, &entries).await?;
@@ -230,8 +244,49 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn a_subset_keeps_only_unchanged_entries() {
+        let a = entry("everyone", None, 0, PERM_VIEW);
+        let b = entry("role", Some(Uuid::nil()), PERM_CONNECT, 0);
+        assert!(entries_subset(&[a.clone(), b.clone()], std::slice::from_ref(&a)));
+        assert!(entries_subset(std::slice::from_ref(&a), &[]));
+        assert!(!entries_subset(std::slice::from_ref(&a), &[a.clone(), b]));
+        assert!(!entries_subset(&[a], &[entry("everyone", None, 0, PERM_VIEW | PERM_CONNECT)]));
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_can_only_remove_rules() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        set_user_tier(&pool, f.owner, "teams").await;
+
+        assert_eq!(create(&pool, f.team, f.admin, vec![entry("everyone", None, 0, PERM_VIEW)]).await.unwrap_err(), StatusCode::PAYMENT_REQUIRED);
+        assert!(create(&pool, f.team, f.admin, vec![entry("everyone", None, 0, 0)]).await.is_ok());
+        assert_eq!(
+            put(&pool, f.team, f.admin, f.rule_set, vec![entry("member", Some(f.blocked), PERM_VIEW, 0)]).await.unwrap_err(),
+            StatusCode::PAYMENT_REQUIRED,
+        );
+        assert_eq!(put(&pool, f.team, f.admin, f.rule_set, vec![entry("everyone", None, 0, PERM_VIEW)]).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put(&pool, f.team, f.admin, f.rule_set, vec![]).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_business_team_can_add_rules() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        set_user_tier(&pool, f.owner, "business").await;
+
+        assert_eq!(
+            put(&pool, f.team, f.admin, f.rule_set, vec![entry("member", Some(f.blocked), PERM_VIEW, 0)]).await,
+            Ok(StatusCode::NO_CONTENT),
+        );
+    }
+
     #[tokio::test]
     async fn a_manager_creates_a_set_and_reads_it_back_once_an_object_uses_it() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -246,6 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn creating_needs_manage_somewhere() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -255,6 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn creating_without_the_capability_header_is_426() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -265,6 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn entries_are_validated() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -312,6 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_replaces_entries_and_changes_what_members_see() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
         put(&pool, f.team, f.admin, f.rule_set, vec![entry("member", Some(f.blocked), PERM_VIEW, 0)]).await.unwrap();
