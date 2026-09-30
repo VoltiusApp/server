@@ -29,6 +29,15 @@ pub fn effective_tier(
     stored_tier
 }
 
+pub const OWNER_PLAN_COLUMNS: &str =
+    "u.subscription_tier, u.trial_ends_at, u.admin_override, u.ls_subscription_id";
+
+pub type TierRow = (String, Option<DateTime<Utc>>, bool, Option<String>);
+
+pub fn effective_tier_of(row: &TierRow) -> String {
+    effective_tier(&row.0, row.1, row.3.is_some(), row.2, Utc::now()).to_string()
+}
+
 /// [`effective_tier`] for one account, read from the database. Every tier gate
 /// outside `/v1/auth/me` must go through this rather than comparing
 /// `users.subscription_tier`: an expired trial still stores `'pro'` there, so a
@@ -37,21 +46,14 @@ pub fn effective_tier(
 /// Falls back to `"free"` if the row can't be read — a gate that fails open is
 /// the bug this function exists to prevent.
 pub async fn effective_tier_for_user(pool: &PgPool, user_id: uuid::Uuid) -> String {
-    match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, Option<String>)>(
-        "SELECT subscription_tier, trial_ends_at, admin_override, ls_subscription_id FROM users WHERE id = $1",
-    )
+    match sqlx::query_as::<_, TierRow>(&format!(
+        "SELECT {OWNER_PLAN_COLUMNS} FROM users u WHERE u.id = $1"
+    ))
     .bind(user_id)
     .fetch_one(pool)
     .await
     {
-        Ok((tier, trial_ends_at, admin_override, ls_subscription_id)) => effective_tier(
-            &tier,
-            trial_ends_at,
-            ls_subscription_id.is_some(),
-            admin_override,
-            Utc::now(),
-        )
-        .to_string(),
+        Ok(row) => effective_tier_of(&row),
         Err(_) => "free".to_string(),
     }
 }

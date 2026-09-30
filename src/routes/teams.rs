@@ -238,7 +238,7 @@ async fn teams_for_user(
         WHERE $2::uuid IS NULL OR t.id = $2
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
-        crate::team_plan::OWNER_PLAN_COLUMNS,
+        crate::entitlement::OWNER_PLAN_COLUMNS,
     ))
     .bind(user_id)
     .bind(only)
