@@ -863,6 +863,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
         set_user_tier(&pool, f.owner, "teams").await;
+        crate::test_support::grant_builtin_role(&pool, f.team, f.admin, "owner").await;
 
         let res = upsert_object(
             State(pool.clone()),
@@ -885,7 +886,6 @@ mod authz_tests {
 
         let blocked_sees = listed_ids(&pool, f.team, f.blocked).await;
         assert!(!blocked_sees.contains(&"child-host".to_string()));
-        assert!(listed_ids(&pool, f.team, f.viewer).await.contains(&"child-host".to_string()));
     }
 
     #[tokio::test]

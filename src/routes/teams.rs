@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
-use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries, MemberContext};
+use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries};
 use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
@@ -1503,25 +1503,11 @@ pub async fn set_member_permissions(
     let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
     crate::team_plan::require_granular(&pool, team_id, crate::team_plan::narrows_masks(previous, (allow, deny))).await?;
 
-    let role_union: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
-         JOIN team_roles tr ON tr.id = tmr.role_id \
-         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read target role union"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    let target_role_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read target role ids"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let target = crate::object_authz::member_rows(&pool, team_id, Some(target_user_id))
+        .await?
+        .pop()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let locked = crate::team_plan::team_locked(&pool, team_id).await?;
 
     if allow == 0 && deny == 0 {
         sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
@@ -1551,20 +1537,8 @@ pub async fn set_member_permissions(
     let entries = rule_entries(&pool, team_id, None).await?;
     let live = live_rule_set_ids(&pool, team_id).await?;
 
-    let prev_ctx = MemberContext {
-        user_id: target_user_id,
-        base: (role_union | previous.0) & !previous.1,
-        team_deny: previous.1,
-        role_ids: target_role_ids.clone(),
-        locked: false,
-    };
-    let next_ctx = MemberContext {
-        user_id: target_user_id,
-        base: (role_union | allow) & !deny,
-        team_deny: deny,
-        role_ids: target_role_ids,
-        locked: false,
-    };
+    let prev_ctx = target.with_overrides(previous.0, previous.1).context(locked);
+    let next_ctx = target.with_overrides(allow, deny).context(locked);
     let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), &live);
     let held_after = holds_vault_key_gate(next_ctx, entries, &live);
     if held_before && !held_after {
@@ -2579,6 +2553,25 @@ mod authz_tests {
         assert_eq!(put_member_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS, crate::test_support::rule_set_client_headers()).await, Err(StatusCode::PAYMENT_REQUIRED));
     }
 
+    #[tokio::test]
+    async fn locked_team_removing_an_allow_never_queues_rotation() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = seed_user(&pool).await;
+        crate::test_support::add_member(&pool, team, member).await;
+        crate::test_support::set_member_overrides(&pool, team, member, crate::permissions::PERM_CONNECT, 0).await;
+        assert_eq!(put_member_overrides(&pool, team, owner, member, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
+            .bind(team)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
     async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
         delete_role(State(pool.clone()), Extension(AuthUser(user)), Extension(SyncNotifier::new()), Path((team, role))).await
     }
@@ -2602,6 +2595,7 @@ mod authz_tests {
         set_user_tier(&pool, owner, "teams").await;
         let team = seed_team(&pool, owner).await;
         let manager = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        crate::test_support::grant_builtin_role(&pool, team, manager, "manager").await;
         let role = seed_role(&pool, team, "legacy", PERM_VIEW_SECRETS).await;
         crate::test_support::seed_rule_set(&pool, team, owner, &[("role", Some(role), 0, crate::permissions::PERM_VIEW)]).await;
 

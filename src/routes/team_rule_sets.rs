@@ -269,6 +269,7 @@ mod tests {
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
         set_user_tier(&pool, f.owner, "teams").await;
+        grant_builtin_role(&pool, f.team, f.admin, "owner").await;
         let set = seed_rule_set(&pool, f.team, f.owner, &[("everyone", None, 0, PERM_VIEW | PERM_CONNECT)]).await;
         point_object(&pool, f.team, &f.object_id, Some(set)).await;
 
@@ -285,6 +286,7 @@ mod tests {
         let pool = test_pool_or_skip!();
         let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
         set_user_tier(&pool, f.owner, "teams").await;
+        grant_builtin_role(&pool, f.team, f.admin, "owner").await;
 
         assert_eq!(create(&pool, f.team, f.admin, vec![entry("everyone", None, 0, PERM_VIEW)]).await.unwrap_err(), StatusCode::PAYMENT_REQUIRED);
         assert!(create(&pool, f.team, f.admin, vec![entry("everyone", None, 0, 0)]).await.is_ok());

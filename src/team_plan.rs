@@ -31,6 +31,10 @@ pub async fn team_plan(pool: &PgPool, team_id: Uuid) -> Result<String, StatusCod
     Ok(plan_from_row(&row))
 }
 
+pub async fn team_locked(pool: &PgPool, team_id: Uuid) -> Result<bool, StatusCode> {
+    Ok(team_plan(pool, team_id).await? != "business")
+}
+
 pub async fn require_granular(
     pool: &PgPool,
     team_id: Uuid,

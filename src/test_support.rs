@@ -272,6 +272,17 @@ pub async fn assign_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) {
         .expect("assign role");
 }
 
+pub async fn grant_builtin_role(pool: &PgPool, team: Uuid, user: Uuid, name: &str) {
+    seed_builtin_roles(pool, team).await;
+    let role: Uuid = sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = $2 AND is_builtin")
+        .bind(team)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("builtin role");
+    assign_role(pool, team, user, role).await;
+}
+
 /// Set permission overrides for `user` within `team`.
 pub async fn set_member_overrides(pool: &PgPool, team: Uuid, user: Uuid, allow: i64, deny: i64) {
     sqlx::query(

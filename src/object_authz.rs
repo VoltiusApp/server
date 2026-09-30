@@ -56,7 +56,6 @@ pub struct MemberContext {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct MemberRow {
     pub user_id: Uuid,
     pub builtin: i64,
@@ -66,7 +65,6 @@ pub struct MemberRow {
     pub role_ids: Vec<Uuid>,
 }
 
-#[allow(dead_code)]
 impl MemberRow {
     pub fn context(&self, locked: bool) -> MemberContext {
         let base = if locked {
@@ -87,35 +85,51 @@ fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-pub async fn member_contexts(
+pub async fn member_rows(
     pool: &PgPool,
     team_id: Uuid,
     only: Option<Uuid>,
-) -> Result<Vec<MemberContext>, StatusCode> {
+) -> Result<Vec<MemberRow>, StatusCode> {
     let sql = format!(
-        "SELECT tm.user_id, COALESCE(bit_or(tr.permissions), 0), COALESCE(MAX(o.allow_mask), 0), \
-                COALESCE(MAX(o.deny_mask), 0), \
+        "SELECT tm.user_id, \
+                COALESCE(bit_or(tr.permissions) FILTER (WHERE tr.is_builtin), 0), \
+                COALESCE(bit_or(tr.permissions) FILTER (WHERE NOT tr.is_builtin), 0), \
+                COALESCE(MAX(o.allow_mask), 0), COALESCE(MAX(o.deny_mask), 0), \
                 COALESCE(array_agg(tmr.role_id) FILTER (WHERE tmr.role_id IS NOT NULL), '{{}}'::uuid[]) \
          {PERMISSION_JOINS} \
          WHERE tm.team_id = $1 AND ($2::uuid IS NULL OR tm.user_id = $2) \
          GROUP BY tm.user_id"
     );
-    let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, Vec<Uuid>)>(&sql)
+    let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, i64, Vec<Uuid>)>(&sql)
         .bind(team_id)
         .bind(only)
         .fetch_all(pool)
         .await
-        .map_err(|e| db_error(e, "member_contexts"))?;
+        .map_err(|e| db_error(e, "member_rows"))?;
     Ok(rows
         .into_iter()
-        .map(|(user_id, roles, allow, deny, role_ids)| MemberContext {
+        .map(|(user_id, builtin, custom, allow, deny, role_ids)| MemberRow {
             user_id,
-            base: (roles | allow) & !deny,
-            team_deny: deny,
+            builtin,
+            custom,
+            allow,
+            deny,
             role_ids,
-            locked: false,
         })
         .collect())
+}
+
+pub async fn member_contexts(
+    pool: &PgPool,
+    team_id: Uuid,
+    only: Option<Uuid>,
+) -> Result<Vec<MemberContext>, StatusCode> {
+    let rows = member_rows(pool, team_id, only).await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let locked = crate::team_plan::team_locked(pool, team_id).await?;
+    Ok(rows.iter().map(|r| r.context(locked)).collect())
 }
 
 pub async fn rule_entries(
@@ -349,6 +363,11 @@ pub async fn record_member_client(pool: &PgPool, team_id: Uuid, user_id: Uuid, h
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::permissions::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::*;
+
     fn row(builtin: i64, custom: i64, allow: i64, deny: i64) -> MemberRow {
         MemberRow { user_id: Uuid::nil(), builtin, custom, allow, deny, role_ids: vec![] }
     }
@@ -375,11 +394,6 @@ mod tests {
         let r = row(PERM_VIEW, 0, 1, 2).with_overrides(PERM_CONNECT, 0);
         assert_eq!((r.builtin, r.allow, r.deny), (PERM_VIEW, PERM_CONNECT, 0));
     }
-
-    use super::*;
-    use crate::permissions::*;
-    use crate::test_pool_or_skip;
-    use crate::test_support::*;
 
     #[test]
     fn layers_for_picks_only_the_callers_role_and_member_entries() {
