@@ -82,7 +82,7 @@ pub(crate) const PERMISSION_JOINS: &str = r#"
            ON o.team_id = tm.team_id AND o.user_id = tm.user_id
 "#;
 
-/// Business: `(roles | allow) & !deny`; locked: `builtin & !(allow | deny)`. 0 for a non-member.
+/// Business: `(roles | allow) & !deny`; locked: `builtin & !deny`. 0 for a non-member.
 pub async fn effective_permissions(
     pool: &PgPool,
     team_id: Uuid,
@@ -660,7 +660,7 @@ mod db_tests {
         let member = seed_user(&pool).await;
         add_member(&pool, team, member).await;
         crate::test_support::grant_builtin_role(&pool, team, member, "member").await;
-        set_member_overrides(&pool, team, member, PERM_VIEW_AUDIT_LOG, PERM_VIEW_SECRETS).await;
+        set_member_overrides(&pool, team, member, PERM_VIEW_AUDIT_LOG | PERM_CONNECT, PERM_VIEW_SECRETS).await;
         let p = effective_permissions(&pool, team, member).await.unwrap();
         assert_eq!(p & (PERM_VIEW_AUDIT_LOG | PERM_VIEW_SECRETS), 0);
         assert_ne!(p & PERM_CONNECT, 0);

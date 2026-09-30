@@ -68,7 +68,7 @@ pub struct MemberRow {
 impl MemberRow {
     pub fn context(&self, locked: bool) -> MemberContext {
         let base = if locked {
-            self.builtin & !(self.allow | self.deny)
+            self.builtin & !self.deny
         } else {
             (self.builtin | self.custom | self.allow) & !self.deny
         };
@@ -381,12 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn locked_context_keeps_builtin_bits_no_override_touched() {
+    fn locked_context_ignores_allow_and_custom_and_applies_deny() {
         let builtin = PERM_VIEW | PERM_CONNECT | PERM_VIEW_SECRETS | PERM_EDIT_KEYS;
         let c = row(builtin, PERM_ADMINISTRATOR, PERM_EDIT_KEYS, PERM_VIEW_SECRETS).context(true);
-        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT | PERM_EDIT_KEYS);
         assert_eq!(c.team_deny, PERM_VIEW_SECRETS);
         assert!(c.locked);
+    }
+
+    #[test]
+    fn locked_context_keeps_a_builtin_bit_a_redundant_allow_repeats() {
+        let c = row(PERM_VIEW | PERM_CONNECT, 0, PERM_CONNECT, 0).context(true);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT);
     }
 
     #[test]
