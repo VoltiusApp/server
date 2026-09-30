@@ -9,7 +9,6 @@ use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
 use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries, MemberContext};
 use crate::routes::audit::write_audit_event;
-use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
@@ -86,26 +85,6 @@ pub(crate) async fn ensure_seat_available(pool: &PgPool, owner_id: Uuid) -> Resu
     let used = owner_seats_used(pool, owner_id).await?;
     if used >= effective_cap {
         warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached");
-        return Err(StatusCode::PAYMENT_REQUIRED);
-    }
-    Ok(())
-}
-
-// ─── Plan tier helper ─────────────────────────────────────────────────────────
-
-async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
-    if self_host::is_self_hosted() {
-        return Ok(());
-    }
-    let owner_id = team_owner(pool, team_id).await?;
-
-    let tier = sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
-        .bind(owner_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to fetch owner tier"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if tier != "business" {
         return Err(StatusCode::PAYMENT_REQUIRED);
     }
     Ok(())
@@ -233,10 +212,24 @@ async fn teams_for_user(
     only: Option<Uuid>,
 ) -> Result<Vec<TeamWithRole>, sqlx::Error> {
     // Returns one row per (team, role) — aggregated in Rust
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>, i64, i64)>(
+    type Row = (
+        Uuid,
+        String,
+        Uuid,
+        chrono::DateTime<chrono::Utc>,
+        Option<Uuid>,
+        i64,
+        i64,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+        Option<String>,
+    );
+    let rows = sqlx::query_as::<_, Row>(&format!(
         r#"
-        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id,
-               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
+        SELECT t.id, t.name, t.owner_id, t.created_at, tmr.role_id,
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
+               {}
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
         JOIN users u ON u.id = t.owner_id
@@ -245,14 +238,28 @@ async fn teams_for_user(
         WHERE $2::uuid IS NULL OR t.id = $2
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
-    )
+        crate::team_plan::OWNER_PLAN_COLUMNS,
+    ))
     .bind(user_id)
     .bind(only)
     .fetch_all(pool)
     .await?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
-    for (id, name, owner_id, owner_tier, created_at, role_id, permission_allow, permission_deny) in rows {
+    for (
+        id,
+        name,
+        owner_id,
+        created_at,
+        role_id,
+        permission_allow,
+        permission_deny,
+        tier,
+        trial_ends_at,
+        admin_override,
+        ls_sub,
+    ) in rows
+    {
         match teams.last_mut() {
             Some(last) if last.id == id => {
                 if let Some(rid) = role_id {
@@ -260,6 +267,8 @@ async fn teams_for_user(
                 }
             }
             _ => {
+                let owner_tier =
+                    crate::team_plan::plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
                 teams.push(TeamWithRole {
                     id,
                     name,
@@ -916,7 +925,7 @@ pub async fn create_role(
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<TeamRole>), StatusCode> {
-    require_business_tier(&pool, team_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, false).await?;
 
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
@@ -991,7 +1000,7 @@ pub async fn update_role(
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateRoleBody>,
 ) -> Result<StatusCode, StatusCode> {
-    require_business_tier(&pool, team_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, false).await?;
 
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
@@ -1069,7 +1078,7 @@ pub async fn delete_role(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    require_business_tier(&pool, team_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, false).await?;
 
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
@@ -1948,6 +1957,7 @@ mod authz_tests {
 
     #[tokio::test]
     async fn create_team_returns_the_row_list_teams_would() {
+        let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "business").await;
@@ -1968,6 +1978,34 @@ mod authz_tests {
         assert_eq!(created.owner_tier, "business");
         assert_eq!(created.role_ids.len(), 1);
         assert_eq!(serde_json::to_value(&created).unwrap(), serde_json::to_value(&listed).unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_teams_reports_a_lapsed_business_trial_as_free() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        sqlx::query("UPDATE users SET trial_ends_at = now() - interval '1 day' WHERE id = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(owner))).await.unwrap();
+        assert_eq!(listed.iter().find(|t| t.id == team).unwrap().owner_tier, "free");
+    }
+
+    #[tokio::test]
+    async fn list_teams_reports_business_when_self_hosted() {
+        let _env = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(owner))).await.unwrap();
+        assert_eq!(listed.iter().find(|t| t.id == team).unwrap().owner_tier, "business");
     }
 
     async fn rename(pool: &PgPool, team: Uuid, user: Uuid, name: &str) -> Result<StatusCode, StatusCode> {

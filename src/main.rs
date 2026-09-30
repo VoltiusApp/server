@@ -15,6 +15,7 @@ mod self_host;
 mod single_instance;
 mod session_grants;
 mod team_join_grants;
+mod team_plan;
 mod sync_notifier;
 mod terminal_manager;
 #[cfg(test)]
