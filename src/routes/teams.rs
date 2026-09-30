@@ -1353,12 +1353,16 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
+fn narrows_masks(previous: (i64, i64), next: (i64, i64)) -> bool {
+    next.0 & !previous.0 == 0 && next.1 & !previous.1 == 0
+}
+
 async fn override_masks<'e, E>(executor: E, team_id: Uuid, user_id: Uuid) -> Result<(i64, i64), StatusCode>
 where
     E: sqlx::PgExecutor<'e>,
 {
     Ok(sqlx::query_as::<_, (i64, i64)>(
-        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(team_id)
     .bind(user_id)
@@ -1480,6 +1484,7 @@ pub async fn set_member_permissions(
     })?;
 
     let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, narrows_masks(previous, (allow, deny))).await?;
 
     let role_union: i64 = sqlx::query_scalar(
         "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
@@ -2501,6 +2506,81 @@ mod authz_tests {
         );
     }
 
+    #[test]
+    fn narrowing_masks_only_drop_bits() {
+        assert!(narrows_masks((0b101, 0b010), (0b001, 0)));
+        assert!(narrows_masks((0, 0), (0, 0)));
+        assert!(!narrows_masks((0b001, 0), (0b011, 0)));
+        assert!(!narrows_masks((0, 0b01), (0, 0b11)));
+        assert!(!narrows_masks((0b01, 0), (0, 0b01)));
+    }
+
+    async fn member_below_owner(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
+        let user = member_with_role(pool, team, perms).await;
+        sqlx::query(
+            "UPDATE team_roles SET position = 100 WHERE id IN \
+             (SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2)",
+        )
+        .bind(team)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("lower role position");
+        user
+    }
+
+    async fn put_overrides(pool: &PgPool, team: Uuid, actor: Uuid, target: Uuid, allow: i64, deny: i64) -> Result<StatusCode, StatusCode> {
+        set_member_permissions(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            crate::test_support::rule_set_client_headers(),
+            Path((team, target)),
+            Json(SetMemberPermissionsRequest { allow, deny }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_can_clear_overrides_but_not_add_them() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
+        crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+
+        assert_eq!(put_overrides(&pool, team, owner, target, PERM_VIEW_SECRETS, 0).await, Err(StatusCode::PAYMENT_REQUIRED));
+        assert_eq!(put_overrides(&pool, team, owner, target, 0, 0).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_business_team_can_add_overrides() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
+
+        assert_eq!(put_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_stale_resubmit_after_a_concurrent_clear_is_refused() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
+        crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+
+        assert_eq!(put_overrides(&pool, team, owner, target, 0, 0).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS).await, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
     async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
         delete_role(State(pool.clone()), Extension(AuthUser(user)), Extension(SyncNotifier::new()), Path((team, role))).await
     }
@@ -3126,6 +3206,7 @@ mod override_response_tests {
     use crate::sync_notifier::SyncNotifier;
     use crate::test_support::{
         assign_role, rule_set_client_headers, seed_builtin_roles, seed_role, seed_team_with_roles,
+        BillingMode,
     };
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
@@ -3215,6 +3296,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_rejects_stripping_an_allow_override_the_actor_lacks() {
+        let _env = BillingMode::self_hosted();
         use crate::permissions::PERM_MANAGE_VAULT;
 
         let pool = test_pool_or_skip!();
@@ -3328,6 +3410,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_rejects_self_edit() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -3352,6 +3435,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_rejects_a_lower_ranked_caller() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3385,6 +3469,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_a_role_granted_bit_is_denied() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3437,6 +3522,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_does_not_queue_rotation_for_non_read_class_denies() {
+        let _env = BillingMode::self_hosted();
         use crate::permissions::PERM_EDIT_CONNECTIONS;
 
         let pool = test_pool_or_skip!();
@@ -3473,6 +3559,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_does_not_queue_rotation_while_connect_still_gates() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3515,6 +3602,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_does_not_queue_rotation_for_a_copy_secrets_only_deny() {
+        let _env = BillingMode::self_hosted();
         use crate::permissions::PERM_COPY_SECRETS;
 
         let pool = test_pool_or_skip!();
@@ -3555,6 +3643,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_clearing_the_only_allow_grant() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -3585,6 +3674,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_denying_view_drops_the_widened_gate() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -3621,6 +3711,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_a_team_deny_wipes_an_object_grant() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -3703,7 +3794,7 @@ mod rule_set_era_tests {
     use crate::test_support::{
         add_member as add_team_member, assign_role, env_lock, member_with_role, rule_set_client_headers,
         seed_role, seed_rule_set, seed_team, seed_team_with_roles, seed_user, set_member_overrides,
-        EnvLockGuard,
+        BillingMode, EnvLockGuard,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -3802,6 +3893,7 @@ mod rule_set_era_tests {
 
     #[tokio::test]
     async fn a_legacy_client_override_edit_keeps_a_view_deny() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
