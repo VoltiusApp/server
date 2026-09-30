@@ -3228,7 +3228,7 @@ mod override_response_tests {
         sqlx::query("UPDATE team_roles SET position = 1 WHERE id = $1").bind(actor_role).execute(&pool).await.unwrap();
         add_member(&pool, team, actor).await;
         assign_role(&pool, team, actor, actor_role).await;
-        let target_role = seed_role(&pool, team, "viewer", PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW).await;
+        let target_role = seed_role(&pool, team, "viewer", crate::permissions::PERM_CONNECT | PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW).await;
         sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
@@ -3249,7 +3249,7 @@ mod override_response_tests {
             Extension(SyncNotifier::new()),
             axum::http::HeaderMap::new(),
             Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_CONNECT }),
         )
         .await
         .unwrap();
@@ -3261,7 +3261,7 @@ mod override_response_tests {
             Extension(SyncNotifier::new()),
             axum::http::HeaderMap::new(),
             Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
+            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_CONNECT }),
         )
         .await
         .unwrap();
@@ -3393,7 +3393,7 @@ mod override_response_tests {
         let team = seed_team_with_roles(&pool, owner).await;
         let contractor = seed_user(&pool).await;
         add_member(&pool, team, contractor).await;
-        crate::test_support::set_member_overrides(&pool, team, contractor, PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW, 0).await;
+        crate::test_support::set_member_overrides(&pool, team, contractor, crate::permissions::PERM_CONNECT | PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW, 0).await;
 
         set_member_permissions(
             State(pool.clone()),

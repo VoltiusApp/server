@@ -84,7 +84,7 @@ async fn require_vault_access(
     crate::permissions::require_team_permissions(pool, team_id, user_id, check).await
 }
 
-/// Team-level `CONNECT`/`VIEW_SECRETS`, or either bit on any live object: one granted host still needs the key.
+/// Team-level `CONNECT`, or `CONNECT` on any live object: one granted host still needs the key.
 async fn require_vault_key_access(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
     require_vault_member(pool, team_id, user_id, action).await?;
     let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
@@ -717,20 +717,20 @@ mod tests {
     use axum::extract::{Path, State};
     use axum::Extension;
 
-    /// Give `user` a role granting PERM_VIEW_SECRETS in `team`.
+    /// Give `user` a role granting PERM_CONNECT | PERM_VIEW_SECRETS in `team`.
     async fn grant_view_secrets(pool: &PgPool, team: Uuid, user: Uuid) {
-        let role = seed_role(pool, team, "viewer", crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW).await;
+        let role = seed_role(pool, team, "viewer", PERM_CONNECT | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW).await;
         assign_role(pool, team, user, role).await;
     }
 
-    /// Give `user` a role granting PERM_VIEW_SECRETS | PERM_COPY_SECRETS in `team`
-    /// — the pair `put_vault_keys` requires of the caller distributing keys.
+    /// Give `user` a role granting PERM_VIEW_SECRETS | PERM_COPY_SECRETS (with the PERM_CONNECT
+    /// they depend on) in `team` — the pair `put_vault_keys` requires of the caller distributing keys.
     async fn grant_view_secrets_and_copy(pool: &PgPool, team: Uuid, user: Uuid) {
         let role = seed_role(
             pool,
             team,
             "key-distributor",
-            crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS | crate::permissions::PERM_VIEW,
+            PERM_CONNECT | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS | crate::permissions::PERM_VIEW,
         )
         .await;
         assign_role(pool, team, user, role).await;

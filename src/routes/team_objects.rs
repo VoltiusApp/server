@@ -15,7 +15,7 @@ use crate::object_authz::{
 };
 use crate::permissions::{
     PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
-    PERM_EDIT_SNIPPETS, PERM_MANAGE_ROLES, PERM_VIEW, PERM_VIEW_SECRETS,
+    PERM_EDIT_SNIPPETS, PERM_MANAGE_ROLES, PERM_VIEW,
 };
 use crate::routes::client_version::{require_client_version, require_rule_set_feature, MinClientVersion};
 use crate::sync_notifier::{notify_team_vault_changed, SyncNotifier};
@@ -583,8 +583,7 @@ pub async fn list_secrets(
 ) -> Result<Json<Vec<TeamSecretResponse>>, StatusCode> {
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
     require_rule_set_feature(&headers)?;
-    const USE_OR_READ: i64 = PERM_CONNECT | PERM_VIEW_SECRETS;
-    if !authz.grants_anywhere(&live_rule_set_ids(&pool, team_id).await?, USE_OR_READ) {
+    if !authz.grants_anywhere(&live_rule_set_ids(&pool, team_id).await?, PERM_CONNECT) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -605,7 +604,7 @@ pub async fn list_secrets(
 
     Ok(Json(
         rows.into_iter()
-            .filter(|row| authz.can_any(row.6, USE_OR_READ))
+            .filter(|row| authz.can(row.6, PERM_CONNECT))
             .map(|row| TeamSecretResponse {
                 secret_id: row.0,
                 object_id: row.1,
@@ -807,7 +806,7 @@ mod authz_tests {
     use super::*;
     use crate::auth::AuthUser;
     use crate::permissions::{
-        PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_SNIPPETS, PERM_VIEW, PERM_VIEW_SECRETS,
+        PERM_CONNECT, PERM_COPY_SECRETS, PERM_EDIT_CONNECTIONS, PERM_EDIT_SNIPPETS, PERM_VIEW, PERM_VIEW_SECRETS,
     };
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
@@ -1067,6 +1066,34 @@ mod authz_tests {
         crate::test_support::point_object(&pool, team, "granted", Some(set)).await;
 
         assert_eq!(listed_secret_objects(&pool, team, junior).await.unwrap(), vec!["granted".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_secrets_withholds_a_host_whose_connect_is_denied() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_CONNECT | PERM_VIEW_SECRETS).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "locked", "connection").await;
+        crate::test_support::seed_team_object(&pool, team, owner, "open", "connection").await;
+        seed_secret_row(&pool, team, owner, "locked").await;
+        seed_secret_row(&pool, team, owner, "open").await;
+        let set = seed_rule_set(&pool, team, owner, &[("member", Some(member), 0, PERM_CONNECT)]).await;
+        crate::test_support::point_object(&pool, team, "locked", Some(set)).await;
+
+        assert_eq!(listed_secret_objects(&pool, team, member).await.unwrap(), vec!["open".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_secrets_forbidden_with_view_secrets_but_no_connect() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let reader = member_with_role(&pool, team, PERM_VIEW_SECRETS | PERM_COPY_SECRETS).await;
+
+        let res = list_secrets(State(pool.clone()), Extension(AuthUser(reader)), rule_set_client_headers(), Path(team)).await;
+
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
 
     // ── upsert_secret gates on the *object's* edit permission, not VIEW_SECRETS ──
