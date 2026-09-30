@@ -2553,23 +2553,33 @@ mod authz_tests {
         assert_eq!(put_member_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS, crate::test_support::rule_set_client_headers()).await, Err(StatusCode::PAYMENT_REQUIRED));
     }
 
+    async fn rotations_after_removing_an_allow(pool: &PgPool, tier: &str) -> i64 {
+        let owner = seed_user(pool).await;
+        set_user_tier(pool, owner, tier).await;
+        let team = seed_team_with_roles(pool, owner).await;
+        let member = seed_user(pool).await;
+        crate::test_support::add_member(pool, team, member).await;
+        crate::test_support::set_member_overrides(pool, team, member, crate::permissions::PERM_VIEW | crate::permissions::PERM_CONNECT, 0).await;
+        assert_eq!(put_member_overrides(pool, team, owner, member, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+        sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
+            .bind(team)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn locked_team_removing_an_allow_never_queues_rotation() {
         let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
-        let owner = seed_user(&pool).await;
-        set_user_tier(&pool, owner, "teams").await;
-        let team = seed_team_with_roles(&pool, owner).await;
-        let member = seed_user(&pool).await;
-        crate::test_support::add_member(&pool, team, member).await;
-        crate::test_support::set_member_overrides(&pool, team, member, crate::permissions::PERM_CONNECT, 0).await;
-        assert_eq!(put_member_overrides(&pool, team, owner, member, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
-            .bind(team)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(rotations_after_removing_an_allow(&pool, "teams").await, 0);
+    }
+
+    #[tokio::test]
+    async fn business_team_removing_an_allow_queues_one_rotation() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        assert_eq!(rotations_after_removing_an_allow(&pool, "business").await, 1);
     }
 
     async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
@@ -2695,6 +2705,7 @@ mod authz_tests {
         let team = seed_team(&pool, owner).await;
         // Caller HAS manage-roles, so only the business gate can reject.
         let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        crate::test_support::grant_builtin_role(&pool, team, caller, "manager").await;
 
         let res = create_role(
             State(pool.clone()),
@@ -2778,6 +2789,7 @@ mod authz_tests {
         let team = seed_team(&pool, owner).await;
         // Caller HAS manage-roles, so only the business gate can reject.
         let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        crate::test_support::grant_builtin_role(&pool, team, caller, "manager").await;
 
         let res = update_role(
             State(pool.clone()),

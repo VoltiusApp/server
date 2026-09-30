@@ -219,18 +219,8 @@ pub async fn seed_builtin_roles(pool: &PgPool, team: Uuid) {
 /// assigns a builtin role needs this instead.
 pub async fn seed_team_with_roles(pool: &PgPool, owner: Uuid) -> Uuid {
     let team = seed_team(pool, owner).await;
-    seed_builtin_roles(pool, team).await;
     add_member(pool, team, owner).await;
-    sqlx::query(
-        "INSERT INTO team_member_roles (team_id, user_id, role_id)
-         SELECT $1, $2, id FROM team_roles
-         WHERE team_id = $1 AND name = 'owner' AND is_builtin = TRUE",
-    )
-    .bind(team)
-    .bind(owner)
-    .execute(pool)
-    .await
-    .expect("assign owner role");
+    grant_builtin_role(pool, team, owner, "owner").await;
     team
 }
 

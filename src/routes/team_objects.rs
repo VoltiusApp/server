@@ -886,6 +886,7 @@ mod authz_tests {
 
         let blocked_sees = listed_ids(&pool, f.team, f.blocked).await;
         assert!(!blocked_sees.contains(&"child-host".to_string()));
+        assert!(!listed_ids(&pool, f.team, f.viewer).await.contains(&"child-host".to_string()));
     }
 
     #[tokio::test]

@@ -82,7 +82,7 @@ pub(crate) const PERMISSION_JOINS: &str = r#"
            ON o.team_id = tm.team_id AND o.user_id = tm.user_id
 "#;
 
-/// `(roleUnion | allow) & ~deny` on Business; built-in roles minus every overridden bit below it. 0 for a non-member.
+/// Business: `(roles | allow) & !deny`; locked: `builtin & !(allow | deny)`. 0 for a non-member.
 pub async fn effective_permissions(
     pool: &PgPool,
     team_id: Uuid,
@@ -659,12 +659,7 @@ mod db_tests {
         let team = crate::test_support::seed_team_with_roles(&pool, owner).await;
         let member = seed_user(&pool).await;
         add_member(&pool, team, member).await;
-        let builtin: Uuid = sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = 'member' AND is_builtin")
-            .bind(team)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assign_role(&pool, team, member, builtin).await;
+        crate::test_support::grant_builtin_role(&pool, team, member, "member").await;
         set_member_overrides(&pool, team, member, PERM_VIEW_AUDIT_LOG, PERM_VIEW_SECRETS).await;
         let p = effective_permissions(&pool, team, member).await.unwrap();
         assert_eq!(p & (PERM_VIEW_AUDIT_LOG | PERM_VIEW_SECRETS), 0);
