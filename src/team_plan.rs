@@ -45,19 +45,23 @@ pub async fn reconcile_team_plan(
     notifier: &SyncNotifier,
     team_id: Uuid,
 ) -> Result<(), StatusCode> {
-    let locked_now = team_locked(pool, team_id).await?;
     let db = |e: sqlx::Error| {
         error!(error = %e, team_id = %team_id, "Failed to reconcile team plan");
         StatusCode::INTERNAL_SERVER_ERROR
     };
     let mut tx = pool.begin().await.map_err(db)?;
-    let stored: Option<bool> =
-        sqlx::query_scalar("SELECT granular_locked FROM teams WHERE id = $1 FOR UPDATE")
-            .bind(team_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db)?;
-    if stored.is_none_or(|s| s == locked_now) {
+    let row = sqlx::query_as::<_, (bool, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
+        "SELECT t.granular_locked, {OWNER_PLAN_COLUMNS} FROM teams t JOIN users u ON u.id = t.owner_id WHERE t.id = $1 FOR UPDATE OF t"
+    ))
+    .bind(team_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db)?;
+    let Some((stored, tier, trial_ends_at, admin_override, ls_sub)) = row else {
+        return Ok(());
+    };
+    let locked_now = plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub)) != "business";
+    if stored == locked_now {
         return Ok(());
     }
     let members = member_rows(pool, team_id, None).await?;
@@ -203,7 +207,9 @@ mod db_tests {
         member_with_role(&pool, team, PERM_CONNECT).await;
         let notifier = SyncNotifier::new();
         reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        let mut rx = notifier.subscribe();
         reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert!(rx.try_recv().is_err());
         assert!(stored_lock(&pool, team).await);
         assert_eq!(rotation_requests(&pool, team).await, 1);
     }
@@ -215,6 +221,7 @@ mod db_tests {
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "teams").await;
         let team = seed_team_with_roles(&pool, owner).await;
+        member_with_role(&pool, team, PERM_VIEW).await;
         reconcile_team_plan(&pool, &SyncNotifier::new(), team)
             .await
             .unwrap();
@@ -246,12 +253,17 @@ mod db_tests {
     }
 
     #[tokio::test]
-    async fn self_hosted_never_locks() {
+    async fn self_hosted_reconcile_leaves_teams_untouched() {
         let _mode = BillingMode::self_hosted();
         let pool = crate::test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
+        sqlx::query("UPDATE teams SET granular_locked = TRUE WHERE id = $1")
+            .bind(team)
+            .execute(&pool)
+            .await
+            .unwrap();
         reconcile_all_teams(&pool, &SyncNotifier::new()).await;
-        assert!(!stored_lock(&pool, team).await);
+        assert!(stored_lock(&pool, team).await);
     }
 }
