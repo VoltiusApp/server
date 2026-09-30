@@ -1556,12 +1556,14 @@ pub async fn set_member_permissions(
         base: (role_union | previous.0) & !previous.1,
         team_deny: previous.1,
         role_ids: target_role_ids.clone(),
+        locked: false,
     };
     let next_ctx = MemberContext {
         user_id: target_user_id,
         base: (role_union | allow) & !deny,
         team_deny: deny,
         role_ids: target_role_ids,
+        locked: false,
     };
     let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), &live);
     let held_after = holds_vault_key_gate(next_ctx, entries, &live);

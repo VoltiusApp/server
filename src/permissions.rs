@@ -229,14 +229,18 @@ pub struct RuleLayers {
 }
 
 /// Keep in sync with `resolveObjectPermissions` in the client's `src/services/permissions.ts`.
-pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>) -> i64 {
+pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>, locked: bool) -> i64 {
     if base & PERM_ADMINISTRATOR != 0 {
         return with_dependencies(ALL_PERMISSIONS & !team_deny);
     }
     let Some(r) = rules else { return with_dependencies(base) };
-    let mut p = (base & !r.everyone_deny) | r.everyone_allow;
-    p = (p & !r.roles_deny) | r.roles_allow;
-    p = (p & !r.member_deny) | r.member_allow;
+    let mut p = if locked {
+        base & !(r.everyone_deny | r.roles_deny | r.member_deny)
+    } else {
+        let p = (base & !r.everyone_deny) | r.everyone_allow;
+        let p = (p & !r.roles_deny) | r.roles_allow;
+        (p & !r.member_deny) | r.member_allow
+    };
     p &= !team_deny;
     if p & PERM_VIEW == 0 { 0 } else { with_dependencies(p) }
 }
@@ -677,19 +681,19 @@ mod object_permission_tests {
 
     #[test]
     fn no_rule_set_returns_the_team_mask() {
-        assert_eq!(object_permissions(MEMBER, 0, None), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, None, false), MEMBER);
     }
 
     #[test]
     fn a_rule_set_with_no_relevant_entries_keeps_the_team_mask() {
-        assert_eq!(object_permissions(MEMBER, 0, Some(&layers())), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&layers()), false), MEMBER);
     }
 
     #[test]
     fn everyone_deny_removes_and_everyone_allow_adds() {
         let r = RuleLayers { everyone_deny: PERM_VIEW_SECRETS, everyone_allow: PERM_COPY_SECRETS, ..layers() };
         assert_eq!(
-            object_permissions(MEMBER, 0, Some(&r)),
+            object_permissions(MEMBER, 0, Some(&r), false),
             PERM_VIEW | PERM_CONNECT | PERM_COPY_SECRETS
         );
     }
@@ -697,57 +701,57 @@ mod object_permission_tests {
     #[test]
     fn role_layer_overrides_everyone() {
         let r = RuleLayers { everyone_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), MEMBER);
     }
 
     #[test]
     fn within_the_role_layer_allow_beats_deny() {
         let r = RuleLayers { roles_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), MEMBER);
     }
 
     #[test]
     fn member_layer_overrides_roles() {
         let r = RuleLayers { roles_allow: PERM_EDIT_CONNECTIONS, member_deny: PERM_EDIT_CONNECTIONS, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), MEMBER);
     }
 
     #[test]
     fn team_deny_stays_absolute_over_a_member_allow() {
         let base = MEMBER & !PERM_VIEW_SECRETS;
         let r = RuleLayers { member_allow: PERM_VIEW_SECRETS, ..layers() };
-        assert_eq!(object_permissions(base, PERM_VIEW_SECRETS, Some(&r)), base);
+        assert_eq!(object_permissions(base, PERM_VIEW_SECRETS, Some(&r), false), base);
     }
 
     #[test]
     fn losing_view_zeroes_every_bit() {
         let r = RuleLayers { everyone_deny: PERM_VIEW, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), 0);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), 0);
     }
 
     #[test]
     fn a_rule_can_grant_view_the_team_mask_lacks() {
         let r = RuleLayers { member_allow: PERM_VIEW, ..layers() };
-        assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r)), PERM_VIEW | PERM_CONNECT);
+        assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r), false), PERM_VIEW | PERM_CONNECT);
     }
 
     #[test]
     fn denying_connect_on_an_object_also_removes_its_secrets() {
         let r = RuleLayers { everyone_deny: PERM_CONNECT, ..layers() };
         let base = MEMBER | PERM_COPY_SECRETS;
-        assert_eq!(object_permissions(base, 0, Some(&r)), PERM_VIEW);
+        assert_eq!(object_permissions(base, 0, Some(&r), false), PERM_VIEW);
     }
 
     #[test]
     fn secrets_without_connect_grant_nothing_on_the_team_mask() {
         let base = PERM_VIEW | PERM_VIEW_SECRETS | PERM_COPY_SECRETS;
-        assert_eq!(object_permissions(base, 0, None), PERM_VIEW);
+        assert_eq!(object_permissions(base, 0, None, false), PERM_VIEW);
     }
 
     #[test]
     fn a_member_allow_of_secrets_needs_connect_too() {
         let r = RuleLayers { member_deny: PERM_CONNECT, member_allow: PERM_VIEW_SECRETS, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), PERM_VIEW);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), PERM_VIEW);
     }
 
     #[test]
@@ -759,16 +763,73 @@ mod object_permission_tests {
     #[test]
     fn administrator_ignores_every_rule() {
         let r = RuleLayers { everyone_deny: ALL_PERMISSIONS, member_deny: ALL_PERMISSIONS, ..layers() };
-        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r)), ALL_PERMISSIONS);
-        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, None), ALL_PERMISSIONS);
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r), false), ALL_PERMISSIONS);
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, None, false), ALL_PERMISSIONS);
     }
 
     #[test]
     fn administrator_still_loses_a_team_denied_bit() {
         assert_eq!(
-            object_permissions(PERM_ADMINISTRATOR, PERM_COPY_SECRETS, None),
+            object_permissions(PERM_ADMINISTRATOR, PERM_COPY_SECRETS, None, false),
             ALL_PERMISSIONS & !PERM_COPY_SECRETS
         );
+    }
+
+    #[test]
+    fn locked_ignores_allow_layers() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW, member_allow: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), true), 0);
+    }
+
+    #[test]
+    fn locked_keeps_deny_only_rules_for_everyone_else() {
+        let r = RuleLayers { member_deny: PERM_VIEW_SECRETS, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), true), MEMBER & !PERM_VIEW_SECRETS);
+    }
+
+    #[test]
+    fn locked_applies_a_role_deny() {
+        let r = RuleLayers { roles_deny: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), true), 0);
+    }
+
+    #[test]
+    fn locked_without_rules_is_the_team_mask() {
+        assert_eq!(object_permissions(MEMBER, 0, None, true), MEMBER);
+    }
+
+    #[test]
+    fn locked_builtin_administrator_keeps_the_bypass() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r), true), ALL_PERMISSIONS);
+    }
+
+    fn subsets(bits: &[i64]) -> Vec<i64> {
+        (0..1usize << bits.len())
+            .map(|i| bits.iter().enumerate().filter(|(b, _)| i & (1 << b) != 0).fold(0, |a, (_, v)| a | v))
+            .collect()
+    }
+
+    #[test]
+    fn locked_is_never_wider_than_business() {
+        let masks = subsets(&[PERM_VIEW, PERM_CONNECT, PERM_VIEW_SECRETS, PERM_COPY_SECRETS, PERM_EDIT_CONNECTIONS]);
+        for &base in &masks {
+            for &allow in &masks {
+                for &deny in &masks {
+                    let r = RuleLayers {
+                        everyone_allow: allow,
+                        everyone_deny: deny,
+                        roles_allow: deny,
+                        roles_deny: allow,
+                        member_allow: allow,
+                        member_deny: deny,
+                    };
+                    let locked = object_permissions(base, 0, Some(&r), true);
+                    let business = object_permissions(base, 0, Some(&r), false);
+                    assert_eq!(locked & !business, 0, "base={base} allow={allow} deny={deny}");
+                }
+            }
+        }
     }
 
     #[test]

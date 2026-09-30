@@ -52,6 +52,34 @@ pub struct MemberContext {
     pub base: i64,
     pub team_deny: i64,
     pub role_ids: Vec<Uuid>,
+    pub locked: bool,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub builtin: i64,
+    pub custom: i64,
+    pub allow: i64,
+    pub deny: i64,
+    pub role_ids: Vec<Uuid>,
+}
+
+#[allow(dead_code)]
+impl MemberRow {
+    pub fn context(&self, locked: bool) -> MemberContext {
+        let base = if locked {
+            self.builtin & !(self.allow | self.deny)
+        } else {
+            (self.builtin | self.custom | self.allow) & !self.deny
+        };
+        MemberContext { user_id: self.user_id, base, team_deny: self.deny, role_ids: self.role_ids.clone(), locked }
+    }
+
+    pub fn with_overrides(&self, allow: i64, deny: i64) -> MemberRow {
+        MemberRow { allow, deny, ..self.clone() }
+    }
 }
 
 fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
@@ -85,6 +113,7 @@ pub async fn member_contexts(
             base: (roles | allow) & !deny,
             team_deny: deny,
             role_ids,
+            locked: false,
         })
         .collect())
 }
@@ -146,7 +175,7 @@ impl ObjectAuthz {
                 .map(|es| layers_for(es, &self.member.role_ids, self.member.user_id))
                 .unwrap_or_default()
         });
-        object_permissions(self.member.base, self.member.team_deny, layers.as_ref())
+        object_permissions(self.member.base, self.member.team_deny, layers.as_ref(), self.member.locked)
     }
 
     pub fn can(&self, set: Option<Uuid>, bits: i64) -> bool {
@@ -320,6 +349,33 @@ pub async fn record_member_client(pool: &PgPool, team_id: Uuid, user_id: Uuid, h
 
 #[cfg(test)]
 mod tests {
+    fn row(builtin: i64, custom: i64, allow: i64, deny: i64) -> MemberRow {
+        MemberRow { user_id: Uuid::nil(), builtin, custom, allow, deny, role_ids: vec![] }
+    }
+
+    #[test]
+    fn business_context_unions_every_source() {
+        let c = row(PERM_VIEW, PERM_CONNECT, PERM_EDIT_KEYS, PERM_VIEW_SECRETS).context(false);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT | PERM_EDIT_KEYS);
+        assert_eq!(c.team_deny, PERM_VIEW_SECRETS);
+        assert!(!c.locked);
+    }
+
+    #[test]
+    fn locked_context_keeps_builtin_bits_no_override_touched() {
+        let builtin = PERM_VIEW | PERM_CONNECT | PERM_VIEW_SECRETS | PERM_EDIT_KEYS;
+        let c = row(builtin, PERM_ADMINISTRATOR, PERM_EDIT_KEYS, PERM_VIEW_SECRETS).context(true);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT);
+        assert_eq!(c.team_deny, PERM_VIEW_SECRETS);
+        assert!(c.locked);
+    }
+
+    #[test]
+    fn with_overrides_replaces_only_the_masks() {
+        let r = row(PERM_VIEW, 0, 1, 2).with_overrides(PERM_CONNECT, 0);
+        assert_eq!((r.builtin, r.allow, r.deny), (PERM_VIEW, PERM_CONNECT, 0));
+    }
+
     use super::*;
     use crate::permissions::*;
     use crate::test_pool_or_skip;
