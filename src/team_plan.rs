@@ -11,6 +11,8 @@ use crate::routes::teams::{notify_team_members_changed, request_team_rotation};
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
 
+const OWNER_PLAN_FROM: &str = "FROM teams t JOIN users u ON u.id = t.owner_id";
+
 pub fn plan_from_row(row: &TierRow) -> String {
     if self_host::is_self_hosted() {
         return "business".to_string();
@@ -18,12 +20,13 @@ pub fn plan_from_row(row: &TierRow) -> String {
     effective_tier_of(row)
 }
 
-pub async fn team_plan(pool: &PgPool, team_id: Uuid) -> Result<String, StatusCode> {
-    if self_host::is_self_hosted() {
-        return Ok("business".to_string());
-    }
-    let row = sqlx::query_as::<_, TierRow>(&format!(
-        "SELECT {OWNER_PLAN_COLUMNS} FROM teams t JOIN users u ON u.id = t.owner_id WHERE t.id = $1"
+pub fn locked_from_row(row: &TierRow) -> bool {
+    plan_from_row(row) != "business"
+}
+
+async fn owner_plan_row(pool: &PgPool, team_id: Uuid) -> Result<TierRow, StatusCode> {
+    sqlx::query_as::<_, TierRow>(&format!(
+        "SELECT {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM} WHERE t.id = $1"
     ))
     .bind(team_id)
     .fetch_optional(pool)
@@ -32,12 +35,14 @@ pub async fn team_plan(pool: &PgPool, team_id: Uuid) -> Result<String, StatusCod
         error!(error = %e, "Failed to read team plan");
         StatusCode::INTERNAL_SERVER_ERROR
     })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(plan_from_row(&row))
+    .ok_or(StatusCode::NOT_FOUND)
 }
 
 pub async fn team_locked(pool: &PgPool, team_id: Uuid) -> Result<bool, StatusCode> {
-    Ok(team_plan(pool, team_id).await? != "business")
+    if self_host::is_self_hosted() {
+        return Ok(false);
+    }
+    Ok(locked_from_row(&owner_plan_row(pool, team_id).await?))
 }
 
 pub async fn reconcile_team_plan(
@@ -51,7 +56,7 @@ pub async fn reconcile_team_plan(
     };
     let mut tx = pool.begin().await.map_err(db)?;
     let row = sqlx::query_as::<_, (bool, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
-        "SELECT t.granular_locked, {OWNER_PLAN_COLUMNS} FROM teams t JOIN users u ON u.id = t.owner_id WHERE t.id = $1 FOR UPDATE OF t"
+        "SELECT t.granular_locked, {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM} WHERE t.id = $1 FOR UPDATE OF t"
     ))
     .bind(team_id)
     .fetch_optional(&mut *tx)
@@ -60,7 +65,7 @@ pub async fn reconcile_team_plan(
     let Some((stored, tier, trial_ends_at, admin_override, ls_sub)) = row else {
         return Ok(());
     };
-    let locked_now = plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub)) != "business";
+    let locked_now = locked_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
     if stored == locked_now {
         return Ok(());
     }
@@ -96,7 +101,7 @@ pub async fn reconcile_all_teams(pool: &PgPool, notifier: &SyncNotifier) {
         return;
     }
     let rows = sqlx::query_as::<_, (Uuid, bool, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
-        "SELECT t.id, t.granular_locked, {OWNER_PLAN_COLUMNS} FROM teams t JOIN users u ON u.id = t.owner_id"
+        "SELECT t.id, t.granular_locked, {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM}"
     ))
     .fetch_all(pool)
     .await;
@@ -105,8 +110,7 @@ pub async fn reconcile_all_teams(pool: &PgPool, notifier: &SyncNotifier) {
         Err(e) => return error!(error = %e, "Failed to list teams for plan reconcile"),
     };
     for (team_id, stored, tier, trial_ends_at, admin_override, ls_sub) in rows {
-        let locked_now =
-            plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub)) != "business";
+        let locked_now = locked_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
         if locked_now != stored {
             if let Err(status) = reconcile_team_plan(pool, notifier, team_id).await {
                 error!(team_id = %team_id, %status, "Team plan reconcile failed");
@@ -120,7 +124,7 @@ pub async fn require_granular(
     team_id: Uuid,
     narrowing: bool,
 ) -> Result<(), StatusCode> {
-    if narrowing || team_plan(pool, team_id).await? == "business" {
+    if narrowing || !team_locked(pool, team_id).await? {
         Ok(())
     } else {
         Err(StatusCode::PAYMENT_REQUIRED)
@@ -181,14 +185,6 @@ mod db_tests {
     use crate::sync_notifier::{SyncEvent, SyncNotifier};
     use crate::test_support::*;
 
-    async fn rotation_requests(pool: &PgPool, team: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
-            .bind(team)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-    }
-
     async fn stored_lock(pool: &PgPool, team: Uuid) -> bool {
         sqlx::query_scalar("SELECT granular_locked FROM teams WHERE id = $1")
             .bind(team)
@@ -211,7 +207,7 @@ mod db_tests {
         reconcile_team_plan(&pool, &notifier, team).await.unwrap();
         assert!(rx.try_recv().is_err());
         assert!(stored_lock(&pool, team).await);
-        assert_eq!(rotation_requests(&pool, team).await, 1);
+        assert_eq!(rotation_request_count(&pool, team).await, 1);
     }
 
     #[tokio::test]
@@ -226,7 +222,7 @@ mod db_tests {
             .await
             .unwrap();
         assert!(stored_lock(&pool, team).await);
-        assert_eq!(rotation_requests(&pool, team).await, 0);
+        assert_eq!(rotation_request_count(&pool, team).await, 0);
     }
 
     #[tokio::test]

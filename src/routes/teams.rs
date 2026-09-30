@@ -1389,14 +1389,15 @@ where
     .unwrap_or((0, 0)))
 }
 
-async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Option<i32>, sqlx::Error> {
+async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid, locked: bool) -> Result<Option<i32>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<i32>>(
         "SELECT MIN(tr.position) FROM team_member_roles tmr \
          JOIN team_roles tr ON tr.id = tmr.role_id \
-         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
+         WHERE tmr.team_id = $1 AND tmr.user_id = $2 AND (tr.is_builtin OR NOT $3)",
     )
     .bind(team_id)
     .bind(user_id)
+    .bind(locked)
     .fetch_one(pool)
     .await
 }
@@ -1439,10 +1440,11 @@ async fn override_guardrails(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let actor_position = role_position(pool, team_id, actor_id)
+    let locked = crate::team_plan::team_locked(pool, team_id).await?;
+    let actor_position = role_position(pool, team_id, actor_id, locked)
         .await
         .map_err(|e| { error!(error = %e, "Failed to read actor role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
-    let target_position = role_position(pool, team_id, target_user_id)
+    let target_position = role_position(pool, team_id, target_user_id, locked)
         .await
         .map_err(|e| { error!(error = %e, "Failed to read target role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
@@ -1493,6 +1495,7 @@ pub async fn set_member_permissions(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    crate::team_plan::reconcile_team_plan(&pool, &notifier, team_id).await?;
     override_guardrails(&pool, team_id, auth.0, target_user_id, allow).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
@@ -2557,15 +2560,17 @@ mod authz_tests {
         let owner = seed_user(pool).await;
         set_user_tier(pool, owner, tier).await;
         let team = seed_team_with_roles(pool, owner).await;
+        sqlx::query("UPDATE teams SET granular_locked = $2 WHERE id = $1")
+            .bind(team)
+            .bind(tier != "business")
+            .execute(pool)
+            .await
+            .unwrap();
         let member = seed_user(pool).await;
         crate::test_support::add_member(pool, team, member).await;
         crate::test_support::set_member_overrides(pool, team, member, crate::permissions::PERM_VIEW | crate::permissions::PERM_CONNECT, 0).await;
         assert_eq!(put_member_overrides(pool, team, owner, member, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
-        sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
-            .bind(team)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        crate::test_support::rotation_request_count(pool, team).await
     }
 
     #[tokio::test]
@@ -2580,6 +2585,53 @@ mod authz_tests {
         let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         assert_eq!(rotations_after_removing_an_allow(&pool, "business").await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreconciled_lapse_still_rotates_out_a_member_whose_gate_came_from_a_custom_role() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = crate::test_support::member_with_role(&pool, team, crate::permissions::PERM_CONNECT).await;
+        let locked_flag = || async {
+            sqlx::query_scalar::<_, bool>("SELECT granular_locked FROM teams WHERE id = $1")
+                .bind(team)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+        assert!(!locked_flag().await);
+
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+
+        assert!(locked_flag().await);
+        assert_eq!(crate::test_support::rotation_request_count(&pool, team).await, 1);
+    }
+
+    #[tokio::test]
+    async fn on_a_locked_team_only_builtin_roles_rank_an_actor_above_a_peer() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let actor = crate::test_support::member_with_role(&pool, team, PERM_MANAGE_MEMBERS).await;
+        let target = seed_user(&pool).await;
+        crate::test_support::add_member(&pool, team, target).await;
+        crate::test_support::grant_builtin_role(&pool, team, target, "member").await;
+        sqlx::query("UPDATE team_roles SET position = 0 WHERE team_id = $1 AND name LIKE 'authz-test-role-%'")
+            .bind(team)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(override_guardrails(&pool, team, actor, target, 0).await, Err(StatusCode::FORBIDDEN));
+
+        set_user_tier(&pool, owner, "business").await;
+        assert_eq!(override_guardrails(&pool, team, actor, target, 0).await, Ok(()));
     }
 
     async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
@@ -3459,13 +3511,7 @@ mod override_response_tests {
         assign_role(&pool, team, target, target_role).await;
 
         let rotations = || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-            )
-            .bind(team)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+            crate::test_support::rotation_request_count(&pool, team).await
         };
 
         put_member_overrides(&pool, team, actor, target, 0, crate::permissions::PERM_CONNECT, axum::http::HeaderMap::new())
@@ -3499,13 +3545,7 @@ mod override_response_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 0);
     }
 
@@ -3532,13 +3572,7 @@ mod override_response_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(
             count, 0,
             "CONNECT still satisfies the Any key gate, so the member keeps key access and rotation buys nothing"
@@ -3569,13 +3603,7 @@ mod override_response_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 0, "COPY_SECRETS alone does not gate get_my_vault_key, so rotation buys nothing");
     }
 
@@ -3593,13 +3621,7 @@ mod override_response_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 1, "clearing a roleless member's only read-class allow must still revoke key access");
     }
 
@@ -3620,13 +3642,7 @@ mod override_response_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(
             count, 1,
             "denying VIEW drops the widened gate's team-level path even though CONNECT is nominally still allowed"
@@ -3656,13 +3672,7 @@ mod override_response_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(
             count, 1,
             "a team-level deny wipes even an object-level grant of the same bit, dropping the widened gate"
@@ -3677,25 +3687,13 @@ mod override_response_tests {
         let mut conn = pool.acquire().await.unwrap();
         super::request_team_rotation(&mut conn, team).await.unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 1);
 
         // Idempotent within an epoch.
         let mut conn = pool.acquire().await.unwrap();
         super::request_team_rotation(&mut conn, team).await.unwrap();
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 1);
     }
 }

@@ -490,3 +490,11 @@ pub async fn hidden_object_fixture(pool: &PgPool, object_type: &str, member_perm
     point_object(pool, team, &object_id, Some(rule_set)).await;
     HiddenObjectFixture { team, owner, viewer, blocked, admin, object_id, rule_set }
 }
+
+pub async fn rotation_request_count(pool: &PgPool, team: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
+        .bind(team)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
