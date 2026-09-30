@@ -1353,10 +1353,6 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
-fn narrows_masks(previous: (i64, i64), next: (i64, i64)) -> bool {
-    next.0 & !previous.0 == 0 && next.1 & !previous.1 == 0
-}
-
 async fn override_masks<'e, E>(executor: E, team_id: Uuid, user_id: Uuid) -> Result<(i64, i64), StatusCode>
 where
     E: sqlx::PgExecutor<'e>,
@@ -1484,7 +1480,7 @@ pub async fn set_member_permissions(
     })?;
 
     let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
-    crate::team_plan::require_granular(&pool, team_id, narrows_masks(previous, (allow, deny))).await?;
+    crate::team_plan::require_granular(&pool, team_id, crate::team_plan::narrows_masks(previous, (allow, deny))).await?;
 
     let role_union: i64 = sqlx::query_scalar(
         "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
@@ -2504,15 +2500,6 @@ mod authz_tests {
             !admits_over_ws(&pool, &manager, session_id, host, guest).await,
             "the guest must lose admission to the session too"
         );
-    }
-
-    #[test]
-    fn narrowing_masks_only_drop_bits() {
-        assert!(narrows_masks((0b101, 0b010), (0b001, 0)));
-        assert!(narrows_masks((0, 0), (0, 0)));
-        assert!(!narrows_masks((0b001, 0), (0b011, 0)));
-        assert!(!narrows_masks((0, 0b01), (0, 0b11)));
-        assert!(!narrows_masks((0b01, 0), (0, 0b01)));
     }
 
     async fn member_below_owner(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {

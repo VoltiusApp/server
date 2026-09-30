@@ -122,8 +122,14 @@ async fn load_entries<'e, E: sqlx::PgExecutor<'e>>(executor: E, set_id: Uuid) ->
     .collect())
 }
 
-fn entries_subset(current: &[RuleEntryBody], next: &[RuleEntryBody]) -> bool {
-    next.iter().all(|e| current.contains(e))
+fn narrows_entries(current: &[RuleEntryBody], next: &[RuleEntryBody]) -> bool {
+    next.iter().all(|e| {
+        current.iter().any(|c| {
+            c.subject_type == e.subject_type
+                && c.subject_id == e.subject_id
+                && crate::team_plan::narrows_masks((c.allow, c.deny), (e.allow, e.deny))
+        })
+    })
 }
 
 async fn new_set(conn: &mut sqlx::PgConnection, team_id: Uuid, author: Uuid) -> Result<Uuid, StatusCode> {
@@ -204,7 +210,7 @@ pub async fn put_rule_set(
     sqlx::query("UPDATE team_rule_sets SET updated_at = now(), updated_by = $2 WHERE id = $1")
         .bind(set_id).bind(auth.0).execute(&mut *tx).await.map_err(|e| internal(e, "stamp set"))?;
     let current = load_entries(&mut *tx, set_id).await?;
-    crate::team_plan::require_granular(&pool, team_id, entries_subset(&current, &entries)).await?;
+    crate::team_plan::require_granular(&pool, team_id, narrows_entries(&current, &entries)).await?;
     sqlx::query("DELETE FROM team_rule_set_entries WHERE rule_set_id = $1")
         .bind(set_id).execute(&mut *tx).await.map_err(|e| internal(e, "clear entries"))?;
     insert_entries(&mut tx, set_id, &entries).await?;
@@ -245,13 +251,32 @@ mod tests {
     }
 
     #[test]
-    fn a_subset_keeps_only_unchanged_entries() {
-        let a = entry("everyone", None, 0, PERM_VIEW);
-        let b = entry("role", Some(Uuid::nil()), PERM_CONNECT, 0);
-        assert!(entries_subset(&[a.clone(), b.clone()], std::slice::from_ref(&a)));
-        assert!(entries_subset(std::slice::from_ref(&a), &[]));
-        assert!(!entries_subset(std::slice::from_ref(&a), &[a.clone(), b]));
-        assert!(!entries_subset(&[a], &[entry("everyone", None, 0, PERM_VIEW | PERM_CONNECT)]));
+    fn narrowing_entries_only_drop_or_shrink() {
+        let both = entry("everyone", None, 0, PERM_VIEW | PERM_CONNECT);
+        let view = entry("everyone", None, 0, PERM_VIEW);
+        let other = entry("role", Some(Uuid::nil()), PERM_CONNECT, 0);
+        assert!(narrows_entries(&[both.clone(), other.clone()], std::slice::from_ref(&both)));
+        assert!(narrows_entries(std::slice::from_ref(&both), &[]));
+        assert!(narrows_entries(std::slice::from_ref(&both), std::slice::from_ref(&view)));
+        assert!(!narrows_entries(std::slice::from_ref(&view), std::slice::from_ref(&both)));
+        assert!(!narrows_entries(std::slice::from_ref(&view), &[view.clone(), other]));
+        assert!(!narrows_entries(&[view], &[entry("everyone", None, PERM_VIEW, 0)]));
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_can_drop_a_single_bit_of_a_rule() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        set_user_tier(&pool, f.owner, "teams").await;
+        let set = seed_rule_set(&pool, f.team, f.owner, &[("everyone", None, 0, PERM_VIEW | PERM_CONNECT)]).await;
+        point_object(&pool, f.team, &f.object_id, Some(set)).await;
+
+        assert_eq!(put(&pool, f.team, f.admin, set, vec![entry("everyone", None, 0, PERM_VIEW)]).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(
+            put(&pool, f.team, f.admin, set, vec![entry("everyone", None, 0, PERM_VIEW | PERM_CONNECT)]).await.unwrap_err(),
+            StatusCode::PAYMENT_REQUIRED,
+        );
     }
 
     #[tokio::test]

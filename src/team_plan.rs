@@ -43,6 +43,10 @@ pub async fn require_granular(
     }
 }
 
+pub fn narrows_masks(previous: (i64, i64), next: (i64, i64)) -> bool {
+    next.0 & !previous.0 == 0 && next.1 & !previous.1 == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +78,14 @@ mod tests {
             plan_from_row(&("business".into(), lapsed, false, None)),
             "free"
         );
+    }
+
+    #[test]
+    fn narrowing_masks_only_drop_bits() {
+        assert!(narrows_masks((0b101, 0b010), (0b001, 0)));
+        assert!(narrows_masks((0, 0), (0, 0)));
+        assert!(!narrows_masks((0b001, 0), (0b011, 0)));
+        assert!(!narrows_masks((0, 0b01), (0, 0b11)));
+        assert!(!narrows_masks((0b01, 0), (0, 0b01)));
     }
 }
