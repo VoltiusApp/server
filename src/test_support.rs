@@ -27,6 +27,38 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 #[allow(dead_code)]
 pub struct EnvLockGuard(pub MutexGuard<'static, ()>);
 
+#[allow(dead_code)]
+pub struct BillingMode(MutexGuard<'static, ()>, Option<String>);
+
+impl BillingMode {
+    pub fn hosted() -> Self {
+        Self::set(Some("test-key"))
+    }
+
+    pub fn self_hosted() -> Self {
+        Self::set(None)
+    }
+
+    fn set(key: Option<&str>) -> Self {
+        let lock = env_lock();
+        let prev = std::env::var("LEMONSQUEEZY_API_KEY").ok();
+        match key {
+            Some(k) => std::env::set_var("LEMONSQUEEZY_API_KEY", k),
+            None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
+        }
+        BillingMode(lock, prev)
+    }
+}
+
+impl Drop for BillingMode {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
+            None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
+        }
+    }
+}
+
 /// Serializes tests that read or write `users.last_seen_on`. Activity counts are
 /// whole-table aggregates, so a concurrent test stamping a user would shift the
 /// totals mid-assertion. Any test touching that column must hold this lock.
