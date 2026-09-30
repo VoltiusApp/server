@@ -1353,6 +1353,27 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
+#[cfg(test)]
+async fn put_member_overrides(
+    pool: &PgPool,
+    team: Uuid,
+    actor: Uuid,
+    target: Uuid,
+    allow: i64,
+    deny: i64,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    set_member_permissions(
+        State(pool.clone()),
+        axum::Extension(AuthUser(actor)),
+        axum::Extension(SyncNotifier::new()),
+        headers,
+        Path((team, target)),
+        Json(SetMemberPermissionsRequest { allow, deny }),
+    )
+    .await
+}
+
 async fn override_masks<'e, E>(executor: E, team_id: Uuid, user_id: Uuid) -> Result<(i64, i64), StatusCode>
 where
     E: sqlx::PgExecutor<'e>,
@@ -2516,18 +2537,6 @@ mod authz_tests {
         user
     }
 
-    async fn put_overrides(pool: &PgPool, team: Uuid, actor: Uuid, target: Uuid, allow: i64, deny: i64) -> Result<StatusCode, StatusCode> {
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            crate::test_support::rule_set_client_headers(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow, deny }),
-        )
-        .await
-    }
-
     #[tokio::test]
     async fn a_teams_team_can_clear_overrides_but_not_add_them() {
         let _env = BillingMode::hosted();
@@ -2538,8 +2547,8 @@ mod authz_tests {
         let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
         crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
 
-        assert_eq!(put_overrides(&pool, team, owner, target, PERM_VIEW_SECRETS, 0).await, Err(StatusCode::PAYMENT_REQUIRED));
-        assert_eq!(put_overrides(&pool, team, owner, target, 0, 0).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, PERM_VIEW_SECRETS, 0, crate::test_support::rule_set_client_headers()).await, Err(StatusCode::PAYMENT_REQUIRED));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
     }
 
     #[tokio::test]
@@ -2551,7 +2560,7 @@ mod authz_tests {
         let team = seed_team_with_roles(&pool, owner).await;
         let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
 
-        assert_eq!(put_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
     }
 
     #[tokio::test]
@@ -2564,8 +2573,8 @@ mod authz_tests {
         let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
         crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
 
-        assert_eq!(put_overrides(&pool, team, owner, target, 0, 0).await, Ok(StatusCode::NO_CONTENT));
-        assert_eq!(put_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS).await, Err(StatusCode::PAYMENT_REQUIRED));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS, crate::test_support::rule_set_client_headers()).await, Err(StatusCode::PAYMENT_REQUIRED));
     }
 
     async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
@@ -3141,6 +3150,7 @@ mod search_tests {
 
 #[cfg(test)]
 mod override_response_tests {
+    use super::put_member_overrides;
     use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, seed_team, seed_user, set_member_overrides};
@@ -3187,17 +3197,13 @@ mod override_response_tests {
         assert!(validate_override_masks(-1, 0).is_err());
     }
 
-    use super::{override_guardrails, set_member_permissions, SetMemberPermissionsRequest};
-    use crate::auth::AuthUser;
+    use super::override_guardrails;
     use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
-    use crate::sync_notifier::SyncNotifier;
     use crate::test_support::{
         assign_role, rule_set_client_headers, seed_builtin_roles, seed_role, seed_team_with_roles,
         BillingMode,
     };
-    use axum::extract::{Path, State};
     use axum::http::StatusCode;
-    use axum::{Extension, Json};
 
     #[tokio::test]
     async fn guardrail_rejects_editing_your_own_overrides() {
@@ -3301,14 +3307,7 @@ mod override_response_tests {
         assign_role(&pool, team, weak_manager, weak_manager_role).await;
 
         assert_eq!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(weak_manager)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, contractor)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, weak_manager, contractor, 0, 0, axum::http::HeaderMap::new())
             .await
             .unwrap_err(),
             StatusCode::FORBIDDEN,
@@ -3322,14 +3321,7 @@ mod override_response_tests {
         assign_role(&pool, team, strong_manager, strong_manager_role).await;
 
         assert!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(strong_manager)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, contractor)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, strong_manager, contractor, 0, 0, axum::http::HeaderMap::new())
             .await
             .is_ok(),
             "a manager holding MANAGE_VAULT can strip it"
@@ -3406,14 +3398,7 @@ mod override_response_tests {
         assign_role(&pool, team, owner, role).await;
 
         assert_eq!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(owner)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, owner)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, owner, owner, 0, 0, axum::http::HeaderMap::new())
             .await
             .unwrap_err(),
             StatusCode::FORBIDDEN
@@ -3440,14 +3425,7 @@ mod override_response_tests {
         assign_role(&pool, team, target, target_role).await;
 
         assert_eq!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(actor)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, target)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, actor, target, 0, 0, axum::http::HeaderMap::new())
             .await
             .unwrap_err(),
             StatusCode::FORBIDDEN
@@ -3482,26 +3460,12 @@ mod override_response_tests {
             .unwrap()
         };
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_CONNECT }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, crate::permissions::PERM_CONNECT, axum::http::HeaderMap::new())
         .await
         .unwrap();
         assert_eq!(rotations().await, 1);
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_CONNECT }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, crate::permissions::PERM_CONNECT, axum::http::HeaderMap::new())
         .await
         .unwrap();
         assert_eq!(rotations().await, 1);
@@ -3523,14 +3487,7 @@ mod override_response_tests {
         assign_role(&pool, team, actor, actor_role).await;
         add_member(&pool, team, target).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_EDIT_CONNECTIONS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_EDIT_CONNECTIONS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
@@ -3563,14 +3520,7 @@ mod override_response_tests {
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_VIEW_SECRETS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
@@ -3607,14 +3557,7 @@ mod override_response_tests {
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_COPY_SECRETS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
@@ -3638,14 +3581,7 @@ mod override_response_tests {
         add_member(&pool, team, contractor).await;
         crate::test_support::set_member_overrides(&pool, team, contractor, crate::permissions::PERM_CONNECT | PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW, 0).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(owner)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, contractor)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-        )
+        put_member_overrides(&pool, team, owner, contractor, 0, 0, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
@@ -3672,14 +3608,7 @@ mod override_response_tests {
         assign_role(&pool, team, target, target_role).await;
         crate::test_support::seed_rule_set(&pool, team, owner, &[]).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(owner)),
-            Extension(SyncNotifier::new()),
-            rule_set_client_headers(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_VIEW }),
-        )
+        put_member_overrides(&pool, team, owner, target, 0, crate::permissions::PERM_VIEW, rule_set_client_headers())
         .await
         .unwrap();
 
@@ -3715,14 +3644,7 @@ mod override_response_tests {
         .await;
         crate::test_support::point_object(&pool, team, "obj-1", Some(set)).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(owner)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_CONNECT }),
-        )
+        put_member_overrides(&pool, team, owner, target, 0, PERM_CONNECT, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
@@ -3772,6 +3694,7 @@ mod override_response_tests {
 
 #[cfg(test)]
 mod rule_set_era_tests {
+    use super::put_member_overrides;
     use super::*;
     use crate::auth::AuthUser;
     use crate::permissions::*;
@@ -3896,14 +3819,7 @@ mod rule_set_era_tests {
         assign_role(&pool, team, target, target_role).await;
         set_member_overrides(&pool, team, target, 0, PERM_VIEW).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_COPY_SECRETS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
