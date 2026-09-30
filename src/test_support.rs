@@ -28,7 +28,7 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 pub struct EnvLockGuard(pub MutexGuard<'static, ()>);
 
 #[allow(dead_code)]
-pub struct BillingMode(MutexGuard<'static, ()>, Option<String>);
+pub struct BillingMode(MutexGuard<'static, ()>, Option<String>, Option<bool>);
 
 impl BillingMode {
     pub fn hosted() -> Self {
@@ -46,7 +46,8 @@ impl BillingMode {
             Some(k) => std::env::set_var("LEMONSQUEEZY_API_KEY", k),
             None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
         }
-        BillingMode(lock, prev)
+        let prev_mode = crate::self_host::set_test_billing_mode(Some(key.is_none()));
+        BillingMode(lock, prev, prev_mode)
     }
 }
 
@@ -56,6 +57,7 @@ impl Drop for BillingMode {
             Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
             None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
         }
+        crate::self_host::set_test_billing_mode(self.2);
     }
 }
 
