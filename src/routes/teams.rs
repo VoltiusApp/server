@@ -1078,8 +1078,6 @@ pub async fn delete_role(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    crate::team_plan::require_granular(&pool, team_id, false).await?;
-
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
@@ -1214,19 +1212,17 @@ pub async fn assign_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Verify role belongs to this team
-    let role_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM team_roles WHERE id = $1 AND team_id = $2)",
+    let is_builtin = sqlx::query_scalar::<_, bool>(
+        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
     )
     .bind(body.role_id)
     .bind(team_id)
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .ok_or(StatusCode::NOT_FOUND)?;
 
-    if !role_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    crate::team_plan::require_granular(&pool, team_id, is_builtin).await?;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -2505,8 +2501,72 @@ mod authz_tests {
         );
     }
 
+    async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
+        delete_role(State(pool.clone()), Extension(AuthUser(user)), Extension(SyncNotifier::new()), Path((team, role))).await
+    }
+
+    async fn call_assign(pool: &PgPool, team: Uuid, actor: Uuid, target: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
+        assign_member_role(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(AssignRoleRequest { role_id: role }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_can_still_delete_a_custom_role_and_its_rules() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        let manager = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        let role = seed_role(&pool, team, "legacy", PERM_VIEW_SECRETS).await;
+        crate::test_support::seed_rule_set(&pool, team, owner, &[("role", Some(role), 0, crate::permissions::PERM_VIEW)]).await;
+
+        assert_eq!(call_delete_role(&pool, team, manager, role).await, Ok(StatusCode::NO_CONTENT));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_set_entries WHERE subject_id = $1")
+            .bind(role).fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_may_assign_builtin_roles_but_not_custom_ones() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = seed_user(&pool).await;
+        add_team_member(&pool, team, target).await;
+        let editor: Uuid = sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = 'editor' AND is_builtin")
+            .bind(team).fetch_one(&pool).await.unwrap();
+        let custom = seed_role(&pool, team, "deploy", PERM_VIEW_SECRETS).await;
+
+        assert_eq!(call_assign(&pool, team, owner, target, editor).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(call_assign(&pool, team, owner, target, custom).await, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn a_business_team_may_assign_custom_roles() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = seed_user(&pool).await;
+        add_team_member(&pool, team, target).await;
+        let custom = seed_role(&pool, team, "deploy", PERM_VIEW_SECRETS).await;
+
+        assert_eq!(call_assign(&pool, team, owner, target, custom).await, Ok(StatusCode::NO_CONTENT));
+    }
+
     #[tokio::test]
     async fn assign_member_role_forbidden_without_manage_permission() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;

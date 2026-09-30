@@ -896,6 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn vault_key_readable_with_connect_permission() {
+        let _env = crate::test_support::BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
