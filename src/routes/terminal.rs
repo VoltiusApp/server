@@ -774,8 +774,7 @@ async fn listed_sessions(
             CASE
               WHEN ts.host_user_id = $1 THEN ts.connection_name
               -- Teammate pair test, inlined: TEAMMATE_PAIR_SQL (teams.rs) hardcodes
-              -- `$2`/`u.id`, which collide with this query's own `$2` (a permission
-              -- bitmask) and lack of a `u`-aliased row — see that constant's doc.
+              -- `$2`/`u.id`, and this query has no `u`-aliased row — see that constant's doc.
               WHEN EXISTS (SELECT 1 FROM team_members a JOIN team_members b ON a.team_id = b.team_id
                             WHERE a.user_id = $1 AND b.user_id = ts.host_user_id) THEN ts.connection_name
               WHEN EXISTS (SELECT 1 FROM terminal_session_invitees tsi2
