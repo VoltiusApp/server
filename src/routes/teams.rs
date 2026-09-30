@@ -657,6 +657,43 @@ pub async fn remove_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Rename team ──────────────────────────────────────────────────────────────
+
+const MAX_TEAM_NAME_CHARS: usize = 100;
+
+#[derive(Deserialize)]
+pub struct RenameTeamRequest {
+    pub name: String,
+}
+
+pub async fn rename_team(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    Path(team_id): Path<Uuid>,
+    Json(body): Json<RenameTeamRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let effective = crate::permissions::effective_permissions(&pool, team_id, auth.0).await?;
+    if effective & (crate::permissions::PERM_MANAGE_VAULT | crate::permissions::PERM_ADMINISTRATOR) == 0 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let name = body.name.trim();
+    if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    sqlx::query("UPDATE teams SET name = $2 WHERE id = $1")
+        .bind(team_id)
+        .bind(name)
+        .execute(&pool)
+        .await
+        .map_err(|e| { error!(error = %e, team_id = %team_id, "Failed to rename team"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    info!(team_id = %team_id, renamed_by = %auth.0, "Team renamed");
+    notify_team_members_changed(&pool, &notifier, team_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── Delete team ──────────────────────────────────────────────────────────────
 
 pub async fn delete_team(
@@ -1931,6 +1968,59 @@ mod authz_tests {
         assert_eq!(created.owner_tier, "business");
         assert_eq!(created.role_ids.len(), 1);
         assert_eq!(serde_json::to_value(&created).unwrap(), serde_json::to_value(&listed).unwrap());
+    }
+
+    async fn rename(pool: &PgPool, team: Uuid, user: Uuid, name: &str) -> Result<StatusCode, StatusCode> {
+        rename_team(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(RenameTeamRequest { name: name.into() }),
+        )
+        .await
+    }
+
+    async fn team_name(pool: &PgPool, team: Uuid) -> String {
+        sqlx::query_scalar("SELECT name FROM teams WHERE id = $1").bind(team).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn rename_team_by_the_owner_is_what_every_member_lists() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        assert_eq!(rename(&pool, team, owner, "  Ops  ").await, Ok(StatusCode::NO_CONTENT));
+
+        assert_eq!(team_name(&pool, team).await, "Ops");
+    }
+
+    #[tokio::test]
+    async fn rename_team_needs_manage_vault() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_MANAGE_MEMBERS).await;
+        let manager = member_with_role(&pool, team, crate::permissions::PERM_MANAGE_VAULT).await;
+        let outsider = seed_user(&pool).await;
+
+        assert_eq!(rename(&pool, team, member, "Nope").await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(rename(&pool, team, outsider, "Nope").await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(rename(&pool, team, manager, "Infra").await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(team_name(&pool, team).await, "Infra");
+    }
+
+    #[tokio::test]
+    async fn rename_team_rejects_a_blank_or_overlong_name() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let before = team_name(&pool, team).await;
+
+        assert_eq!(rename(&pool, team, owner, "   ").await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(rename(&pool, team, owner, &"x".repeat(101)).await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(team_name(&pool, team).await, before);
     }
 
     #[tokio::test]

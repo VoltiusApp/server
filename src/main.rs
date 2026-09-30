@@ -356,7 +356,7 @@ async fn main() {
             "/v1/teams/:team_id/members",
             post(routes::teams::add_member),
         )
-        .route("/v1/teams/:team_id", delete(routes::teams::delete_team))
+        .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route(
             "/v1/teams/:team_id/members/:user_id",
             delete(routes::teams::remove_member),
