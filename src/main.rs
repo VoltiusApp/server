@@ -2,6 +2,7 @@ mod auth;
 mod db;
 mod email;
 mod entitlement;
+mod features;
 mod handles;
 mod last_seen;
 mod lemonsqueezy;
@@ -245,6 +246,12 @@ async fn main() {
         knock_per_hour,
         "Configured rate limits"
     );
+    let features = features::Features::from_env();
+    tracing::info!(
+        registration = features.registration,
+        team_invites = features.team_invites,
+        "Configured features"
+    );
 
     // Register — stricter limit: 5/day per IP on top of the general auth 10/min
     let register_route = Router::new()
@@ -252,7 +259,8 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::register_rate_limit))
         .layer(Extension(register_limiter))
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
-        .layer(Extension(auth_limiter.clone()));
+        .layer(Extension(auth_limiter.clone()))
+        .layer(middleware::from_fn(features::require_registration));
 
     // Public auth + public invitation lookup — rate limited at 10/min per IP
     let public = Router::new()
@@ -292,6 +300,7 @@ async fn main() {
         )
         .layer(middleware::from_fn(rate_limit::invite_rate_limit))
         .layer(Extension(invite_limiter))
+        .layer(middleware::from_fn(features::require_team_invites))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()));
 
@@ -365,7 +374,8 @@ async fn main() {
         )
         .route(
             "/v1/teams/:team_id/members",
-            post(routes::teams::add_member),
+            post(routes::teams::add_member)
+                .layer(middleware::from_fn(features::require_team_invites)),
         )
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route(
@@ -433,7 +443,8 @@ async fn main() {
         // Team join grants (link-borne membership; never vault access)
         .route(
             "/v1/teams/:team_id/grants",
-            post(routes::team_grants::create_grant),
+            post(routes::team_grants::create_grant)
+                .layer(middleware::from_fn(features::require_team_invites)),
         )
         .route(
             "/v1/teams/:team_id/grants",
@@ -704,6 +715,7 @@ async fn main() {
         .route("/health", get(routes::health::health))
         .route("/health/deep", get(routes::health::health_deep))
         .route("/v1/meta", get(routes::meta::get_meta))
+        .layer(Extension(features))
         .layer({
             let allow_origin = match std::env::var("CORS_ORIGINS") {
                 Ok(s) => {
