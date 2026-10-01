@@ -30,6 +30,13 @@ pub struct RuleSetBody {
     pub entries: Vec<RuleEntryBody>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PutRuleSetBody {
+    pub entries: Vec<RuleEntryBody>,
+    #[serde(default)]
+    pub expected_updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RuleSetResponse {
     pub id: Uuid,
@@ -198,7 +205,7 @@ pub async fn put_rule_set(
     Extension(sync_notifier): Extension<SyncNotifier>,
     headers: HeaderMap,
     Path((team_id, set_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<RuleSetBody>,
+    Json(body): Json<PutRuleSetBody>,
 ) -> Result<StatusCode, StatusCode> {
     require_rule_set_feature(&headers)?;
     let authz = load_member(&pool, team_id, auth.0).await?;
@@ -206,9 +213,16 @@ pub async fn put_rule_set(
     let entries = validate_entries(&pool, team_id, body.entries).await?;
     let mut tx = pool.begin().await.map_err(|e| internal(e, "begin put"))?;
     // Stamp first: the row lock this UPDATE takes serializes concurrent PUTs on
-    // the same set until commit, so a second writer's DELETE can't interleave.
-    sqlx::query("UPDATE team_rule_sets SET updated_at = now(), updated_by = $2 WHERE id = $1")
-        .bind(set_id).bind(auth.0).execute(&mut *tx).await.map_err(|e| internal(e, "stamp set"))?;
+    // the same set until commit, and the stamp check re-runs on the locked row.
+    let stamped = sqlx::query(
+        "UPDATE team_rule_sets SET updated_at = now(), updated_by = $2 \
+         WHERE id = $1 AND ($3::timestamptz IS NULL OR updated_at = $3)",
+    )
+    .bind(set_id).bind(auth.0).bind(body.expected_updated_at)
+    .execute(&mut *tx).await.map_err(|e| internal(e, "stamp set"))?;
+    if stamped.rows_affected() == 0 {
+        return Err(StatusCode::CONFLICT);
+    }
     let current = load_entries(&mut *tx, set_id).await?;
     crate::team_plan::require_granular(&pool, team_id, narrows_entries(&current, &entries)).await?;
     sqlx::query("DELETE FROM team_rule_set_entries WHERE rule_set_id = $1")
@@ -238,16 +252,31 @@ mod tests {
             .map(|(_, Json(c))| c.id)
     }
 
-    async fn put(pool: &PgPool, team: Uuid, user: Uuid, set: Uuid, entries: Vec<RuleEntryBody>) -> Result<StatusCode, StatusCode> {
+    async fn put_expecting(
+        pool: &PgPool,
+        team: Uuid,
+        user: Uuid,
+        set: Uuid,
+        entries: Vec<RuleEntryBody>,
+        expected_updated_at: Option<DateTime<Utc>>,
+    ) -> Result<StatusCode, StatusCode> {
         put_rule_set(
             State(pool.clone()),
             Extension(AuthUser(user)),
             Extension(crate::sync_notifier::SyncNotifier::new()),
             rule_set_client_headers(),
             Path((team, set)),
-            Json(RuleSetBody { entries }),
+            Json(PutRuleSetBody { entries, expected_updated_at }),
         )
         .await
+    }
+
+    async fn put(pool: &PgPool, team: Uuid, user: Uuid, set: Uuid, entries: Vec<RuleEntryBody>) -> Result<StatusCode, StatusCode> {
+        put_expecting(pool, team, user, set, entries, None).await
+    }
+
+    async fn stamp_of(pool: &PgPool, set: Uuid) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT updated_at FROM team_rule_sets WHERE id = $1").bind(set).fetch_one(pool).await.unwrap()
     }
 
     #[test]
@@ -309,6 +338,23 @@ mod tests {
             put(&pool, f.team, f.admin, f.rule_set, vec![entry("member", Some(f.blocked), PERM_VIEW, 0)]).await,
             Ok(StatusCode::NO_CONTENT),
         );
+    }
+
+    #[tokio::test]
+    async fn put_with_a_stale_stamp_is_409_and_leaves_the_entries() {
+        let _env = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        let seen = stamp_of(&pool, f.rule_set).await;
+        let theirs = vec![entry("member", Some(f.blocked), PERM_VIEW, 0)];
+        assert_eq!(put_expecting(&pool, f.team, f.admin, f.rule_set, theirs.clone(), Some(seen)).await, Ok(StatusCode::NO_CONTENT));
+        let after_theirs = stamp_of(&pool, f.rule_set).await;
+        assert_ne!(after_theirs, seen);
+
+        let stale = put_expecting(&pool, f.team, f.admin, f.rule_set, vec![], Some(seen)).await;
+        assert_eq!(stale.unwrap_err(), StatusCode::CONFLICT);
+        assert_eq!(load_entries(&pool, f.rule_set).await.unwrap(), theirs);
+        assert_eq!(put_expecting(&pool, f.team, f.admin, f.rule_set, vec![], Some(after_theirs)).await, Ok(StatusCode::NO_CONTENT));
     }
 
     #[tokio::test]
