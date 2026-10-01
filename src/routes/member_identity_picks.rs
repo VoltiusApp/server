@@ -6,11 +6,10 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::object_authz::ObjectAuthz;
+use crate::object_authz::{db_error, ObjectAuthz};
 use crate::permissions::{is_team_member, PERM_CONNECT};
 
 #[derive(Debug, Serialize)]
@@ -38,11 +37,6 @@ pub struct PickRequest {
     pub identity_id: String,
 }
 
-fn db_error(e: sqlx::Error) -> StatusCode {
-    error!(error = %e, "member identity picks query failed");
-    StatusCode::INTERNAL_SERVER_ERROR
-}
-
 fn validate(identity_id: &str) -> Result<(), StatusCode> {
     if identity_id.is_empty() || identity_id.len() > 128 {
         return Err(StatusCode::BAD_REQUEST);
@@ -60,7 +54,7 @@ async fn can_pick_object(pool: &PgPool, user: Uuid, object_id: &str) -> Result<b
     .bind(object_id)
     .fetch_all(pool)
     .await
-    .map_err(db_error)?;
+    .map_err(|e| db_error(e, "pickable objects"))?;
     for (team_id, rule_set_id) in rows {
         if let Some(authz) = ObjectAuthz::load(pool, team_id, user).await? {
             if authz.can(rule_set_id, PERM_CONNECT) {
@@ -82,7 +76,7 @@ pub async fn list_picks(
     .bind(auth.0)
     .fetch_all(&pool)
     .await
-    .map_err(db_error)?;
+    .map_err(|e| db_error(e, "list object picks"))?;
     let defaults = sqlx::query_as::<_, (Uuid, String, DateTime<Utc>)>(
         "SELECT team_id, identity_id, updated_at FROM member_identity_picks
           WHERE user_id = $1 AND team_id IS NOT NULL ORDER BY team_id",
@@ -90,7 +84,7 @@ pub async fn list_picks(
     .bind(auth.0)
     .fetch_all(&pool)
     .await
-    .map_err(db_error)?;
+    .map_err(|e| db_error(e, "list team defaults"))?;
     Ok(Json(IdentityPicks {
         objects: objects
             .into_iter()
@@ -131,7 +125,7 @@ pub async fn put_object_pick(
     .bind(&body.identity_id)
     .execute(&pool)
     .await
-    .map_err(db_error)?;
+    .map_err(|e| db_error(e, "upsert object pick"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -145,7 +139,7 @@ pub async fn delete_object_pick(
         .bind(&object_id)
         .execute(&pool)
         .await
-        .map_err(db_error)?;
+        .map_err(|e| db_error(e, "delete object pick"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -169,7 +163,7 @@ pub async fn put_team_default(
     .bind(&body.identity_id)
     .execute(&pool)
     .await
-    .map_err(db_error)?;
+    .map_err(|e| db_error(e, "upsert team default"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -183,7 +177,7 @@ pub async fn delete_team_default(
         .bind(team_id)
         .execute(&pool)
         .await
-        .map_err(db_error)?;
+        .map_err(|e| db_error(e, "delete team default"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

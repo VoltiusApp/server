@@ -80,8 +80,8 @@ impl MemberRow {
     }
 }
 
-fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
-    error!(error = %e, what, "Object authorization query failed");
+pub(crate) fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
+    error!(error = %e, what, "Database query failed");
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
