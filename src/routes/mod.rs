@@ -5,6 +5,7 @@ pub mod billing;
 pub mod client_version;
 pub mod health;
 pub mod invitations;
+pub mod member_identity_picks;
 pub mod meta;
 pub mod metrics;
 pub mod presence;

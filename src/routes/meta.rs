@@ -15,6 +15,7 @@ pub struct MetaResponse {
     pub billing_enabled: bool,
     pub registration_enabled: bool,
     pub team_invites_enabled: bool,
+    pub identity_picks: bool,
 }
 
 pub async fn get_meta(Extension(features): Extension<Features>) -> Json<MetaResponse> {
@@ -24,5 +25,22 @@ pub async fn get_meta(Extension(features): Extension<Features>) -> Json<MetaResp
         billing_enabled: !self_hosted,
         registration_enabled: features.registration,
         team_invites_enabled: features.team_invites,
+        identity_picks: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn meta_advertises_identity_picks() {
+        let Json(meta) = get_meta(Extension(Features {
+            registration: true,
+            team_invites: true,
+        }))
+        .await;
+        let body = serde_json::to_value(&meta).unwrap();
+        assert_eq!(body["identity_picks"], serde_json::json!(true));
+    }
 }
