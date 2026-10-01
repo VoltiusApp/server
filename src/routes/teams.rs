@@ -7,9 +7,8 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
-use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries, MemberContext};
+use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries};
 use crate::routes::audit::write_audit_event;
-use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
@@ -86,26 +85,6 @@ pub(crate) async fn ensure_seat_available(pool: &PgPool, owner_id: Uuid) -> Resu
     let used = owner_seats_used(pool, owner_id).await?;
     if used >= effective_cap {
         warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached");
-        return Err(StatusCode::PAYMENT_REQUIRED);
-    }
-    Ok(())
-}
-
-// ─── Plan tier helper ─────────────────────────────────────────────────────────
-
-async fn require_business_tier(pool: &PgPool, team_id: Uuid) -> Result<(), StatusCode> {
-    if self_host::is_self_hosted() {
-        return Ok(());
-    }
-    let owner_id = team_owner(pool, team_id).await?;
-
-    let tier = sqlx::query_scalar::<_, String>("SELECT subscription_tier FROM users WHERE id = $1")
-        .bind(owner_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to fetch owner tier"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if tier != "business" {
         return Err(StatusCode::PAYMENT_REQUIRED);
     }
     Ok(())
@@ -233,10 +212,24 @@ async fn teams_for_user(
     only: Option<Uuid>,
 ) -> Result<Vec<TeamWithRole>, sqlx::Error> {
     // Returns one row per (team, role) — aggregated in Rust
-    let rows = sqlx::query_as::<_, (Uuid, String, Uuid, String, chrono::DateTime<chrono::Utc>, Option<Uuid>, i64, i64)>(
+    type Row = (
+        Uuid,
+        String,
+        Uuid,
+        chrono::DateTime<chrono::Utc>,
+        Option<Uuid>,
+        i64,
+        i64,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        bool,
+        Option<String>,
+    );
+    let rows = sqlx::query_as::<_, Row>(&format!(
         r#"
-        SELECT t.id, t.name, t.owner_id, u.subscription_tier, t.created_at, tmr.role_id,
-               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0)
+        SELECT t.id, t.name, t.owner_id, t.created_at, tmr.role_id,
+               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
+               {}
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
         JOIN users u ON u.id = t.owner_id
@@ -245,14 +238,28 @@ async fn teams_for_user(
         WHERE $2::uuid IS NULL OR t.id = $2
         ORDER BY t.created_at ASC, tmr.role_id ASC NULLS LAST
         "#,
-    )
+        crate::entitlement::OWNER_PLAN_COLUMNS,
+    ))
     .bind(user_id)
     .bind(only)
     .fetch_all(pool)
     .await?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
-    for (id, name, owner_id, owner_tier, created_at, role_id, permission_allow, permission_deny) in rows {
+    for (
+        id,
+        name,
+        owner_id,
+        created_at,
+        role_id,
+        permission_allow,
+        permission_deny,
+        tier,
+        trial_ends_at,
+        admin_override,
+        ls_sub,
+    ) in rows
+    {
         match teams.last_mut() {
             Some(last) if last.id == id => {
                 if let Some(rid) = role_id {
@@ -260,6 +267,8 @@ async fn teams_for_user(
                 }
             }
             _ => {
+                let owner_tier =
+                    crate::team_plan::plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
                 teams.push(TeamWithRole {
                     id,
                     name,
@@ -509,7 +518,7 @@ pub async fn add_member(
     Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
 }
 
-async fn request_team_rotation(
+pub(crate) async fn request_team_rotation(
     conn: &mut sqlx::PgConnection,
     team_id: Uuid,
 ) -> Result<(), StatusCode> {
@@ -916,7 +925,7 @@ pub async fn create_role(
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<TeamRole>), StatusCode> {
-    require_business_tier(&pool, team_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, false).await?;
 
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
@@ -991,7 +1000,7 @@ pub async fn update_role(
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateRoleBody>,
 ) -> Result<StatusCode, StatusCode> {
-    require_business_tier(&pool, team_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, false).await?;
 
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
@@ -1069,8 +1078,6 @@ pub async fn delete_role(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path((team_id, role_id)): axum::extract::Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
-    require_business_tier(&pool, team_id).await?;
-
     let can_manage = crate::permissions::has_team_permission(
         &pool, team_id, auth.0, crate::permissions::PERM_MANAGE_ROLES,
     )
@@ -1205,19 +1212,17 @@ pub async fn assign_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Verify role belongs to this team
-    let role_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM team_roles WHERE id = $1 AND team_id = $2)",
+    let is_builtin = sqlx::query_scalar::<_, bool>(
+        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
     )
     .bind(body.role_id)
     .bind(team_id)
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?
+    .ok_or(StatusCode::NOT_FOUND)?;
 
-    if !role_exists {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    crate::team_plan::require_granular(&pool, team_id, is_builtin).await?;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -1348,12 +1353,33 @@ fn validate_override_masks(allow: i64, deny: i64) -> Result<(), StatusCode> {
     Ok(())
 }
 
+#[cfg(test)]
+async fn put_member_overrides(
+    pool: &PgPool,
+    team: Uuid,
+    actor: Uuid,
+    target: Uuid,
+    allow: i64,
+    deny: i64,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    set_member_permissions(
+        State(pool.clone()),
+        axum::Extension(AuthUser(actor)),
+        axum::Extension(SyncNotifier::new()),
+        headers,
+        Path((team, target)),
+        Json(SetMemberPermissionsRequest { allow, deny }),
+    )
+    .await
+}
+
 async fn override_masks<'e, E>(executor: E, team_id: Uuid, user_id: Uuid) -> Result<(i64, i64), StatusCode>
 where
     E: sqlx::PgExecutor<'e>,
 {
     Ok(sqlx::query_as::<_, (i64, i64)>(
-        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2",
+        "SELECT allow_mask, deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(team_id)
     .bind(user_id)
@@ -1363,14 +1389,15 @@ where
     .unwrap_or((0, 0)))
 }
 
-async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Option<i32>, sqlx::Error> {
+async fn role_position(pool: &PgPool, team_id: Uuid, user_id: Uuid, locked: bool) -> Result<Option<i32>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<i32>>(
         "SELECT MIN(tr.position) FROM team_member_roles tmr \
          JOIN team_roles tr ON tr.id = tmr.role_id \
-         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
+         WHERE tmr.team_id = $1 AND tmr.user_id = $2 AND (tr.is_builtin OR NOT $3)",
     )
     .bind(team_id)
     .bind(user_id)
+    .bind(locked)
     .fetch_one(pool)
     .await
 }
@@ -1413,10 +1440,11 @@ async fn override_guardrails(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let actor_position = role_position(pool, team_id, actor_id)
+    let locked = crate::team_plan::team_locked(pool, team_id).await?;
+    let actor_position = role_position(pool, team_id, actor_id, locked)
         .await
         .map_err(|e| { error!(error = %e, "Failed to read actor role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
-    let target_position = role_position(pool, team_id, target_user_id)
+    let target_position = role_position(pool, team_id, target_user_id, locked)
         .await
         .map_err(|e| { error!(error = %e, "Failed to read target role position"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
@@ -1467,6 +1495,7 @@ pub async fn set_member_permissions(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    crate::team_plan::reconcile_team_plan(&pool, &notifier, team_id).await?;
     override_guardrails(&pool, team_id, auth.0, target_user_id, allow).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
@@ -1475,26 +1504,13 @@ pub async fn set_member_permissions(
     })?;
 
     let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, crate::team_plan::narrows_masks(previous, (allow, deny))).await?;
 
-    let role_union: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(bit_or(tr.permissions), 0) FROM team_member_roles tmr \
-         JOIN team_roles tr ON tr.id = tmr.role_id \
-         WHERE tmr.team_id = $1 AND tmr.user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read target role union"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    let target_role_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to read target role ids"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let target = crate::object_authz::member_rows(&pool, team_id, Some(target_user_id))
+        .await?
+        .pop()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let locked = crate::team_plan::team_locked(&pool, team_id).await?;
 
     if allow == 0 && deny == 0 {
         sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
@@ -1524,18 +1540,8 @@ pub async fn set_member_permissions(
     let entries = rule_entries(&pool, team_id, None).await?;
     let live = live_rule_set_ids(&pool, team_id).await?;
 
-    let prev_ctx = MemberContext {
-        user_id: target_user_id,
-        base: (role_union | previous.0) & !previous.1,
-        team_deny: previous.1,
-        role_ids: target_role_ids.clone(),
-    };
-    let next_ctx = MemberContext {
-        user_id: target_user_id,
-        base: (role_union | allow) & !deny,
-        team_deny: deny,
-        role_ids: target_role_ids,
-    };
+    let prev_ctx = target.with_overrides(previous.0, previous.1).context(locked);
+    let next_ctx = target.with_overrides(allow, deny).context(locked);
     let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), &live);
     let held_after = holds_vault_key_gate(next_ctx, entries, &live);
     if held_before && !held_after {
@@ -1845,7 +1851,7 @@ mod authz_tests {
     use crate::test_support::{
         add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
         seed_team_with_roles, seed_user, set_user_seats, set_user_tier, set_user_trial,
-        unique_handle, EnvLockGuard,
+        unique_handle, BillingMode, EnvLockGuard,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -1948,6 +1954,7 @@ mod authz_tests {
 
     #[tokio::test]
     async fn create_team_returns_the_row_list_teams_would() {
+        let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "business").await;
@@ -1968,6 +1975,34 @@ mod authz_tests {
         assert_eq!(created.owner_tier, "business");
         assert_eq!(created.role_ids.len(), 1);
         assert_eq!(serde_json::to_value(&created).unwrap(), serde_json::to_value(&listed).unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_teams_reports_a_lapsed_business_trial_as_free() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        sqlx::query("UPDATE users SET trial_ends_at = now() - interval '1 day' WHERE id = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(owner))).await.unwrap();
+        assert_eq!(listed.iter().find(|t| t.id == team).unwrap().owner_tier, "free");
+    }
+
+    #[tokio::test]
+    async fn list_teams_reports_business_when_self_hosted() {
+        let _env = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+
+        let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(owner))).await.unwrap();
+        assert_eq!(listed.iter().find(|t| t.id == team).unwrap().owner_tier, "business");
     }
 
     async fn rename(pool: &PgPool, team: Uuid, user: Uuid, name: &str) -> Result<StatusCode, StatusCode> {
@@ -2467,8 +2502,205 @@ mod authz_tests {
         );
     }
 
+    async fn member_below_owner(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
+        let user = member_with_role(pool, team, perms).await;
+        sqlx::query(
+            "UPDATE team_roles SET position = 100 WHERE id IN \
+             (SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2)",
+        )
+        .bind(team)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("lower role position");
+        user
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_can_clear_overrides_but_not_add_them() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
+        crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+
+        assert_eq!(put_member_overrides(&pool, team, owner, target, PERM_VIEW_SECRETS, 0, crate::test_support::rule_set_client_headers()).await, Err(StatusCode::PAYMENT_REQUIRED));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_business_team_can_add_overrides() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
+
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_stale_resubmit_after_a_concurrent_clear_is_refused() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = member_below_owner(&pool, team, PERM_VIEW_SECRETS).await;
+        crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, PERM_VIEW_SECRETS, crate::test_support::rule_set_client_headers()).await, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
+    async fn rotations_after_removing_an_allow(pool: &PgPool, tier: &str) -> i64 {
+        let owner = seed_user(pool).await;
+        set_user_tier(pool, owner, tier).await;
+        let team = seed_team_with_roles(pool, owner).await;
+        sqlx::query("UPDATE teams SET granular_locked = $2 WHERE id = $1")
+            .bind(team)
+            .bind(tier != "business")
+            .execute(pool)
+            .await
+            .unwrap();
+        let member = seed_user(pool).await;
+        crate::test_support::add_member(pool, team, member).await;
+        crate::test_support::set_member_overrides(pool, team, member, crate::permissions::PERM_VIEW | crate::permissions::PERM_CONNECT, 0).await;
+        assert_eq!(put_member_overrides(pool, team, owner, member, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+        crate::test_support::rotation_request_count(pool, team).await
+    }
+
+    #[tokio::test]
+    async fn locked_team_removing_an_allow_never_queues_rotation() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        assert_eq!(rotations_after_removing_an_allow(&pool, "teams").await, 0);
+    }
+
+    #[tokio::test]
+    async fn business_team_removing_an_allow_queues_one_rotation() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        assert_eq!(rotations_after_removing_an_allow(&pool, "business").await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreconciled_lapse_still_rotates_out_a_member_whose_gate_came_from_a_custom_role() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = crate::test_support::member_with_role(&pool, team, crate::permissions::PERM_CONNECT).await;
+        let locked_flag = || async {
+            sqlx::query_scalar::<_, bool>("SELECT granular_locked FROM teams WHERE id = $1")
+                .bind(team)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+        assert!(!locked_flag().await);
+
+        assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
+
+        assert!(locked_flag().await);
+        assert_eq!(crate::test_support::rotation_request_count(&pool, team).await, 1);
+    }
+
+    #[tokio::test]
+    async fn on_a_locked_team_only_builtin_roles_rank_an_actor_above_a_peer() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let actor = crate::test_support::member_with_role(&pool, team, PERM_MANAGE_MEMBERS).await;
+        let target = seed_user(&pool).await;
+        crate::test_support::add_member(&pool, team, target).await;
+        crate::test_support::grant_builtin_role(&pool, team, target, "member").await;
+        sqlx::query("UPDATE team_roles SET position = 0 WHERE team_id = $1 AND name LIKE 'authz-test-role-%'")
+            .bind(team)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(override_guardrails(&pool, team, actor, target, 0).await, Err(StatusCode::FORBIDDEN));
+
+        set_user_tier(&pool, owner, "business").await;
+        assert_eq!(override_guardrails(&pool, team, actor, target, 0).await, Ok(()));
+    }
+
+    async fn call_delete_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
+        delete_role(State(pool.clone()), Extension(AuthUser(user)), Extension(SyncNotifier::new()), Path((team, role))).await
+    }
+
+    async fn call_assign(pool: &PgPool, team: Uuid, actor: Uuid, target: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
+        assign_member_role(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path((team, target)),
+            Json(AssignRoleRequest { role_id: role }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_can_still_delete_a_custom_role_and_its_rules() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        let manager = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        crate::test_support::grant_builtin_role(&pool, team, manager, "manager").await;
+        let role = seed_role(&pool, team, "legacy", PERM_VIEW_SECRETS).await;
+        crate::test_support::seed_rule_set(&pool, team, owner, &[("role", Some(role), 0, crate::permissions::PERM_VIEW)]).await;
+
+        assert_eq!(call_delete_role(&pool, team, manager, role).await, Ok(StatusCode::NO_CONTENT));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_set_entries WHERE subject_id = $1")
+            .bind(role).fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_may_assign_builtin_roles_but_not_custom_ones() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = seed_user(&pool).await;
+        add_team_member(&pool, team, target).await;
+        let editor: Uuid = sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = 'editor' AND is_builtin")
+            .bind(team).fetch_one(&pool).await.unwrap();
+        let custom = seed_role(&pool, team, "deploy", PERM_VIEW_SECRETS).await;
+
+        assert_eq!(call_assign(&pool, team, owner, target, editor).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(call_assign(&pool, team, owner, target, custom).await, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn a_business_team_may_assign_custom_roles() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let target = seed_user(&pool).await;
+        add_team_member(&pool, team, target).await;
+        let custom = seed_role(&pool, team, "deploy", PERM_VIEW_SECRETS).await;
+
+        assert_eq!(call_assign(&pool, team, owner, target, custom).await, Ok(StatusCode::NO_CONTENT));
+    }
+
     #[tokio::test]
     async fn assign_member_role_forbidden_without_manage_permission() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -2493,7 +2725,7 @@ mod authz_tests {
         // No LEMONSQUEEZY_API_KEY in test env → business gate is bypassed, so the
         // PERM_MANAGE_ROLES check is what rejects here. Hold the env lock (without
         // mutating anything) so this can't race against a concurrently-running
-        // BillingEnv-holding test that sets LEMONSQUEEZY_API_KEY out from under us.
+        // BillingMode-holding test that sets LEMONSQUEEZY_API_KEY out from under us.
         let _env = EnvLockGuard(env_lock());
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
@@ -2517,35 +2749,15 @@ mod authz_tests {
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
     }
 
-    /// RAII guard: set LEMONSQUEEZY_API_KEY so is_self_hosted()==false, restore on drop.
-    /// Field 0 (the lock) is held only for its lifetime, never read.
-    #[allow(dead_code)]
-    struct BillingEnv(std::sync::MutexGuard<'static, ()>, Option<String>);
-    impl BillingEnv {
-        fn on() -> Self {
-            let g = env_lock();
-            let prev = std::env::var("LEMONSQUEEZY_API_KEY").ok();
-            std::env::set_var("LEMONSQUEEZY_API_KEY", "test-key");
-            BillingEnv(g, prev)
-        }
-    }
-    impl Drop for BillingEnv {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
-                None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
-            }
-        }
-    }
-
     #[tokio::test]
     async fn create_role_payment_required_when_owner_not_business() {
-        let _env = BillingEnv::on();
+        let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await; // default tier 'free'
         let team = seed_team(&pool, owner).await;
         // Caller HAS manage-roles, so only the business gate can reject.
         let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        crate::test_support::grant_builtin_role(&pool, team, caller, "manager").await;
 
         let res = create_role(
             State(pool.clone()),
@@ -2566,7 +2778,7 @@ mod authz_tests {
 
     #[tokio::test]
     async fn create_role_ok_when_business_and_manage_roles() {
-        let _env = BillingEnv::on();
+        let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "business").await;
@@ -2596,7 +2808,7 @@ mod authz_tests {
         // bypassed, so PERM_MANAGE_ROLES is what rejects. Both gates fire
         // before the role lookup, so a random role_id is fine. Hold the env
         // lock (without mutating anything) so this can't race a concurrently
-        // running BillingEnv-holding test that sets LEMONSQUEEZY_API_KEY.
+        // running BillingMode-holding test that sets LEMONSQUEEZY_API_KEY.
         let _env = EnvLockGuard(env_lock());
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
@@ -2623,12 +2835,13 @@ mod authz_tests {
 
     #[tokio::test]
     async fn update_role_payment_required_when_owner_not_business() {
-        let _env = BillingEnv::on();
+        let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await; // default tier 'free'
         let team = seed_team(&pool, owner).await;
         // Caller HAS manage-roles, so only the business gate can reject.
         let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        crate::test_support::grant_builtin_role(&pool, team, caller, "manager").await;
 
         let res = update_role(
             State(pool.clone()),
@@ -2650,7 +2863,7 @@ mod authz_tests {
 
     #[tokio::test]
     async fn update_role_ok_when_business_and_manage_roles() {
-        let _env = BillingEnv::on();
+        let _env = BillingMode::hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "business").await;
@@ -2997,6 +3210,7 @@ mod search_tests {
 
 #[cfg(test)]
 mod override_response_tests {
+    use super::put_member_overrides;
     use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, seed_team, seed_user, set_member_overrides};
@@ -3043,16 +3257,13 @@ mod override_response_tests {
         assert!(validate_override_masks(-1, 0).is_err());
     }
 
-    use super::{override_guardrails, set_member_permissions, SetMemberPermissionsRequest};
-    use crate::auth::AuthUser;
+    use super::override_guardrails;
     use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
-    use crate::sync_notifier::SyncNotifier;
     use crate::test_support::{
         assign_role, rule_set_client_headers, seed_builtin_roles, seed_role, seed_team_with_roles,
+        BillingMode,
     };
-    use axum::extract::{Path, State};
     use axum::http::StatusCode;
-    use axum::{Extension, Json};
 
     #[tokio::test]
     async fn guardrail_rejects_editing_your_own_overrides() {
@@ -3138,6 +3349,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_rejects_stripping_an_allow_override_the_actor_lacks() {
+        let _env = BillingMode::self_hosted();
         use crate::permissions::PERM_MANAGE_VAULT;
 
         let pool = test_pool_or_skip!();
@@ -3155,14 +3367,7 @@ mod override_response_tests {
         assign_role(&pool, team, weak_manager, weak_manager_role).await;
 
         assert_eq!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(weak_manager)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, contractor)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, weak_manager, contractor, 0, 0, axum::http::HeaderMap::new())
             .await
             .unwrap_err(),
             StatusCode::FORBIDDEN,
@@ -3176,14 +3381,7 @@ mod override_response_tests {
         assign_role(&pool, team, strong_manager, strong_manager_role).await;
 
         assert!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(strong_manager)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, contractor)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, strong_manager, contractor, 0, 0, axum::http::HeaderMap::new())
             .await
             .is_ok(),
             "a manager holding MANAGE_VAULT can strip it"
@@ -3251,6 +3449,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_rejects_self_edit() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
@@ -3259,14 +3458,7 @@ mod override_response_tests {
         assign_role(&pool, team, owner, role).await;
 
         assert_eq!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(owner)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, owner)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, owner, owner, 0, 0, axum::http::HeaderMap::new())
             .await
             .unwrap_err(),
             StatusCode::FORBIDDEN
@@ -3275,6 +3467,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_rejects_a_lower_ranked_caller() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3292,14 +3485,7 @@ mod override_response_tests {
         assign_role(&pool, team, target, target_role).await;
 
         assert_eq!(
-            set_member_permissions(
-                State(pool.clone()),
-                Extension(AuthUser(actor)),
-                Extension(SyncNotifier::new()),
-                axum::http::HeaderMap::new(),
-                Path((team, target)),
-                Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-            )
+            put_member_overrides(&pool, team, actor, target, 0, 0, axum::http::HeaderMap::new())
             .await
             .unwrap_err(),
             StatusCode::FORBIDDEN
@@ -3308,6 +3494,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_a_role_granted_bit_is_denied() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3324,35 +3511,15 @@ mod override_response_tests {
         assign_role(&pool, team, target, target_role).await;
 
         let rotations = || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-            )
-            .bind(team)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+            crate::test_support::rotation_request_count(&pool, team).await
         };
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_CONNECT }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, crate::permissions::PERM_CONNECT, axum::http::HeaderMap::new())
         .await
         .unwrap();
         assert_eq!(rotations().await, 1);
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_CONNECT }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, crate::permissions::PERM_CONNECT, axum::http::HeaderMap::new())
         .await
         .unwrap();
         assert_eq!(rotations().await, 1);
@@ -3360,6 +3527,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_does_not_queue_rotation_for_non_read_class_denies() {
+        let _env = BillingMode::self_hosted();
         use crate::permissions::PERM_EDIT_CONNECTIONS;
 
         let pool = test_pool_or_skip!();
@@ -3373,29 +3541,17 @@ mod override_response_tests {
         assign_role(&pool, team, actor, actor_role).await;
         add_member(&pool, team, target).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_EDIT_CONNECTIONS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_EDIT_CONNECTIONS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 0);
     }
 
     #[tokio::test]
     async fn set_member_permissions_handler_does_not_queue_rotation_while_connect_still_gates() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3412,24 +3568,11 @@ mod override_response_tests {
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_VIEW_SECRETS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_VIEW_SECRETS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(
             count, 0,
             "CONNECT still satisfies the Any key gate, so the member keeps key access and rotation buys nothing"
@@ -3438,6 +3581,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_does_not_queue_rotation_for_a_copy_secrets_only_deny() {
+        let _env = BillingMode::self_hosted();
         use crate::permissions::PERM_COPY_SECRETS;
 
         let pool = test_pool_or_skip!();
@@ -3455,29 +3599,17 @@ mod override_response_tests {
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_COPY_SECRETS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 0, "COPY_SECRETS alone does not gate get_my_vault_key, so rotation buys nothing");
     }
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_clearing_the_only_allow_grant() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -3485,29 +3617,17 @@ mod override_response_tests {
         add_member(&pool, team, contractor).await;
         crate::test_support::set_member_overrides(&pool, team, contractor, crate::permissions::PERM_CONNECT | PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW, 0).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(owner)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, contractor)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: 0 }),
-        )
+        put_member_overrides(&pool, team, owner, contractor, 0, 0, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 1, "clearing a roleless member's only read-class allow must still revoke key access");
     }
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_denying_view_drops_the_widened_gate() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -3518,24 +3638,11 @@ mod override_response_tests {
         assign_role(&pool, team, target, target_role).await;
         crate::test_support::seed_rule_set(&pool, team, owner, &[]).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(owner)),
-            Extension(SyncNotifier::new()),
-            rule_set_client_headers(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: crate::permissions::PERM_VIEW }),
-        )
+        put_member_overrides(&pool, team, owner, target, 0, crate::permissions::PERM_VIEW, rule_set_client_headers())
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(
             count, 1,
             "denying VIEW drops the widened gate's team-level path even though CONNECT is nominally still allowed"
@@ -3544,6 +3651,7 @@ mod override_response_tests {
 
     #[tokio::test]
     async fn set_member_permissions_handler_queues_rotation_when_a_team_deny_wipes_an_object_grant() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -3560,24 +3668,11 @@ mod override_response_tests {
         .await;
         crate::test_support::point_object(&pool, team, "obj-1", Some(set)).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(owner)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_CONNECT }),
-        )
+        put_member_overrides(&pool, team, owner, target, 0, PERM_CONNECT, axum::http::HeaderMap::new())
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(
             count, 1,
             "a team-level deny wipes even an object-level grant of the same bit, dropping the widened gate"
@@ -3592,31 +3687,20 @@ mod override_response_tests {
         let mut conn = pool.acquire().await.unwrap();
         super::request_team_rotation(&mut conn, team).await.unwrap();
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 1);
 
         // Idempotent within an epoch.
         let mut conn = pool.acquire().await.unwrap();
         super::request_team_rotation(&mut conn, team).await.unwrap();
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 = crate::test_support::rotation_request_count(&pool, team).await;
         assert_eq!(count, 1);
     }
 }
 
 #[cfg(test)]
 mod rule_set_era_tests {
+    use super::put_member_overrides;
     use super::*;
     use crate::auth::AuthUser;
     use crate::permissions::*;
@@ -3626,7 +3710,7 @@ mod rule_set_era_tests {
     use crate::test_support::{
         add_member as add_team_member, assign_role, env_lock, member_with_role, rule_set_client_headers,
         seed_role, seed_rule_set, seed_team, seed_team_with_roles, seed_user, set_member_overrides,
-        EnvLockGuard,
+        BillingMode, EnvLockGuard,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -3725,6 +3809,7 @@ mod rule_set_era_tests {
 
     #[tokio::test]
     async fn a_legacy_client_override_edit_keeps_a_view_deny() {
+        let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let actor = seed_user(&pool).await;
@@ -3740,14 +3825,7 @@ mod rule_set_era_tests {
         assign_role(&pool, team, target, target_role).await;
         set_member_overrides(&pool, team, target, 0, PERM_VIEW).await;
 
-        set_member_permissions(
-            State(pool.clone()),
-            Extension(AuthUser(actor)),
-            Extension(SyncNotifier::new()),
-            axum::http::HeaderMap::new(),
-            Path((team, target)),
-            Json(SetMemberPermissionsRequest { allow: 0, deny: PERM_COPY_SECRETS }),
-        )
+        put_member_overrides(&pool, team, actor, target, 0, PERM_COPY_SECRETS, axum::http::HeaderMap::new())
         .await
         .unwrap();
 

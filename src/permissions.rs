@@ -82,30 +82,16 @@ pub(crate) const PERMISSION_JOINS: &str = r#"
            ON o.team_id = tm.team_id AND o.user_id = tm.user_id
 "#;
 
-// MAX pulls the single override row (join is one-to-at-most-one) into the aggregate.
-const EFFECTIVE_EXPR: &str = "(COALESCE(bit_or(tr.permissions), 0) | COALESCE(MAX(o.allow_mask), 0)) \
-                              & ~COALESCE(MAX(o.deny_mask), 0)";
-
-/// `(roleUnion | allow) & ~deny`. Returns 0 if the user is not a member.
+/// Business: `(roles | allow) & !deny`; locked: `builtin & !deny`. 0 for a non-member.
 pub async fn effective_permissions(
     pool: &PgPool,
     team_id: Uuid,
     user_id: Uuid,
 ) -> Result<i64, StatusCode> {
-    let sql = format!(
-        "SELECT {EFFECTIVE_EXPR} {PERMISSION_JOINS} \
-         WHERE tm.team_id = $1 AND tm.user_id = $2"
-    );
-    sqlx::query_scalar::<_, i64>(&sql)
-        .bind(team_id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map(|v| with_dependencies(v.unwrap_or(0)))
-        .map_err(|e| {
-            error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to check team permission");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    Ok(crate::object_authz::member_contexts(pool, team_id, Some(user_id))
+        .await?
+        .pop()
+        .map_or(0, |m| with_dependencies(m.base)))
 }
 
 /// Returns true if any of (team_id, user_id)'s roles grant `permission`.
@@ -193,29 +179,12 @@ pub async fn has_any_team_permission(
     user_id: Uuid,
     permission: i64,
 ) -> Result<bool, StatusCode> {
-    if team_ids.is_empty() {
-        return Ok(false);
+    for &team_id in team_ids {
+        if effective_permissions(pool, team_id, user_id).await? & permission != 0 {
+            return Ok(true);
+        }
     }
-    let sql = format!(
-        "SELECT COALESCE(bool_or(granted), false) FROM ( \
-             SELECT (({EFFECTIVE_EXPR}) & $3) <> 0 AS granted \
-             {PERMISSION_JOINS} \
-             WHERE tm.team_id = ANY($1) AND tm.user_id = $2 \
-             GROUP BY tm.team_id \
-         ) per_team"
-    );
-    let granted = sqlx::query_scalar::<_, bool>(&sql)
-        .bind(team_ids)
-        .bind(user_id)
-        .bind(permission)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %user_id, "Failed to check any-team permission");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(granted)
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -229,14 +198,18 @@ pub struct RuleLayers {
 }
 
 /// Keep in sync with `resolveObjectPermissions` in the client's `src/services/permissions.ts`.
-pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>) -> i64 {
+pub fn object_permissions(base: i64, team_deny: i64, rules: Option<&RuleLayers>, locked: bool) -> i64 {
     if base & PERM_ADMINISTRATOR != 0 {
         return with_dependencies(ALL_PERMISSIONS & !team_deny);
     }
     let Some(r) = rules else { return with_dependencies(base) };
-    let mut p = (base & !r.everyone_deny) | r.everyone_allow;
-    p = (p & !r.roles_deny) | r.roles_allow;
-    p = (p & !r.member_deny) | r.member_allow;
+    let mut p = if locked {
+        base & !(r.everyone_deny | r.roles_deny | r.member_deny)
+    } else {
+        let p = (base & !r.everyone_deny) | r.everyone_allow;
+        let p = (p & !r.roles_deny) | r.roles_allow;
+        (p & !r.member_deny) | r.member_allow
+    };
     p &= !team_deny;
     if p & PERM_VIEW == 0 { 0 } else { with_dependencies(p) }
 }
@@ -663,6 +636,53 @@ mod db_tests {
 
         assert!(res.is_err(), "the composite FK must refuse a cross-team pointer");
     }
+
+    #[tokio::test]
+    async fn locked_team_custom_role_grants_nothing() {
+        let _mode = crate::test_support::BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = crate::test_support::seed_team_with_roles(&pool, owner).await;
+        let member = crate::test_support::member_with_role(&pool, team, PERM_VIEW_AUDIT_LOG).await;
+        assert_eq!(effective_permissions(&pool, team, member).await.unwrap(), 0);
+        crate::test_support::set_user_tier(&pool, owner, "business").await;
+        assert_ne!(effective_permissions(&pool, team, member).await.unwrap() & PERM_VIEW_AUDIT_LOG, 0);
+    }
+
+    #[tokio::test]
+    async fn locked_team_drops_allowed_bits_and_keeps_denies() {
+        let _mode = crate::test_support::BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = crate::test_support::seed_team_with_roles(&pool, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        crate::test_support::grant_builtin_role(&pool, team, member, "member").await;
+        set_member_overrides(&pool, team, member, PERM_VIEW_AUDIT_LOG | PERM_CONNECT, PERM_VIEW_SECRETS).await;
+        let p = effective_permissions(&pool, team, member).await.unwrap();
+        assert_eq!(p & (PERM_VIEW_AUDIT_LOG | PERM_VIEW_SECRETS), 0);
+        assert_ne!(p & PERM_CONNECT, 0);
+    }
+
+    #[tokio::test]
+    async fn has_any_team_permission_is_plan_aware_per_team() {
+        let _mode = crate::test_support::BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let locked_owner = seed_user(&pool).await;
+        let paid_owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, locked_owner, "teams").await;
+        crate::test_support::set_user_tier(&pool, paid_owner, "business").await;
+        let locked_team = crate::test_support::seed_team_with_roles(&pool, locked_owner).await;
+        let paid_team = crate::test_support::seed_team_with_roles(&pool, paid_owner).await;
+        let user = crate::test_support::member_with_role(&pool, locked_team, PERM_VIEW_AUDIT_LOG).await;
+        assert!(!has_any_team_permission(&pool, &[locked_team], user, PERM_VIEW_AUDIT_LOG).await.unwrap());
+        let role = seed_role(&pool, paid_team, "auditor", PERM_VIEW_AUDIT_LOG).await;
+        add_member(&pool, paid_team, user).await;
+        assign_role(&pool, paid_team, user, role).await;
+        assert!(has_any_team_permission(&pool, &[locked_team, paid_team], user, PERM_VIEW_AUDIT_LOG).await.unwrap());
+    }
 }
 
 #[cfg(test)]
@@ -677,19 +697,19 @@ mod object_permission_tests {
 
     #[test]
     fn no_rule_set_returns_the_team_mask() {
-        assert_eq!(object_permissions(MEMBER, 0, None), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, None, false), MEMBER);
     }
 
     #[test]
     fn a_rule_set_with_no_relevant_entries_keeps_the_team_mask() {
-        assert_eq!(object_permissions(MEMBER, 0, Some(&layers())), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&layers()), false), MEMBER);
     }
 
     #[test]
     fn everyone_deny_removes_and_everyone_allow_adds() {
         let r = RuleLayers { everyone_deny: PERM_VIEW_SECRETS, everyone_allow: PERM_COPY_SECRETS, ..layers() };
         assert_eq!(
-            object_permissions(MEMBER, 0, Some(&r)),
+            object_permissions(MEMBER, 0, Some(&r), false),
             PERM_VIEW | PERM_CONNECT | PERM_COPY_SECRETS
         );
     }
@@ -697,57 +717,57 @@ mod object_permission_tests {
     #[test]
     fn role_layer_overrides_everyone() {
         let r = RuleLayers { everyone_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), MEMBER);
     }
 
     #[test]
     fn within_the_role_layer_allow_beats_deny() {
         let r = RuleLayers { roles_deny: PERM_CONNECT, roles_allow: PERM_CONNECT, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), MEMBER);
     }
 
     #[test]
     fn member_layer_overrides_roles() {
         let r = RuleLayers { roles_allow: PERM_EDIT_CONNECTIONS, member_deny: PERM_EDIT_CONNECTIONS, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), MEMBER);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), MEMBER);
     }
 
     #[test]
     fn team_deny_stays_absolute_over_a_member_allow() {
         let base = MEMBER & !PERM_VIEW_SECRETS;
         let r = RuleLayers { member_allow: PERM_VIEW_SECRETS, ..layers() };
-        assert_eq!(object_permissions(base, PERM_VIEW_SECRETS, Some(&r)), base);
+        assert_eq!(object_permissions(base, PERM_VIEW_SECRETS, Some(&r), false), base);
     }
 
     #[test]
     fn losing_view_zeroes_every_bit() {
         let r = RuleLayers { everyone_deny: PERM_VIEW, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), 0);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), 0);
     }
 
     #[test]
     fn a_rule_can_grant_view_the_team_mask_lacks() {
         let r = RuleLayers { member_allow: PERM_VIEW, ..layers() };
-        assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r)), PERM_VIEW | PERM_CONNECT);
+        assert_eq!(object_permissions(PERM_CONNECT, 0, Some(&r), false), PERM_VIEW | PERM_CONNECT);
     }
 
     #[test]
     fn denying_connect_on_an_object_also_removes_its_secrets() {
         let r = RuleLayers { everyone_deny: PERM_CONNECT, ..layers() };
         let base = MEMBER | PERM_COPY_SECRETS;
-        assert_eq!(object_permissions(base, 0, Some(&r)), PERM_VIEW);
+        assert_eq!(object_permissions(base, 0, Some(&r), false), PERM_VIEW);
     }
 
     #[test]
     fn secrets_without_connect_grant_nothing_on_the_team_mask() {
         let base = PERM_VIEW | PERM_VIEW_SECRETS | PERM_COPY_SECRETS;
-        assert_eq!(object_permissions(base, 0, None), PERM_VIEW);
+        assert_eq!(object_permissions(base, 0, None, false), PERM_VIEW);
     }
 
     #[test]
     fn a_member_allow_of_secrets_needs_connect_too() {
         let r = RuleLayers { member_deny: PERM_CONNECT, member_allow: PERM_VIEW_SECRETS, ..layers() };
-        assert_eq!(object_permissions(MEMBER, 0, Some(&r)), PERM_VIEW);
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), false), PERM_VIEW);
     }
 
     #[test]
@@ -759,16 +779,73 @@ mod object_permission_tests {
     #[test]
     fn administrator_ignores_every_rule() {
         let r = RuleLayers { everyone_deny: ALL_PERMISSIONS, member_deny: ALL_PERMISSIONS, ..layers() };
-        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r)), ALL_PERMISSIONS);
-        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, None), ALL_PERMISSIONS);
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r), false), ALL_PERMISSIONS);
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, None, false), ALL_PERMISSIONS);
     }
 
     #[test]
     fn administrator_still_loses_a_team_denied_bit() {
         assert_eq!(
-            object_permissions(PERM_ADMINISTRATOR, PERM_COPY_SECRETS, None),
+            object_permissions(PERM_ADMINISTRATOR, PERM_COPY_SECRETS, None, false),
             ALL_PERMISSIONS & !PERM_COPY_SECRETS
         );
+    }
+
+    #[test]
+    fn locked_ignores_allow_layers() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW, member_allow: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), true), 0);
+    }
+
+    #[test]
+    fn locked_keeps_deny_only_rules_for_everyone_else() {
+        let r = RuleLayers { member_deny: PERM_VIEW_SECRETS, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), true), MEMBER & !PERM_VIEW_SECRETS);
+    }
+
+    #[test]
+    fn locked_applies_a_role_deny() {
+        let r = RuleLayers { roles_deny: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(MEMBER, 0, Some(&r), true), 0);
+    }
+
+    #[test]
+    fn locked_without_rules_is_the_team_mask() {
+        assert_eq!(object_permissions(MEMBER, 0, None, true), MEMBER);
+    }
+
+    #[test]
+    fn locked_builtin_administrator_keeps_the_bypass() {
+        let r = RuleLayers { everyone_deny: PERM_VIEW, ..layers() };
+        assert_eq!(object_permissions(PERM_ADMINISTRATOR, 0, Some(&r), true), ALL_PERMISSIONS);
+    }
+
+    fn subsets(bits: &[i64]) -> Vec<i64> {
+        (0..1usize << bits.len())
+            .map(|i| bits.iter().enumerate().filter(|(b, _)| i & (1 << b) != 0).fold(0, |a, (_, v)| a | v))
+            .collect()
+    }
+
+    #[test]
+    fn locked_is_never_wider_than_business() {
+        let masks = subsets(&[PERM_VIEW, PERM_CONNECT, PERM_VIEW_SECRETS, PERM_COPY_SECRETS, PERM_EDIT_CONNECTIONS]);
+        for &base in &masks {
+            for &allow in &masks {
+                for &deny in &masks {
+                    let r = RuleLayers {
+                        everyone_allow: allow,
+                        everyone_deny: deny,
+                        roles_allow: deny,
+                        roles_deny: allow,
+                        member_allow: allow,
+                        member_deny: deny,
+                    };
+                    let locked = object_permissions(base, 0, Some(&r), true);
+                    let business = object_permissions(base, 0, Some(&r), false);
+                    assert_eq!(locked & !business, 0, "base={base} allow={allow} deny={deny}");
+                }
+            }
+        }
     }
 
     #[test]

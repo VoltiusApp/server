@@ -121,7 +121,7 @@ pub async fn lemonsqueezy_webhook(
 
     info!(event = %event_name, "LemonSqueezy webhook received");
 
-    match event_name {
+    let status = match event_name {
         "subscription_created" => handle_subscription_created(&pool, &notifier, &payload).await,
         "subscription_updated" => handle_subscription_updated(&pool, &notifier, &payload).await,
         "subscription_cancelled" => handle_subscription_cancelled(&pool, &notifier, &payload).await,
@@ -131,7 +131,10 @@ pub async fn lemonsqueezy_webhook(
             info!(event = %event_name, "LemonSqueezy webhook: unhandled event");
             StatusCode::OK
         }
-    }
+    };
+    let (pool, notifier) = (pool.clone(), notifier.clone());
+    tokio::spawn(async move { crate::team_plan::reconcile_all_teams(&pool, &notifier).await });
+    status
 }
 
 async fn handle_subscription_created(

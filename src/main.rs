@@ -15,6 +15,7 @@ mod self_host;
 mod single_instance;
 mod session_grants;
 mod team_join_grants;
+mod team_plan;
 mod sync_notifier;
 mod terminal_manager;
 #[cfg(test)]
@@ -154,6 +155,16 @@ async fn main() {
     observability::spawn_storage_refresher(pool.clone());
 
     let notifier = SyncNotifier::new();
+    {
+        let (pool, notifier) = (pool.clone(), notifier.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                team_plan::reconcile_all_teams(&pool, &notifier).await;
+            }
+        });
+    }
     let terminal_manager = TerminalManager::new();
     let presence_map: PresenceMap = Arc::new(DashMap::new());
     let usage_map: UsageMap = Arc::new(DashMap::new());

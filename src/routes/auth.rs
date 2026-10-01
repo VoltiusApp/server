@@ -869,39 +869,20 @@ mod handler_tests {
     use super::*;
     use crate::auth::jwt::validate_token;
     use crate::test_pool_or_skip;
-    use crate::test_support::{
-        env_lock, seed_user_with_credentials, set_user_tier, set_user_trial,
-    };
+    use crate::test_support::{seed_user_with_credentials, set_user_tier, set_user_trial};
     use axum::extract::State;
 
-    /// Holds the env lock, pins JWT_SECRET so issued tokens decode, and toggles
-    /// LEMONSQUEEZY_API_KEY (the self-hosted signal), restoring it on drop.
-    /// Wrapping the guard in a struct field keeps clippy's `await_holding_lock`
-    /// quiet while the lock is held across the handler's `.await` points.
     #[allow(dead_code)]
-    struct EnvGuard {
-        lock: std::sync::MutexGuard<'static, ()>,
-        prev_ls: Option<String>,
-    }
+    struct EnvGuard(crate::test_support::BillingMode);
     impl EnvGuard {
         fn new(self_hosted: bool) -> Self {
-            let lock = env_lock();
-            std::env::set_var("JWT_SECRET", "ci-test-secret");
-            let prev_ls = std::env::var("LEMONSQUEEZY_API_KEY").ok();
-            if self_hosted {
-                std::env::remove_var("LEMONSQUEEZY_API_KEY");
+            let billing = if self_hosted {
+                crate::test_support::BillingMode::self_hosted()
             } else {
-                std::env::set_var("LEMONSQUEEZY_API_KEY", "test-key");
-            }
-            EnvGuard { lock, prev_ls }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev_ls {
-                Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
-                None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
-            }
+                crate::test_support::BillingMode::hosted()
+            };
+            std::env::set_var("JWT_SECRET", "ci-test-secret");
+            EnvGuard(billing)
         }
     }
 

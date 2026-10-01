@@ -755,6 +755,7 @@ struct VisibleSessionRow {
     /// `invited_by`'s handle, read from `users`.
     invited_by_handle: Option<String>,
     invitee_ids: Vec<Uuid>,
+    vault_candidate_ids: Vec<Uuid>,
 }
 
 async fn listed_sessions(
@@ -773,8 +774,7 @@ async fn listed_sessions(
             CASE
               WHEN ts.host_user_id = $1 THEN ts.connection_name
               -- Teammate pair test, inlined: TEAMMATE_PAIR_SQL (teams.rs) hardcodes
-              -- `$2`/`u.id`, which collide with this query's own `$2` (a permission
-              -- bitmask) and lack of a `u`-aliased row — see that constant's doc.
+              -- `$2`/`u.id`, and this query has no `u`-aliased row — see that constant's doc.
               WHEN EXISTS (SELECT 1 FROM team_members a JOIN team_members b ON a.team_id = b.team_id
                             WHERE a.user_id = $1 AND b.user_id = ts.host_user_id) THEN ts.connection_name
               WHEN EXISTS (SELECT 1 FROM terminal_session_invitees tsi2
@@ -811,51 +811,38 @@ async fn listed_sessions(
                 ) all_invitee_ids),
                 ARRAY[]::uuid[]
               )
-            ELSE ARRAY[]::uuid[] END AS invitee_ids
+            ELSE ARRAY[]::uuid[] END AS invitee_ids,
+            COALESCE(vc.ids, ARRAY[]::uuid[]) AS vault_candidate_ids
         FROM terminal_sessions ts
+        LEFT JOIN LATERAL (
+            SELECT array_agg(tsv.team_id) AS ids
+            FROM terminal_session_vaults tsv
+            JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
+            WHERE tsv.session_id = ts.id
+              AND (
+                array_length(ts.allowed_roles, 1) IS NULL
+                OR cardinality(ts.allowed_roles) = 0
+                OR EXISTS (
+                  SELECT 1
+                  FROM team_member_roles tmr
+                  JOIN team_roles tr ON tr.id = tmr.role_id
+                  WHERE tmr.team_id = tsv.team_id
+                    AND tmr.user_id = $1
+                    AND tr.name = ANY(ts.allowed_roles)
+                )
+              )
+        ) vc ON TRUE
         WHERE ts.ended_at IS NULL
           AND (
             (ts.host_user_id = $1 AND ts.visibility IN ('vault', 'direct'))
             OR EXISTS (SELECT 1 FROM terminal_session_invitees tsi
                         WHERE tsi.session_id = ts.id AND tsi.user_id = $1)
-            OR (
-              ts.visibility = 'vault'
-              AND EXISTS (
-                SELECT 1
-                FROM terminal_session_vaults tsv
-                JOIN team_members tm ON tm.team_id = tsv.team_id AND tm.user_id = $1
-                WHERE tsv.session_id = ts.id
-                  AND (
-                    SELECT (COALESCE(bit_or(tr_perm.permissions), 0) | COALESCE(MAX(o.allow_mask), 0))
-                           & ~COALESCE(MAX(o.deny_mask), 0) & $2
-                    FROM team_members tm2
-                    LEFT JOIN team_member_roles tmr_perm
-                           ON tmr_perm.team_id = tm2.team_id AND tmr_perm.user_id = tm2.user_id
-                    LEFT JOIN team_roles tr_perm ON tr_perm.id = tmr_perm.role_id
-                    LEFT JOIN team_member_permission_overrides o
-                           ON o.team_id = tm2.team_id AND o.user_id = tm2.user_id
-                    WHERE tm2.team_id = tsv.team_id AND tm2.user_id = $1
-                  ) <> 0
-                  AND (
-                    array_length(ts.allowed_roles, 1) IS NULL
-                    OR cardinality(ts.allowed_roles) = 0
-                    OR EXISTS (
-                      SELECT 1
-                      FROM team_member_roles tmr
-                      JOIN team_roles tr ON tr.id = tmr.role_id
-                      WHERE tmr.team_id = tsv.team_id
-                        AND tmr.user_id = $1
-                        AND tr.name = ANY(ts.allowed_roles)
-                    )
-                  )
-              )
-            )
+            OR (ts.visibility = 'vault' AND vc.ids IS NOT NULL)
           )
         ORDER BY ts.created_at DESC
         "#,
     )
     .bind(user_id)
-    .bind(crate::permissions::PERM_VIEW_TERMINAL_SESSIONS)
     .fetch_all(pool)
     .await
     .map_err(|e| {
@@ -871,8 +858,35 @@ async fn listed_sessions(
 async fn visible_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<VisibleSessionRow>, StatusCode> {
     let rows = listed_sessions(pool, user_id).await?;
     let mut authz: std::collections::HashMap<Uuid, Option<crate::object_authz::ObjectAuthz>> = Default::default();
+    let mut may_view: std::collections::HashMap<Uuid, bool> = Default::default();
     let mut kept = Vec::with_capacity(rows.len());
     for row in rows {
+        if row.host_user_id != user_id && row.invited_by.is_none() {
+            let mut granted = false;
+            for &team_id in &row.vault_candidate_ids {
+                let ok = match may_view.get(&team_id) {
+                    Some(&ok) => ok,
+                    None => {
+                        let ok = crate::permissions::has_team_permission(
+                            pool,
+                            team_id,
+                            user_id,
+                            crate::permissions::PERM_VIEW_TERMINAL_SESSIONS,
+                        )
+                        .await?;
+                        may_view.insert(team_id, ok);
+                        ok
+                    }
+                };
+                if ok {
+                    granted = true;
+                    break;
+                }
+            }
+            if !granted {
+                continue;
+            }
+        }
         let hidden = match row.connection_object_id.as_deref() {
             Some(object_id) if row.host_user_id != user_id && row.invited_by.is_none() => {
                 let owners: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
@@ -3056,6 +3070,23 @@ mod tests {
     async fn a_vault_session_on_a_visible_host_is_still_listed() {
         let pool = test_pool_or_skip!();
         let (_, mate, session_id) = vault_session_on_host(&pool, true).await;
+        assert!(visible_sessions(&pool, mate).await.unwrap().iter().any(|r| r.id == session_id));
+    }
+
+    #[tokio::test]
+    async fn a_locked_team_does_not_list_vault_sessions_on_a_custom_role_grant() {
+        let _env = crate::test_support::BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        let mate = crate::test_support::member_with_role(&pool, team, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+        let host = seed_user(&pool).await;
+        let session_id = seed_session(&pool, host, "vault").await;
+        sqlx::query("INSERT INTO terminal_session_vaults (session_id, team_id) VALUES ($1, $2)")
+            .bind(session_id).bind(team).execute(&pool).await.unwrap();
+        assert!(visible_sessions(&pool, mate).await.unwrap().iter().all(|r| r.id != session_id));
+        crate::test_support::set_user_tier(&pool, owner, "business").await;
         assert!(visible_sessions(&pool, mate).await.unwrap().iter().any(|r| r.id == session_id));
     }
 

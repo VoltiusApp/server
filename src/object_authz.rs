@@ -52,6 +52,32 @@ pub struct MemberContext {
     pub base: i64,
     pub team_deny: i64,
     pub role_ids: Vec<Uuid>,
+    pub locked: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub builtin: i64,
+    pub custom: i64,
+    pub allow: i64,
+    pub deny: i64,
+    pub role_ids: Vec<Uuid>,
+}
+
+impl MemberRow {
+    pub fn context(&self, locked: bool) -> MemberContext {
+        let base = if locked {
+            self.builtin & !self.deny
+        } else {
+            (self.builtin | self.custom | self.allow) & !self.deny
+        };
+        MemberContext { user_id: self.user_id, base, team_deny: self.deny, role_ids: self.role_ids.clone(), locked }
+    }
+
+    pub fn with_overrides(&self, allow: i64, deny: i64) -> MemberRow {
+        MemberRow { allow, deny, ..self.clone() }
+    }
 }
 
 fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
@@ -59,34 +85,51 @@ fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-pub async fn member_contexts(
+pub async fn member_rows(
     pool: &PgPool,
     team_id: Uuid,
     only: Option<Uuid>,
-) -> Result<Vec<MemberContext>, StatusCode> {
+) -> Result<Vec<MemberRow>, StatusCode> {
     let sql = format!(
-        "SELECT tm.user_id, COALESCE(bit_or(tr.permissions), 0), COALESCE(MAX(o.allow_mask), 0), \
-                COALESCE(MAX(o.deny_mask), 0), \
+        "SELECT tm.user_id, \
+                COALESCE(bit_or(tr.permissions) FILTER (WHERE tr.is_builtin), 0), \
+                COALESCE(bit_or(tr.permissions) FILTER (WHERE NOT tr.is_builtin), 0), \
+                COALESCE(MAX(o.allow_mask), 0), COALESCE(MAX(o.deny_mask), 0), \
                 COALESCE(array_agg(tmr.role_id) FILTER (WHERE tmr.role_id IS NOT NULL), '{{}}'::uuid[]) \
          {PERMISSION_JOINS} \
          WHERE tm.team_id = $1 AND ($2::uuid IS NULL OR tm.user_id = $2) \
          GROUP BY tm.user_id"
     );
-    let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, Vec<Uuid>)>(&sql)
+    let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, i64, Vec<Uuid>)>(&sql)
         .bind(team_id)
         .bind(only)
         .fetch_all(pool)
         .await
-        .map_err(|e| db_error(e, "member_contexts"))?;
+        .map_err(|e| db_error(e, "member_rows"))?;
     Ok(rows
         .into_iter()
-        .map(|(user_id, roles, allow, deny, role_ids)| MemberContext {
+        .map(|(user_id, builtin, custom, allow, deny, role_ids)| MemberRow {
             user_id,
-            base: (roles | allow) & !deny,
-            team_deny: deny,
+            builtin,
+            custom,
+            allow,
+            deny,
             role_ids,
         })
         .collect())
+}
+
+pub async fn member_contexts(
+    pool: &PgPool,
+    team_id: Uuid,
+    only: Option<Uuid>,
+) -> Result<Vec<MemberContext>, StatusCode> {
+    let rows = member_rows(pool, team_id, only).await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let locked = crate::team_plan::team_locked(pool, team_id).await?;
+    Ok(rows.iter().map(|r| r.context(locked)).collect())
 }
 
 pub async fn rule_entries(
@@ -146,7 +189,7 @@ impl ObjectAuthz {
                 .map(|es| layers_for(es, &self.member.role_ids, self.member.user_id))
                 .unwrap_or_default()
         });
-        object_permissions(self.member.base, self.member.team_deny, layers.as_ref())
+        object_permissions(self.member.base, self.member.team_deny, layers.as_ref(), self.member.locked)
     }
 
     pub fn can(&self, set: Option<Uuid>, bits: i64) -> bool {
@@ -325,6 +368,39 @@ mod tests {
     use crate::test_pool_or_skip;
     use crate::test_support::*;
 
+    fn row(builtin: i64, custom: i64, allow: i64, deny: i64) -> MemberRow {
+        MemberRow { user_id: Uuid::nil(), builtin, custom, allow, deny, role_ids: vec![] }
+    }
+
+    #[test]
+    fn business_context_unions_every_source() {
+        let c = row(PERM_VIEW, PERM_CONNECT, PERM_EDIT_KEYS, PERM_VIEW_SECRETS).context(false);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT | PERM_EDIT_KEYS);
+        assert_eq!(c.team_deny, PERM_VIEW_SECRETS);
+        assert!(!c.locked);
+    }
+
+    #[test]
+    fn locked_context_ignores_allow_and_custom_and_applies_deny() {
+        let builtin = PERM_VIEW | PERM_CONNECT | PERM_VIEW_SECRETS | PERM_EDIT_KEYS;
+        let c = row(builtin, PERM_ADMINISTRATOR, PERM_EDIT_KEYS, PERM_VIEW_SECRETS).context(true);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT | PERM_EDIT_KEYS);
+        assert_eq!(c.team_deny, PERM_VIEW_SECRETS);
+        assert!(c.locked);
+    }
+
+    #[test]
+    fn locked_context_keeps_a_builtin_bit_a_redundant_allow_repeats() {
+        let c = row(PERM_VIEW | PERM_CONNECT, 0, PERM_CONNECT, 0).context(true);
+        assert_eq!(c.base, PERM_VIEW | PERM_CONNECT);
+    }
+
+    #[test]
+    fn with_overrides_replaces_only_the_masks() {
+        let r = row(PERM_VIEW, 0, 1, 2).with_overrides(PERM_CONNECT, 0);
+        assert_eq!((r.builtin, r.allow, r.deny), (PERM_VIEW, PERM_CONNECT, 0));
+    }
+
     #[test]
     fn layers_for_picks_only_the_callers_role_and_member_entries() {
         let me = Uuid::new_v4();
@@ -493,5 +569,39 @@ mod tests {
         .unwrap();
         assert_eq!(version.as_deref(), Some("0.99.0"));
         assert!(rule_sets);
+    }
+
+    #[tokio::test]
+    async fn lapsed_team_hides_objects_from_custom_role_holders() {
+        let _mode = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
+        set_user_tier(&pool, f.owner, "teams").await;
+        for user in [f.viewer, f.blocked, f.admin] {
+            let hidden = hidden_object_ids(&pool, f.team, user).await.unwrap();
+            assert!(hidden.contains(&f.object_id), "{user} must not see it");
+        }
+        set_user_tier(&pool, f.owner, "business").await;
+        assert!(!hidden_object_ids(&pool, f.team, f.viewer).await.unwrap().contains(&f.object_id));
+    }
+
+    #[tokio::test]
+    async fn lapsed_team_keeps_a_deny_only_rule() {
+        let _mode = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let (kept, denied) = (seed_user(&pool).await, seed_user(&pool).await);
+        for u in [kept, denied] {
+            add_member(&pool, team, u).await;
+            grant_builtin_role(&pool, team, u, "member").await;
+        }
+        let object_id = format!("obj-{}", Uuid::new_v4());
+        seed_team_object(&pool, team, owner, &object_id, "connection").await;
+        let set = seed_rule_set(&pool, team, owner, &[("member", Some(denied), 0, PERM_VIEW)]).await;
+        point_object(&pool, team, &object_id, Some(set)).await;
+        assert!(!hidden_object_ids(&pool, team, kept).await.unwrap().contains(&object_id));
+        assert!(hidden_object_ids(&pool, team, denied).await.unwrap().contains(&object_id));
     }
 }

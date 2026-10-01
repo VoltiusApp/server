@@ -812,7 +812,7 @@ mod authz_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         hidden_object_fixture, member_with_role, rule_set_client_headers, seed_rule_set, seed_team,
-        seed_user,
+        seed_user, set_user_tier, BillingMode,
     };
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
@@ -855,6 +855,38 @@ mod authz_tests {
             .into_iter()
             .map(|o| o.object_id)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_downgraded_team_can_point_a_new_object_at_a_hidden_set() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
+        set_user_tier(&pool, f.owner, "teams").await;
+        crate::test_support::grant_builtin_role(&pool, f.team, f.admin, "owner").await;
+
+        let res = upsert_object(
+            State(pool.clone()),
+            Extension(AuthUser(f.admin)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path(f.team),
+            Json(UpsertTeamObjectRequest {
+                object_id: "child-host".to_string(),
+                object_type: TeamObjectType::Connection,
+                name: None,
+                folder_id: None,
+                metadata: serde_json::json!({}),
+                rule_set_id: Some(Some(f.rule_set)),
+            }),
+        )
+        .await;
+        assert!(res.is_ok(), "pointing at an existing set must stay ungated, got {:?}", res.err());
+
+        let blocked_sees = listed_ids(&pool, f.team, f.blocked).await;
+        assert!(!blocked_sees.contains(&"child-host".to_string()));
+        assert!(!listed_ids(&pool, f.team, f.viewer).await.contains(&"child-host".to_string()));
     }
 
     #[tokio::test]

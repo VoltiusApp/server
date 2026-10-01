@@ -27,6 +27,40 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 #[allow(dead_code)]
 pub struct EnvLockGuard(pub MutexGuard<'static, ()>);
 
+#[allow(dead_code)]
+pub struct BillingMode(MutexGuard<'static, ()>, Option<String>, Option<bool>);
+
+impl BillingMode {
+    pub fn hosted() -> Self {
+        Self::set(Some("test-key"))
+    }
+
+    pub fn self_hosted() -> Self {
+        Self::set(None)
+    }
+
+    fn set(key: Option<&str>) -> Self {
+        let lock = env_lock();
+        let prev = std::env::var("LEMONSQUEEZY_API_KEY").ok();
+        match key {
+            Some(k) => std::env::set_var("LEMONSQUEEZY_API_KEY", k),
+            None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
+        }
+        let prev_mode = crate::self_host::set_test_billing_mode(Some(key.is_none()));
+        BillingMode(lock, prev, prev_mode)
+    }
+}
+
+impl Drop for BillingMode {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
+            None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
+        }
+        crate::self_host::set_test_billing_mode(self.2);
+    }
+}
+
 /// Serializes tests that read or write `users.last_seen_on`. Activity counts are
 /// whole-table aggregates, so a concurrent test stamping a user would shift the
 /// totals mid-assertion. Any test touching that column must hold this lock.
@@ -185,18 +219,8 @@ pub async fn seed_builtin_roles(pool: &PgPool, team: Uuid) {
 /// assigns a builtin role needs this instead.
 pub async fn seed_team_with_roles(pool: &PgPool, owner: Uuid) -> Uuid {
     let team = seed_team(pool, owner).await;
-    seed_builtin_roles(pool, team).await;
     add_member(pool, team, owner).await;
-    sqlx::query(
-        "INSERT INTO team_member_roles (team_id, user_id, role_id)
-         SELECT $1, $2, id FROM team_roles
-         WHERE team_id = $1 AND name = 'owner' AND is_builtin = TRUE",
-    )
-    .bind(team)
-    .bind(owner)
-    .execute(pool)
-    .await
-    .expect("assign owner role");
+    grant_builtin_role(pool, team, owner, "owner").await;
     team
 }
 
@@ -236,6 +260,17 @@ pub async fn assign_role(pool: &PgPool, team: Uuid, user: Uuid, role: Uuid) {
         .execute(pool)
         .await
         .expect("assign role");
+}
+
+pub async fn grant_builtin_role(pool: &PgPool, team: Uuid, user: Uuid, name: &str) {
+    seed_builtin_roles(pool, team).await;
+    let role: Uuid = sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = $2 AND is_builtin")
+        .bind(team)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("builtin role");
+    assign_role(pool, team, user, role).await;
 }
 
 /// Set permission overrides for `user` within `team`.
@@ -454,4 +489,12 @@ pub async fn hidden_object_fixture(pool: &PgPool, object_type: &str, member_perm
     .await;
     point_object(pool, team, &object_id, Some(rule_set)).await;
     HiddenObjectFixture { team, owner, viewer, blocked, admin, object_id, rule_set }
+}
+
+pub async fn rotation_request_count(pool: &PgPool, team: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM team_rotation_requests WHERE team_id = $1")
+        .bind(team)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
