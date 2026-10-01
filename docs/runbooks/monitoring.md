@@ -56,7 +56,7 @@ dashboard. Reading `/metrics` is for an investigation already underway, not for 
 
 ## `/health` versus `/health/deep`
 
-- `GET /health` — `src/routes/health.rs`, returns the literal string `ok`, never touches Postgres.
+- `GET /health` — `src/routes/health.rs`, returns the literal string `ok\n`, never touches Postgres.
   This is the container healthcheck (`compose.prod.yml`) and it must stay static: if it queried
   Postgres, a transient database hiccup would mark the container unhealthy and Docker would
   restart a server process that was otherwise fine, turning a blip into an outage.
