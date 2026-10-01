@@ -112,6 +112,26 @@ fn require_edit_on(authz: &ObjectAuthz, rows: &[(String, Option<Uuid>)]) -> Resu
     Ok(())
 }
 
+async fn folder_rule_set(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    team_id: Uuid,
+    folder_id: &str,
+) -> Result<Option<Uuid>, StatusCode> {
+    sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT rule_set_id FROM team_vault_objects \
+         WHERE team_id = $1 AND object_id = $2 AND object_type IN ('folder', 'snippet_folder')",
+    )
+    .bind(team_id)
+    .bind(folder_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map(Option::flatten)
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to read the parent folder's rule set");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<Uuid>>, D::Error> {
     Option::<Uuid>::deserialize(d).map(Some)
 }
@@ -130,6 +150,9 @@ pub struct UpsertTeamObjectRequest {
     pub metadata: serde_json::Value,
     #[serde(default, deserialize_with = "present")]
     pub rule_set_id: Option<Option<Uuid>>,
+    /// A folder whose rule set a new row takes when the client cannot resolve that folder itself.
+    #[serde(default)]
+    pub rules_from_folder: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,7 +296,11 @@ pub async fn upsert_object(
 
     let body_edit = body.object_type.edit_permission();
     let current = existing.as_ref().and_then(|(_, rule_set_id)| *rule_set_id);
-    let target = body.rule_set_id.unwrap_or(current);
+    let target = match (body.rule_set_id, &existing, &body.rules_from_folder) {
+        (Some(target), _, _) => target,
+        (None, None, Some(folder_id)) => folder_rule_set(&mut tx, team_id, folder_id).await?,
+        (None, _, _) => current,
+    };
 
     match &existing {
         None if !authz.can(target, body_edit) => return Err(StatusCode::FORBIDDEN),
@@ -879,6 +906,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({}),
                 rule_set_id: Some(Some(f.rule_set)),
+                rules_from_folder: None,
             }),
         )
         .await;
@@ -961,6 +989,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({}),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await;
@@ -989,6 +1018,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({}),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await;
@@ -1017,6 +1047,7 @@ mod authz_tests {
                 folder_id: Some("folder-7".to_string()),
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await
@@ -1149,6 +1180,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({}),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await
@@ -1801,6 +1833,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await
@@ -1967,6 +2000,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await;
@@ -1999,6 +2033,7 @@ mod authz_tests {
                 folder_id: None,
                 metadata: serde_json::json!({ "host": "10.0.0.1" }),
                 rule_set_id: None,
+                rules_from_folder: None,
             }),
         )
         .await;
@@ -2249,7 +2284,21 @@ mod authz_tests {
             folder_id: None,
             metadata: serde_json::json!({ "v": 2 }),
             rule_set_id,
+            rules_from_folder: None,
         }
+    }
+
+    async fn object_exists(pool: &PgPool, team: Uuid, object_id: &str) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM team_vault_objects WHERE team_id = $1 AND object_id = $2)")
+            .bind(team)
+            .bind(object_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn body_in_folder(object_id: &str, folder_id: &str) -> UpsertTeamObjectRequest {
+        UpsertTeamObjectRequest { rules_from_folder: Some(folder_id.to_string()), ..object_body(object_id, None) }
     }
 
     async fn upsert_as(pool: &PgPool, team: Uuid, user: Uuid, headers: axum::http::HeaderMap, body: UpsertTeamObjectRequest) -> Result<StatusCode, StatusCode> {
@@ -2284,6 +2333,7 @@ mod authz_tests {
         ).unwrap();
         assert_eq!(absent.rule_set_id, None);
         assert_eq!(null.rule_set_id, Some(None));
+        assert_eq!(absent.rules_from_folder, None);
     }
 
     #[tokio::test]
@@ -2355,6 +2405,71 @@ mod authz_tests {
         let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
         let res = upsert_as(&pool, team, editor, rule_set_client_headers(), object_body("new-3", Some(Some(Uuid::new_v4())))).await;
         assert_eq!(res.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_new_object_takes_the_rule_set_of_its_unresolved_folder() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), body_in_folder("child-1", &f.object_id)).await.unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, "child-1").await, Some(f.rule_set));
+        assert!(!listed_ids(&pool, f.team, f.blocked).await.contains(&"child-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn creating_in_a_folder_hidden_from_the_creator_is_refused() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
+        let res = upsert_as(&pool, f.team, f.blocked, rule_set_client_headers(), body_in_folder("child-7", &f.object_id)).await;
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+        assert!(!object_exists(&pool, f.team, "child-7").await);
+    }
+
+    #[tokio::test]
+    async fn a_new_object_takes_the_rule_set_of_a_deleted_folder() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
+        sqlx::query("UPDATE team_vault_objects SET deleted_at = now() WHERE team_id = $1 AND object_id = $2")
+            .bind(f.team).bind(&f.object_id).execute(&pool).await.unwrap();
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), body_in_folder("child-2", &f.object_id)).await.unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, "child-2").await, Some(f.rule_set));
+    }
+
+    #[tokio::test]
+    async fn a_folder_hint_that_is_not_a_folder_of_the_team_is_team_wide() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "connection", PERM_EDIT_CONNECTIONS).await;
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), body_in_folder("child-3", &f.object_id)).await.unwrap();
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), body_in_folder("child-4", "no-such-folder")).await.unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, "child-3").await, None);
+        assert_eq!(stored_pointer(&pool, f.team, "child-4").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_folder_hint_never_overrides_an_explicit_pointer_or_an_existing_row() {
+        let pool = test_pool_or_skip!();
+        let f = hidden_object_fixture(&pool, "folder", PERM_EDIT_CONNECTIONS).await;
+        let explicit = UpsertTeamObjectRequest { rule_set_id: Some(None), ..body_in_folder("child-5", &f.object_id) };
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), explicit).await.unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, "child-5").await, None);
+
+        upsert_as(&pool, f.team, f.viewer, rule_set_client_headers(), body_in_folder("child-5", &f.object_id)).await.unwrap();
+        assert_eq!(stored_pointer(&pool, f.team, "child-5").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_denies_edit_refuses_the_new_object() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let editor = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        crate::test_support::seed_team_object(&pool, team, owner, "locked-folder", "folder").await;
+        let locked = seed_rule_set(&pool, team, owner, &[("everyone", None, 0, PERM_EDIT_CONNECTIONS)]).await;
+        crate::test_support::point_object(&pool, team, "locked-folder", Some(locked)).await;
+
+        let res = upsert_as(&pool, team, editor, rule_set_client_headers(), body_in_folder("child-6", "locked-folder")).await;
+        assert_eq!(res.unwrap_err(), StatusCode::FORBIDDEN);
+        assert!(!object_exists(&pool, team, "child-6").await);
     }
 
     #[tokio::test]
