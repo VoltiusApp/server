@@ -8,7 +8,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 pub async fn health() -> &'static str {
-    "ok"
+    "ok\n"
 }
 
 pub async fn health_deep(State(pool): State<PgPool>) -> Response {
@@ -55,7 +55,7 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&bytes[..], b"ok");
+        assert_eq!(&bytes[..], b"ok\n");
     }
 
     #[tokio::test]
