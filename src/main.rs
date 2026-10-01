@@ -429,6 +429,26 @@ async fn main() {
             "/v1/my/pending-invitations/:inv_id",
             delete(routes::invitations::decline_my_pending_invitation),
         )
+        .route(
+            "/v1/my/identity-picks",
+            get(routes::member_identity_picks::list_picks),
+        )
+        .route(
+            "/v1/my/identity-picks/objects/:object_id",
+            put(routes::member_identity_picks::put_object_pick),
+        )
+        .route(
+            "/v1/my/identity-picks/objects/:object_id",
+            delete(routes::member_identity_picks::delete_object_pick),
+        )
+        .route(
+            "/v1/my/identity-picks/teams/:team_id",
+            put(routes::member_identity_picks::put_team_default),
+        )
+        .route(
+            "/v1/my/identity-picks/teams/:team_id",
+            delete(routes::member_identity_picks::delete_team_default),
+        )
         // Custom roles
         .route("/v1/teams/:team_id/roles", get(routes::teams::list_roles))
         .route("/v1/teams/:team_id/roles", post(routes::teams::create_role))
