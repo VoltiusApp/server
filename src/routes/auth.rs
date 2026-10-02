@@ -11,7 +11,9 @@ use crate::auth::{
     AuthUser,
 };
 use crate::email::send_verification_email;
+use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
+use crate::sync_notifier::SyncNotifier;
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
 
@@ -196,13 +198,15 @@ fn email_delivery_configured() -> bool {
 pub async fn register(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
-    register_with(pool, features, email_delivery_configured(), body).await
+    register_with(pool, &notifier, features, email_delivery_configured(), body).await
 }
 
 async fn register_with(
     pool: PgPool,
+    notifier: &SyncNotifier,
     features: crate::features::Features,
     delivery_configured: bool,
     body: RegisterRequest,
@@ -317,45 +321,21 @@ async fn register_with(
         false
     };
 
-    // Auto-accept any pending invitations for this email
-    let pending = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<String>)>(
-        "SELECT team_id, role, invited_by, member_name FROM pending_invitations
-         WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
-    )
+    let pending = sqlx::query_as::<_, PendingInvitation>(&format!(
+        "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
+         WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()"
+    ))
     .bind(&email)
     .fetch_all(&pool)
     .await
     .unwrap_or_default();
 
-    // Shared with the two explicit accept paths. This one used to write its own
-    // INSERT naming a `role` column that `team_members` has not had since the
-    // roles migration — the error was swallowed, so the invitations below were
-    // marked accepted while nobody was ever added to the team.
-    for (team_id, role, invited_by, member_name) in &pending {
-        match pool.acquire().await {
-            Ok(mut conn) => {
-                if let Err(status) = crate::routes::invitations::admit_member(
-                    &mut conn, *team_id, user_id, *invited_by, role, member_name.as_deref(),
-                )
-                .await
-                {
-                    error!(user_id = %user_id, team_id = %team_id, ?status, "Failed to auto-accept invitation on registration");
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to acquire connection to auto-accept invitations")
-            }
+    for invitation in &pending {
+        if let Err(status) =
+            accept_pending_invitation(&pool, notifier, invitation, user_id, Some(email.clone()), "registration").await
+        {
+            error!(user_id = %user_id, ?status, "Failed to auto-accept invitation on registration");
         }
-    }
-    if !pending.is_empty() {
-        let _ = sqlx::query(
-            "UPDATE pending_invitations SET accepted_at = now()
-             WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
-        )
-        .bind(&email)
-        .execute(&pool)
-        .await;
-        info!(user_id = %user_id, count = pending.len(), "Auto-accepted pending invitations on registration");
     }
 
     let trial_ends_ts = trial_ends_at.map(|t| t.timestamp());
@@ -1035,7 +1015,7 @@ mod handler_tests {
         let pool = test_pool_or_skip!();
         let local = unique_handle("jn");
         let email = format!("{local}@corp.test");
-        let (_, Json(resp)) = register(State(pool.clone()), features(true), Json(register_req(&email, Uuid::new_v4(), None)))
+        let (_, Json(resp)) = register(State(pool.clone()), features(true), Extension(SyncNotifier::new()), Json(register_req(&email, Uuid::new_v4(), None)))
             .await
             .unwrap();
         assert_eq!(handle_row(&pool, resp.user_id).await, (local, true));
@@ -1046,12 +1026,12 @@ mod handler_tests {
         let _env = EnvGuard::new(true);
         let pool = test_pool_or_skip!();
         let local = unique_handle("jn");
-        let first = register(State(pool.clone()), features(true), Json(register_req(&format!("{local}@a.test"), Uuid::new_v4(), None)))
+        let first = register(State(pool.clone()), features(true), Extension(SyncNotifier::new()), Json(register_req(&format!("{local}@a.test"), Uuid::new_v4(), None)))
             .await
             .unwrap()
             .1
              .0;
-        let second = register(State(pool.clone()), features(true), Json(register_req(&format!("{local}@b.test"), Uuid::new_v4(), None)))
+        let second = register(State(pool.clone()), features(true), Extension(SyncNotifier::new()), Json(register_req(&format!("{local}@b.test"), Uuid::new_v4(), None)))
             .await
             .unwrap()
             .1
@@ -1068,7 +1048,7 @@ mod handler_tests {
             .execute(&pool)
             .await
             .unwrap();
-        let third = register(State(pool.clone()), features(true), Json(register_req(&format!("{retired}@c.test"), Uuid::new_v4(), None)))
+        let third = register(State(pool.clone()), features(true), Extension(SyncNotifier::new()), Json(register_req(&format!("{retired}@c.test"), Uuid::new_v4(), None)))
             .await
             .unwrap()
             .1
@@ -1081,7 +1061,7 @@ mod handler_tests {
         let _env = EnvGuard::new(true);
         let pool = test_pool_or_skip!();
         let local = unique_handle("jn");
-        let (_, Json(resp)) = register(State(pool.clone()), features(false), Json(register_req(&format!("{local}@corp.test"), Uuid::new_v4(), None)))
+        let (_, Json(resp)) = register(State(pool.clone()), features(false), Extension(SyncNotifier::new()), Json(register_req(&format!("{local}@corp.test"), Uuid::new_v4(), None)))
             .await
             .unwrap();
         let (h, custom) = handle_row(&pool, resp.user_id).await;
@@ -1096,7 +1076,7 @@ mod handler_tests {
         let account_id = Uuid::new_v4();
         let email = format!("{}@ex.test", Uuid::new_v4());
 
-        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, None)))
+        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Extension(SyncNotifier::new()), Json(register_req(&email, account_id, None)))
             .await
             .expect("register ok");
 
@@ -1121,7 +1101,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
         let before = Utc::now().timestamp();
 
-        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, None)))
+        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Extension(SyncNotifier::new()), Json(register_req(&email, account_id, None)))
             .await
             .expect("register ok");
 
@@ -1155,7 +1135,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
 
         let (status, Json(resp)) =
-            register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, Some(&fp))))
+            register(State(pool.clone()), Extension(Features::open()), Extension(SyncNotifier::new()), Json(register_req(&email, account_id, Some(&fp))))
                 .await
                 .expect("register ok");
 
@@ -1176,6 +1156,7 @@ mod handler_tests {
         let (status, _) = register(
             State(pool.clone()),
             Extension(Features::open()),
+            Extension(SyncNotifier::new()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1185,6 +1166,7 @@ mod handler_tests {
         match register(
             State(pool.clone()),
             Extension(Features::open()),
+            Extension(SyncNotifier::new()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1192,6 +1174,55 @@ mod handler_tests {
             Err(s) => assert_eq!(s, StatusCode::CONFLICT),
             Ok(_) => panic!("expected CONFLICT on duplicate email"),
         }
+    }
+
+    #[tokio::test]
+    async fn register_auto_accept_admits_audits_and_tells_the_team() {
+        use crate::sync_notifier::SyncEvent;
+        use crate::test_support::{add_member, seed_invitation, seed_team, seed_user};
+
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        let (invitation_id, _token) = seed_invitation(&pool, team, &email, "member", None).await;
+
+        let notifier = SyncNotifier::new();
+        let mut rx = notifier.subscribe();
+        let (_, Json(resp)) = register(
+            State(pool.clone()),
+            Extension(Features::open()),
+            Extension(notifier.clone()),
+            Json(register_req(&email, Uuid::new_v4(), None)),
+        )
+        .await
+        .unwrap();
+
+        let (accepted, member, joined): (bool, bool, i64) = sqlx::query_as(
+            "SELECT
+               (SELECT accepted_at IS NOT NULL FROM pending_invitations WHERE id = $1),
+               EXISTS(SELECT 1 FROM team_members WHERE team_id = $2 AND user_id = $3),
+               (SELECT COUNT(*) FROM audit_logs WHERE team_id = $2 AND actor_id = $3 AND action = 'member.joined')",
+        )
+        .bind(invitation_id)
+        .bind(team)
+        .bind(resp.user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(accepted && member);
+        assert_eq!(joined, 1);
+
+        let roster_event = format!("team_members:{team}");
+        let mut owner_told = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let SyncEvent::BlobPushed { user_id, device_id } = ev {
+                owner_told |= user_id == owner && device_id == roster_event;
+            }
+        }
+        assert!(owner_told, "the inviter's roster must hear about the sign-up");
     }
 
     // ── login: effective tier in the issued session ───────────────────────────
@@ -1373,6 +1404,7 @@ mod handler_tests {
         let (_, Json(resp)) = register(
             State(pool.clone()),
             Extension(Features::open()),
+            Extension(SyncNotifier::new()),
             Json(register_req(&typed, Uuid::new_v4(), None)),
         )
         .await
@@ -1395,6 +1427,7 @@ mod handler_tests {
         let _ = register(
             State(pool.clone()),
             Extension(Features::open()),
+            Extension(SyncNotifier::new()),
             Json(register_req(&email, account_id, None)),
         )
         .await
@@ -1421,6 +1454,7 @@ mod handler_tests {
         let _ = register(
             State(pool.clone()),
             Extension(Features::open()),
+            Extension(SyncNotifier::new()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1429,6 +1463,7 @@ mod handler_tests {
         match register(
             State(pool.clone()),
             Extension(Features::open()),
+            Extension(SyncNotifier::new()),
             Json(register_req(&email.to_uppercase(), Uuid::new_v4(), None)),
         )
         .await
@@ -1579,7 +1614,7 @@ mod handler_tests {
     }
 
     async fn registered_unverified(pool: &PgPool, switch: bool, email: &str) -> (Uuid, String) {
-        let (_, Json(resp)) = register_with(pool.clone(), features(switch).0, true, register_req(email, Uuid::new_v4(), None))
+        let (_, Json(resp)) = register_with(pool.clone(), &SyncNotifier::new(), features(switch).0, true, register_req(email, Uuid::new_v4(), None))
             .await
             .unwrap();
         let token = sqlx::query_scalar("SELECT token FROM email_verification_tokens WHERE user_id = $1")
