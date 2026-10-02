@@ -31,6 +31,7 @@ pub struct TeamMember {
     /// `display_name`. Delete this field in 0.27, and never repopulate it.
     pub display_name: String,
     pub handle: String,
+    pub member_name: Option<String>,
     pub public_key: String,
     /// The inviter's handle. The field name is the alias, the value is not.
     pub invited_by_display_name: Option<String>,

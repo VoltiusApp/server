@@ -57,6 +57,14 @@ pub async fn write_audit_event(
     }
 }
 
+pub(crate) const AUDIT_ACTOR_JOINS: &str = "JOIN users u ON u.id = al.actor_id \
+     LEFT JOIN team_member_names mn ON mn.team_id = al.team_id AND mn.user_id = al.actor_id";
+
+const AUDIT_ROW_COLUMNS: &str = "al.id, al.team_id, al.vault_id, al.actor_id, \
+     u.handle AS actor_name, mn.name AS actor_member_name, \
+     al.action, al.source, al.target_type, al.target_id, al.target_name, \
+     al.metadata, al.ip_address::text AS ip_address, al.created_at";
+
 // ─── Response types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -66,6 +74,7 @@ pub struct AuditLogRow {
     pub vault_id: Option<Uuid>,
     pub actor_id: Uuid,
     pub actor_name: String,
+    pub actor_member_name: Option<String>,
     pub action: String,
     pub source: String,
     pub target_type: Option<String>,
@@ -160,24 +169,19 @@ pub async fn list_audit_logs(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let logs = sqlx::query_as::<_, AuditLogRow>(
-        r#"SELECT
-               al.id, al.team_id, al.vault_id, al.actor_id,
-               u.handle AS actor_name,
-               al.action, al.source, al.target_type, al.target_id, al.target_name,
-               al.metadata, al.ip_address::text AS ip_address, al.created_at
-           FROM audit_logs al
-           JOIN users u ON u.id = al.actor_id
-           WHERE al.team_id = $1
-              AND ($2::text IS NULL OR al.action = $2)
-              AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
-              AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
-              AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
-              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
-              AND (al.target_id IS NULL OR NOT (al.target_id = ANY($9::text[])))
-            ORDER BY al.created_at DESC
-            LIMIT $7 OFFSET $8"#,
-    )
+    let sql = format!(
+        "SELECT {AUDIT_ROW_COLUMNS} FROM audit_logs al {AUDIT_ACTOR_JOINS} \
+         WHERE al.team_id = $1 \
+            AND ($2::text IS NULL OR al.action = $2) \
+            AND ($3::uuid IS NULL OR al.actor_id = $3::uuid) \
+            AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz) \
+            AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz) \
+            AND ($6::uuid IS NULL OR al.vault_id = $6::uuid) \
+            AND (al.target_id IS NULL OR NOT (al.target_id = ANY($9::text[]))) \
+          ORDER BY al.created_at DESC \
+          LIMIT $7 OFFSET $8"
+    );
+    let logs = sqlx::query_as::<_, AuditLogRow>(&sql)
     .bind(team_id)
     .bind(&params.action)
     .bind(params.actor_id)
@@ -223,23 +227,18 @@ pub async fn export_audit_logs(
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    let logs = sqlx::query_as::<_, AuditLogRow>(
-        r#"SELECT
-               al.id, al.team_id, al.vault_id, al.actor_id,
-               u.handle AS actor_name,
-               al.action, al.source, al.target_type, al.target_id, al.target_name,
-               al.metadata, al.ip_address::text AS ip_address, al.created_at
-           FROM audit_logs al
-           JOIN users u ON u.id = al.actor_id
-           WHERE al.team_id = $1
-              AND ($2::text IS NULL OR al.action = $2)
-              AND ($3::uuid IS NULL OR al.actor_id = $3::uuid)
-              AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz)
-              AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz)
-              AND ($6::uuid IS NULL OR al.vault_id = $6::uuid)
-              AND (al.target_id IS NULL OR NOT (al.target_id = ANY($7::text[])))
-            ORDER BY al.created_at DESC"#,
-    )
+    let sql = format!(
+        "SELECT {AUDIT_ROW_COLUMNS} FROM audit_logs al {AUDIT_ACTOR_JOINS} \
+         WHERE al.team_id = $1 \
+            AND ($2::text IS NULL OR al.action = $2) \
+            AND ($3::uuid IS NULL OR al.actor_id = $3::uuid) \
+            AND ($4::timestamptz IS NULL OR al.created_at >= $4::timestamptz) \
+            AND ($5::timestamptz IS NULL OR al.created_at <= $5::timestamptz) \
+            AND ($6::uuid IS NULL OR al.vault_id = $6::uuid) \
+            AND (al.target_id IS NULL OR NOT (al.target_id = ANY($7::text[]))) \
+          ORDER BY al.created_at DESC"
+    );
+    let logs = sqlx::query_as::<_, AuditLogRow>(&sql)
     .bind(team_id)
     .bind(&params.action)
     .bind(params.actor_id)
@@ -259,11 +258,11 @@ pub async fn export_audit_logs(
     match format {
         "csv" => {
             let mut csv = String::from(
-                "id,team_id,vault_id,actor_id,actor_name,action,source,target_type,target_id,target_name,ip_address,created_at,metadata\n",
+                "id,team_id,vault_id,actor_id,actor_name,action,source,target_type,target_id,target_name,ip_address,created_at,metadata,actor_member_name\n",
             );
             for log in &logs {
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                     log.id,
                     log.team_id,
                     log.vault_id.map(|v| v.to_string()).unwrap_or_default(),
@@ -282,6 +281,7 @@ pub async fn export_audit_logs(
                             .map(|m| m.to_string())
                             .unwrap_or_default()
                     ),
+                    csv_escape(log.actor_member_name.as_deref().unwrap_or("")),
                 ));
             }
             Ok((
