@@ -216,17 +216,21 @@ mod db_tests {
 
     async fn wait_for_audit_rows(pool: &PgPool, team: Uuid, action: &str, expected: i64) {
         for _ in 0..100 {
-            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE team_id = $1 AND action = $2")
-                .bind(team)
-                .bind(action)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-            if n >= expected {
+            if audit_rows(pool, team, action).await >= expected {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        panic!("timed out waiting for {expected} {action} audit rows");
+    }
+
+    async fn audit_rows(pool: &PgPool, team: Uuid, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE team_id = $1 AND action = $2")
+            .bind(team)
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     async fn stored(pool: &PgPool, team: Uuid, user: Uuid) -> Option<String> {
@@ -313,6 +317,8 @@ mod db_tests {
         put(&pool, admin, team, target, Some("Jan")).await.unwrap();
         put(&pool, admin, team, target, Some("Jan")).await.unwrap();
         wait_for_audit_rows(&pool, team, "member.renamed", 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(audit_rows(&pool, team, "member.renamed").await, 1, "an unchanged name must not write a second event");
 
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(
             "SELECT metadata FROM audit_logs WHERE team_id = $1 AND action = 'member.renamed' AND target_id = $2",
