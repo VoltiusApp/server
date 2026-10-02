@@ -306,58 +306,60 @@ async fn delete_grant_side_rows(
     Ok(())
 }
 
-/// Undoes `grant_invitee` for every grant `user_id` is no longer qualified for
-/// after leaving a team — both grants they hold and grants they issued, since
-/// the admission guard tests the inviter/invitee *pair*. Clears the durable
-/// row, the wrapped key (`GET .../key` would otherwise still hand it out), the
-/// suppressed-knock row (else the seat it fakes-occupies never frees up) and
-/// the in-memory set the WebSocket actually reads.
-///
-/// Scope: this closes admission to *new* connections. The relay protocol has no
-/// eviction message, so a participant already attached to the live socket stays
-/// until they disconnect — deliberate, not an oversight.
+/// Undoes `grant_invitee` for every grant a `departed` user is no longer
+/// qualified for after leaving a team — both grants they hold and grants they
+/// issued, since the admission guard tests the inviter/invitee *pair*. Clears
+/// the durable row, the wrapped key (`GET .../key` would otherwise still hand it
+/// out), the suppressed-knock row (else the seat it fakes-occupies never frees
+/// up) and the in-memory set the WebSocket actually reads, then makes every
+/// affected live socket re-run admission so one that lost access is dropped.
 // Kept as its own bulk-statement shape rather than looping `revoke_one_grant`
 // per pair: the filtered `NOT EXISTS` DELETE below computes the whole revoked
 // set in one round trip, and a departed member can hold or have issued many
 // grants — looping would turn one statement into 3N and re-derive the same
 // teammate check per row.
-pub(crate) async fn revoke_grants_for_departed_member(
+pub(crate) async fn revoke_grants_for_departed_members(
     pool: &PgPool,
     manager: &TerminalManager,
-    user_id: Uuid,
+    departed: &[Uuid],
 ) -> Result<(), sqlx::Error> {
     let revoked: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "DELETE FROM terminal_session_invitees tsi \
-          WHERE (tsi.user_id = $1 OR tsi.invited_by = $1) \
+          WHERE (tsi.user_id = ANY($1) OR tsi.invited_by = ANY($1)) \
             AND NOT EXISTS ( \
               SELECT 1 FROM team_members a \
                 JOIN team_members b ON a.team_id = b.team_id \
                WHERE a.user_id = tsi.invited_by AND b.user_id = tsi.user_id) \
           RETURNING tsi.session_id, tsi.user_id",
     )
-    .bind(user_id)
+    .bind(departed)
     .fetch_all(pool)
     .await?;
 
-    if revoked.is_empty() {
-        return Ok(());
-    }
-
-    let (session_ids, user_ids): (Vec<Uuid>, Vec<Uuid>) = revoked.iter().copied().unzip();
-    for table in GRANT_SIDE_TABLES {
-        delete_grant_side_rows(pool, table, &session_ids, &user_ids).await?;
+    if !revoked.is_empty() {
+        let (session_ids, user_ids): (Vec<Uuid>, Vec<Uuid>) = revoked.iter().copied().unzip();
+        for table in GRANT_SIDE_TABLES {
+            delete_grant_side_rows(pool, table, &session_ids, &user_ids).await?;
+        }
     }
 
     let mut sessions = manager.sessions.lock().await;
     for (session_id, revoked_user) in revoked {
         if let Some(state) = sessions.get_mut(&session_id) {
             state.invitees.remove(&revoked_user);
+            state.recheck_access();
+        }
+    }
+    // Vault-share participants hold no grant row; leaving the team is their revoke.
+    for state in sessions.values() {
+        if state.participants.keys().any(|p| departed.contains(p)) {
+            state.recheck_access();
         }
     }
     Ok(())
 }
 
-/// The single-pair form of `revoke_grants_for_departed_member`: durable row,
+/// The single-pair form of `revoke_grants_for_departed_members`: durable row,
 /// wrapped key, the suppressed-knock row, and the in-memory set the WebSocket
 /// actually reads. All four, always — a DB-only revoke leaves live admission
 /// open, and a stale `suppressed_invites` row occupies a guest seat that
@@ -378,6 +380,7 @@ pub(crate) async fn revoke_one_grant(
     }
     if let Some(state) = manager.sessions.lock().await.get_mut(&session_id) {
         state.invitees.remove(&user_id);
+        state.recheck_access();
     }
     Ok(())
 }
@@ -690,6 +693,7 @@ pub async fn create_session(
                 pending_control_request: None,
                 tx,
                 output_history: std::collections::VecDeque::new(),
+                access_changed: tokio::sync::watch::channel(()).0,
             },
         );
     }
@@ -1398,6 +1402,49 @@ pub(crate) async fn stamp_acceptance(pool: &PgPool, session_id: Uuid, user_id: U
     }
 }
 
+struct Admission {
+    authorized: bool,
+    host_user_id: Uuid,
+    vault_owner_id: Option<Uuid>,
+}
+
+/// `None` when the session is no longer live.
+async fn check_admission(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    user_id: Uuid,
+    invite_token: Option<&str>,
+) -> Option<Admission> {
+    let (vault_ids, visibility, allowed_roles, host_user_id, vault_owner_id, invitees) = {
+        let sessions = manager.sessions.lock().await;
+        let s = sessions.get(&session_id)?;
+        (
+            s.vault_ids.clone(),
+            s.visibility.clone(),
+            s.allowed_roles.clone(),
+            s.host_user_id,
+            s.vault_owner_id,
+            s.invitees.clone(),
+        )
+    };
+    let authorized = is_authorized_participant(
+        pool,
+        session_id,
+        user_id,
+        host_user_id,
+        &visibility,
+        &vault_ids,
+        &allowed_roles,
+        invite_token,
+        &invitees,
+    )
+    .await;
+    Some(Admission { authorized, host_user_id, vault_owner_id })
+}
+
+const ACCESS_REVOKED_FRAME: &str = r#"{"type":"session_ended","reason":"access_revoked"}"#;
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
@@ -1409,48 +1456,15 @@ async fn handle_socket(
     manager: TerminalManager,
     notifier: crate::sync_notifier::SyncNotifier,
 ) {
-    // Fetch session state from in-memory manager
-    let session_info = {
-        let sessions = manager.sessions.lock().await;
-        sessions.get(&session_id).map(|s| {
-            (
-                s.vault_ids.clone(),
-                s.visibility.clone(),
-                s.allowed_roles.clone(),
-                s.host_user_id,
-                s.vault_owner_id,
-                s.invitees.clone(),
-            )
-        })
+    // Subscribed before admission so a revoke racing this join still triggers a recheck.
+    let access_rx = manager.sessions.lock().await.get(&session_id).map(|s| s.access_changed.subscribe());
+    let (Some(mut access_rx), Some(Admission { authorized, host_user_id, vault_owner_id })) = (
+        access_rx,
+        check_admission(&pool, &manager, session_id, user_id, invite_token.as_deref()).await,
+    ) else {
+        warn!(session_id = %session_id, user_id = %user_id, "WS: session not found");
+        return;
     };
-
-    let (
-        vault_ids,
-        visibility,
-        allowed_roles,
-        host_user_id,
-        vault_owner_id,
-        invitees,
-    ) = match session_info {
-        Some(info) => info,
-        None => {
-            warn!(session_id = %session_id, user_id = %user_id, "WS: session not found");
-            return;
-        }
-    };
-
-    let authorized = is_authorized_participant(
-        &pool,
-        session_id,
-        user_id,
-        host_user_id,
-        &visibility,
-        &vault_ids,
-        &allowed_roles,
-        invite_token.as_deref(),
-        &invitees,
-    )
-    .await;
 
     if !authorized {
         warn!(session_id = %session_id, user_id = %user_id, "WS: unauthorized user rejected");
@@ -1547,25 +1561,44 @@ async fn handle_socket(
 
     info!(session_id = %session_id, user_id = %user_id, "WS participant joined");
 
-    let send_task = {
+    let mut send_task = {
+        let pool = pool.clone();
+        let manager = manager.clone();
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if ws_sender.send(Message::Text(msg)).await.is_err() {
+                tokio::select! {
+                    Ok(()) = access_rx.changed() => {
+                        let admission =
+                            check_admission(&pool, &manager, session_id, user_id, invite_token.as_deref()).await;
+                        if matches!(admission, Some(Admission { authorized: false, .. })) {
+                            info!(session_id = %session_id, user_id = %user_id, "WS participant lost access");
+                            let _ = ws_sender.send(Message::Text(ACCESS_REVOKED_FRAME.to_string())).await;
+                            let _ = ws_sender.send(Message::Close(None)).await;
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(session_id = %session_id, user_id = %user_id, lagged = n, "WS broadcast lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    msg = rx.recv() => match msg {
+                        Ok(msg) => {
+                            if ws_sender.send(Message::Text(msg)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(session_id = %session_id, user_id = %user_id, lagged = n, "WS broadcast lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
                 }
             }
         })
     };
 
-    while let Some(Ok(msg)) = ws_receiver.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = ws_receiver.next() => msg,
+            _ = &mut send_task => break,
+        };
+        let Some(Ok(msg)) = msg else { break };
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => break,
@@ -2998,7 +3031,7 @@ mod tests {
             .await
             .unwrap();
 
-        revoke_grants_for_departed_member(&pool, &manager, mate).await.unwrap();
+        revoke_grants_for_departed_members(&pool, &manager, &[mate]).await.unwrap();
 
         let invitees: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2")
@@ -3437,5 +3470,198 @@ mod tests {
         )
         .await;
         assert!(matches!(res, Err(StatusCode::FORBIDDEN)));
+    }
+}
+
+#[cfg(test)]
+mod live_revoke_tests {
+    use super::*;
+    use crate::permissions::PERM_JOIN_TERMINAL_SESSION;
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, member_with_role, seed_session, seed_team, seed_user, set_user_tier};
+    use axum::{routing::get, Router};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn serve(pool: PgPool, manager: TerminalManager) -> std::net::SocketAddr {
+        let app = Router::new()
+            .route("/v1/terminal-sessions/:id/ws", get(ws_handler))
+            .layer(Extension(manager))
+            .layer(Extension(SyncNotifier::new()))
+            .with_state(pool);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    async fn connect(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid) -> Client {
+        let token = crate::auth::jwt::create_access_token(user, "business", None, false, false, false, true).unwrap();
+        let url = format!("ws://{addr}/v1/terminal-sessions/{session_id}/ws?token={token}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        next_of_type(&mut ws, "participant_list").await.expect("admitted");
+        ws
+    }
+
+    /// Next frame of `kind`, skipping others; `None` once the server closes the socket.
+    async fn next_of_type(ws: &mut Client, kind: &str) -> Option<serde_json::Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(Ok(frame)) = ws.next().await {
+                let WsMessage::Text(text) = frame else { continue };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == kind {
+                    return Some(value);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for a frame")
+    }
+
+    async fn assert_evicted(guest: &mut Client) {
+        let ended = next_of_type(guest, "session_ended").await.expect("evicted guest is told the session ended");
+        assert_eq!(ended["reason"], "access_revoked");
+        assert!(next_of_type(guest, "output").await.is_none(), "the server closes the evicted socket");
+    }
+
+    async fn assert_still_relayed(host: &mut Client, guest: &mut Client) {
+        host.send(WsMessage::Text(r#"{"type":"output","data":"still-here"}"#.into())).await.unwrap();
+        let frame = next_of_type(guest, "output").await.expect("guest keeps receiving output");
+        assert_eq!(frame["data"], "still-here");
+    }
+
+    async fn leave_team(pool: &PgPool, manager: &TerminalManager, team: Uuid, user: Uuid) {
+        sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+            .bind(team)
+            .bind(user)
+            .execute(pool)
+            .await
+            .unwrap();
+        revoke_grants_for_departed_members(pool, manager, &[user]).await.unwrap();
+    }
+
+    /// Host on a Teams plan with a live `direct` session `mate` is invited to.
+    async fn direct_session_with_joined_mate(
+        pool: &PgPool,
+        teams: &[Uuid],
+        host: Uuid,
+        mate: Uuid,
+    ) -> (TerminalManager, Uuid, Client, Client) {
+        set_user_tier(pool, host, "teams").await;
+        for team in teams {
+            add_member(pool, *team, host).await;
+            add_member(pool, *team, mate).await;
+        }
+        let session_id = seed_session(pool, host, "direct").await;
+        let manager = TerminalManager::new();
+        manager.insert_test_session(session_id, host).await;
+        grant_invitee(pool, &SyncNotifier::new(), &manager, &crate::test_support::default_knock_limiter(), session_id, host, mate, "wrapped")
+            .await
+            .unwrap();
+        let addr = serve(pool.clone(), manager.clone()).await;
+        let host_ws = connect(addr, session_id, host).await;
+        let mate_ws = connect(addr, session_id, mate).await;
+        (manager, session_id, host_ws, mate_ws)
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_drops_their_live_socket() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (manager, _, mut host_ws, mut mate_ws) = direct_session_with_joined_mate(&pool, &[team], host, mate).await;
+
+        leave_team(&pool, &manager, team, mate).await;
+
+        assert_evicted(&mut mate_ws).await;
+        let left = next_of_type(&mut host_ws, "participant_left").await.unwrap();
+        assert_eq!(left["user_id"], mate.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_member_who_still_shares_a_team_keeps_their_live_socket() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team_a = seed_team(&pool, host).await;
+        let team_b = seed_team(&pool, host).await;
+        let (manager, _, mut host_ws, mut mate_ws) =
+            direct_session_with_joined_mate(&pool, &[team_a, team_b], host, mate).await;
+
+        leave_team(&pool, &manager, team_a, mate).await;
+
+        assert_still_relayed(&mut host_ws, &mut mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn uninviting_drops_the_live_socket() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (manager, session_id, _host_ws, mut mate_ws) =
+            direct_session_with_joined_mate(&pool, &[team], host, mate).await;
+
+        uninvite_inner(&pool, &manager, session_id, host, mate).await.unwrap();
+
+        assert_evicted(&mut mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_the_only_shared_team_drops_the_live_socket() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (manager, session_id, _host_ws, mut mate_ws) =
+            direct_session_with_joined_mate(&pool, &[team], host, mate).await;
+
+        let res = crate::routes::teams::delete_team(
+            State(pool.clone()),
+            Extension(crate::auth::AuthUser(host)),
+            Extension(SyncNotifier::new()),
+            Extension(manager.clone()),
+            axum::extract::Path(team),
+        )
+        .await;
+        assert!(res.is_ok());
+
+        assert_evicted(&mut mate_ws).await;
+        let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM terminal_session_invitees WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(grants, 0);
+    }
+
+    #[tokio::test]
+    async fn leaving_a_vault_sessions_team_drops_the_live_socket() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        set_user_tier(&pool, host, "teams").await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        let mate = member_with_role(&pool, team, PERM_JOIN_TERMINAL_SESSION).await;
+        let session_id = seed_session(&pool, host, "vault").await;
+        let manager = TerminalManager::new();
+        manager.insert_test_session(session_id, host).await;
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let state = sessions.get_mut(&session_id).unwrap();
+            state.visibility = "vault".to_string();
+            state.vault_ids = vec![team];
+        }
+        let addr = serve(pool.clone(), manager.clone()).await;
+        let _host_ws = connect(addr, session_id, host).await;
+        let mut mate_ws = connect(addr, session_id, mate).await;
+
+        leave_team(&pool, &manager, team, mate).await;
+
+        assert_evicted(&mut mate_ws).await;
     }
 }

@@ -618,7 +618,7 @@ pub async fn remove_member(
     // Best effort, after commit: the membership row is already gone, so a
     // failure here must not fail the request.
     if let Err(e) =
-        crate::routes::terminal::revoke_grants_for_departed_member(&pool, &manager, user_id).await
+        crate::routes::terminal::revoke_grants_for_departed_members(&pool, &manager, &[user_id]).await
     {
         error!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to revoke session invitee grants");
     }
@@ -688,6 +688,7 @@ pub async fn delete_team(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::Extension(manager): axum::Extension<crate::terminal_manager::TerminalManager>,
     Path(team_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     let is_owner = sqlx::query_scalar::<_, bool>(
@@ -721,6 +722,12 @@ pub async fn delete_team(
         .await
         .map_err(|e| { error!(error = %e, team_id = %team_id, "Failed to delete team"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
+    if let Err(e) =
+        crate::routes::terminal::revoke_grants_for_departed_members(&pool, &manager, &member_ids).await
+    {
+        error!(error = %e, team_id = %team_id, "Failed to revoke session invitee grants");
+    }
+
     info!(team_id = %team_id, deleted_by = %auth.0, "Team deleted by owner");
     for member_id in member_ids {
         notifier.notify_membership_changed(member_id, team_id, false);
@@ -740,7 +747,7 @@ pub struct SearchUsersQuery {
 ///   - This constant, spliced via `format!` into `search_users_inner` (below,
 ///     in this file) and into `shares_a_team` (routes::terminal), which share
 ///     its `$2`/`u.id` parameter shape.
-///   - The `NOT EXISTS` in `revoke_grants_for_departed_member`
+///   - The `NOT EXISTS` in `revoke_grants_for_departed_members`
 ///     (routes::terminal) — inlined because it binds only `$1` and needs
 ///     `tsi.invited_by`/`tsi.user_id`, not `$2`/`u.id`.
 ///   - The `connection_name` redaction `CASE` in `listed_sessions`
@@ -3076,7 +3083,7 @@ mod authz_tests {
         .await;
         crate::test_support::point_object(&pool, team, "o-1", Some(set)).await;
 
-        let res = delete_team(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Path(team)).await;
+        let res = delete_team(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Extension(TerminalManager::new()), Path(team)).await;
 
         assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_rule_sets WHERE team_id = $1")

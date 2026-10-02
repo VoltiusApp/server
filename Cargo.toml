@@ -39,3 +39,4 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 [dev-dependencies]
 # `oneshot` for driving middleware through a throwaway Router in authz tests.
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.24"
