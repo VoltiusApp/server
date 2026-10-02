@@ -1,5 +1,5 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use uuid::Uuid;
 use serde::Serialize;
 
@@ -48,6 +48,14 @@ pub struct SessionState {
     /// Ring buffer of recent encrypted output relay messages for late-join replay.
     /// Stored as-is (already encrypted); the server never sees plaintext.
     pub output_history: VecDeque<String>,
+    /// Bumped when someone may have lost access; each attached socket re-runs admission.
+    pub access_changed: watch::Sender<()>,
+}
+
+impl SessionState {
+    pub fn recheck_access(&self) {
+        self.access_changed.send_replace(());
+    }
 }
 
 #[derive(Clone)]
@@ -84,6 +92,7 @@ impl TerminalManager {
                 pending_control_request: None,
                 tx,
                 output_history: VecDeque::new(),
+                access_changed: watch::channel(()).0,
             },
         );
     }
