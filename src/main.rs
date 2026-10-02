@@ -688,6 +688,8 @@ async fn main() {
             post(routes::admin::restore_user),
         )
         .route("/v1/admin/users/:id/ban", post(routes::admin::ban_user))
+        .route("/v1/admin/users/:id/handle", put(routes::admin::set_user_handle))
+        .route("/v1/admin/handles/derive", post(routes::admin::derive_handles))
         .route("/v1/admin/users/:id/unban", post(routes::admin::unban_user))
         .route(
             "/v1/admin/users/:id/extend-trial",
