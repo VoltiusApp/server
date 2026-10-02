@@ -68,6 +68,14 @@ pub async fn require_team_invites(
     deny_unless(features.team_invites, "TEAM_INVITES_DISABLED", req, next).await
 }
 
+pub async fn require_handle_self_service(
+    Extension(features): Extension<Features>,
+    req: Request,
+    next: Next,
+) -> Response {
+    deny_unless(!features.handles_from_email, "HANDLE_MANAGED", req, next).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +151,24 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "REGISTRATION_DISABLED" }));
+    }
+
+    #[tokio::test]
+    async fn handle_lock_names_itself_and_only_when_switched_on() {
+        async fn status(features: Features) -> (StatusCode, serde_json::Value) {
+            let app = Router::new()
+                .route("/handle", post(ok_handler))
+                .layer(from_fn(require_handle_self_service))
+                .layer(Extension(features));
+            let resp = app.oneshot(Request::post("/handle").body(Body::empty()).unwrap()).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+        }
+        assert_eq!(status(Features::open()).await.0, StatusCode::OK);
+        assert_eq!(
+            status(Features { handles_from_email: true, ..Features::open() }).await,
+            (StatusCode::FORBIDDEN, serde_json::json!({ "error": "HANDLE_MANAGED" }))
+        );
     }
 }

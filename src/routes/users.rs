@@ -21,6 +21,48 @@ pub struct ClaimHandleRequest {
     pub handle: String,
 }
 
+pub(crate) async fn set_handle(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    current: &str,
+    handle: &str,
+) -> Result<(), StatusCode> {
+    let retired: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM retired_handles WHERE handle = $1)")
+            .bind(handle)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if retired {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    sqlx::query(
+        "INSERT INTO retired_handles (handle, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(current)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match sqlx::query(
+        "UPDATE users SET handle = $1, handle_is_custom = TRUE, handle_updated_at = now() WHERE id = $2",
+    )
+    .bind(handle)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err(StatusCode::CONFLICT),
+        Err(e) => {
+            error!(error = %e, "Failed to set handle");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// The whole claim, factored out of the axum handler so the tests can drive it
 /// without building a router.
 pub(crate) async fn claim_handle_inner(
@@ -79,43 +121,7 @@ pub(crate) async fn claim_handle_inner(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let retired: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM retired_handles WHERE handle = $1)")
-            .bind(&handle)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if retired {
-        return Err(StatusCode::CONFLICT);
-    }
-
-    sqlx::query(
-        "INSERT INTO retired_handles (handle, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(&current)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let update = sqlx::query(
-        "UPDATE users SET handle = $1, handle_is_custom = TRUE, handle_updated_at = now() WHERE id = $2",
-    )
-    .bind(&handle)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await;
-
-    match update {
-        Ok(_) => {}
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(StatusCode::CONFLICT)
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to claim handle");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
+    set_handle(&mut tx, user_id, &current, &handle).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit handle claim");

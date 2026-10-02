@@ -348,7 +348,11 @@ async fn main() {
             post(routes::auth::resend_verification_email),
         )
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
-        .route("/v1/users/me/handle", put(routes::users::claim_handle))
+        .route(
+            "/v1/users/me/handle",
+            put(routes::users::claim_handle)
+                .layer(middleware::from_fn(features::require_handle_self_service)),
+        )
         .route(
             "/v1/users/me/preferences",
             put(routes::users::update_preferences),
