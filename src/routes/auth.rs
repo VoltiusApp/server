@@ -189,10 +189,23 @@ async fn insert_user_with_handle_fallback(
     }
 }
 
+fn email_delivery_configured() -> bool {
+    !std::env::var("RESEND_API_KEY").unwrap_or_default().is_empty()
+}
+
 pub async fn register(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
     Json(body): Json<RegisterRequest>,
+) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+    register_with(pool, features, email_delivery_configured(), body).await
+}
+
+async fn register_with(
+    pool: PgPool,
+    features: crate::features::Features,
+    delivery_configured: bool,
+    body: RegisterRequest,
 ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
     let email = crate::email::normalize(&body.email);
 
@@ -230,7 +243,7 @@ pub async fn register(
     };
 
     let (handle, handle_is_custom) =
-        crate::handles::registration_handle(&pool, &email, features.handles_from_email)
+        crate::handles::registration_handle(&pool, &email, features.handles_from_email && !delivery_configured)
             .await
             .map_err(|e| {
                 error!(error = %e, "Failed to choose a handle for registration");
@@ -272,10 +285,7 @@ pub async fn register(
         }
     }
 
-    let email_verified = if std::env::var("RESEND_API_KEY")
-        .unwrap_or_default()
-        .is_empty()
-    {
+    let email_verified = if !delivery_configured {
         sqlx::query(
             "UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1",
         )
@@ -524,11 +534,34 @@ pub struct VerifyEmailResponse {
     pub user_id: Uuid,
 }
 
+async fn derive_handle_on_verify(tx: &mut sqlx::PgConnection, user_id: Uuid, email: &str, current: &str) {
+    let Ok(candidate) = crate::handles::derive_handle_candidate(email) else {
+        return;
+    };
+    let Ok(mut savepoint) = sqlx::Acquire::begin(&mut *tx).await else {
+        return;
+    };
+    let free = crate::handles::handle_is_free(&mut *savepoint, &candidate).await;
+    if matches!(free, Ok(true))
+        && crate::routes::users::set_handle(&mut savepoint, user_id, current, &candidate).await.is_ok()
+    {
+        let _ = savepoint.commit().await;
+    }
+}
+
 pub async fn verify_email(
     State(pool): State<PgPool>,
+    axum::Extension(features): axum::Extension<crate::features::Features>,
     Json(body): Json<VerifyEmailRequest>,
 ) -> Result<Json<VerifyEmailResponse>, StatusCode> {
-    let verified = sqlx::query_as::<_, (String, Uuid)>(
+    let db_err = |what: &'static str| {
+        move |e: sqlx::Error| {
+            error!(error = %e, "{what}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    let mut tx = pool.begin().await.map_err(db_err("Failed to begin email verification"))?;
+    let verified = sqlx::query_as::<_, (String, Uuid, String, bool)>(
         "WITH consumed AS (
            UPDATE email_verification_tokens
            SET consumed_at = now()
@@ -539,20 +572,22 @@ pub async fn verify_email(
          SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now())
          FROM consumed
          WHERE users.id = consumed.user_id
-         RETURNING users.email, users.id",
+         RETURNING users.email, users.id, users.handle, users.handle_is_custom",
     )
     .bind(&body.token)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to verify email token");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .map_err(db_err("Failed to verify email token"))?;
 
-    if let Some((email, user_id)) = verified {
+    if let Some((email, user_id, handle, handle_is_custom)) = verified {
+        if features.handles_from_email && !handle_is_custom {
+            derive_handle_on_verify(&mut tx, user_id, &email, &handle).await;
+        }
+        tx.commit().await.map_err(db_err("Failed to commit email verification"))?;
         info!(email = %email, "User email verified");
         return Ok(Json(VerifyEmailResponse { email, user_id }));
     }
+    drop(tx);
 
     let token_status = sqlx::query_as::<_, (DateTime<Utc>, Option<DateTime<Utc>>)>(
         "SELECT expires_at, consumed_at FROM email_verification_tokens WHERE token = $1",
@@ -972,6 +1007,18 @@ mod handler_tests {
 
     fn features(handles_from_email: bool) -> Extension<Features> {
         Extension(Features { handles_from_email, ..Features::open() })
+    }
+
+    fn test_new_user(email: &str) -> NewUser<'_> {
+        NewUser {
+            email,
+            account_id: Uuid::new_v4(),
+            auth_hash: "hash",
+            public_key: None,
+            wrapped_user_secrets: None,
+            tier: "free",
+            trial_ends_at: None,
+        }
     }
 
     async fn handle_row(pool: &PgPool, id: Uuid) -> (String, bool) {
@@ -1506,24 +1553,11 @@ mod handler_tests {
             .await
             .unwrap();
         let email = format!("{}@race.test", Uuid::new_v4());
-        let new_user = NewUser {
-            email: &email,
-            account_id: Uuid::new_v4(),
-            auth_hash: "hash",
-            public_key: None,
-            wrapped_user_secrets: None,
-            tier: "free",
-            trial_ends_at: None,
-        };
+        let new_user = test_new_user(&email);
         let id = insert_user_with_handle_fallback(&pool, &new_user, &taken.to_uppercase(), true)
             .await
             .unwrap();
-        let (handle, custom): (String, bool) =
-            sqlx::query_as("SELECT handle, handle_is_custom FROM users WHERE id = $1")
-                .bind(id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (handle, custom) = handle_row(&pool, id).await;
         assert_ne!(handle.to_lowercase(), taken.to_lowercase());
         assert!(!custom);
     }
@@ -1537,18 +1571,62 @@ mod handler_tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let new_user = NewUser {
-            email: &email,
-            account_id: Uuid::new_v4(),
-            auth_hash: "hash",
-            public_key: None,
-            wrapped_user_secrets: None,
-            tier: "free",
-            trial_ends_at: None,
-        };
+        let new_user = test_new_user(&email);
         let err = insert_user_with_handle_fallback(&pool, &new_user, "fresh-handle-xyz", false)
             .await
             .unwrap_err();
         assert!(is_email_taken(&err));
+    }
+
+    async fn registered_unverified(pool: &PgPool, switch: bool, email: &str) -> (Uuid, String) {
+        let (_, Json(resp)) = register_with(pool.clone(), features(switch).0, true, register_req(email, Uuid::new_v4(), None))
+            .await
+            .unwrap();
+        let token = sqlx::query_scalar("SELECT token FROM email_verification_tokens WHERE user_id = $1")
+            .bind(resp.user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (resp.user_id, token)
+    }
+
+    async fn verify(pool: &PgPool, switch: bool, token: String) {
+        let _ = verify_email(State(pool.clone()), features(switch), Json(VerifyEmailRequest { token })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn derivation_waits_for_email_verification_when_delivery_is_configured() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jv");
+        let (id, token) = registered_unverified(&pool, true, &format!("{local}@corp.test")).await;
+        let (before, custom) = handle_row(&pool, id).await;
+        assert_ne!(before, local);
+        assert!(!custom);
+        verify(&pool, true, token).await;
+        assert_eq!(handle_row(&pool, id).await, (local, true));
+    }
+
+    #[tokio::test]
+    async fn verification_never_touches_a_custom_handle_or_renames_with_the_switch_off() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let custom_local = unique_handle("jc");
+        let (custom_id, custom_token) = registered_unverified(&pool, true, &format!("{custom_local}@corp.test")).await;
+        let mine = unique_handle("mine");
+        sqlx::query("UPDATE users SET handle = $1, handle_is_custom = TRUE WHERE id = $2")
+            .bind(&mine)
+            .bind(custom_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        verify(&pool, true, custom_token).await;
+        assert_eq!(handle_row(&pool, custom_id).await, (mine, true));
+
+        let off_local = unique_handle("jo");
+        let (off_id, off_token) = registered_unverified(&pool, false, &format!("{off_local}@corp.test")).await;
+        let (generated, _) = handle_row(&pool, off_id).await;
+        verify(&pool, false, off_token).await;
+        assert_eq!(handle_row(&pool, off_id).await, (generated, false));
     }
 }

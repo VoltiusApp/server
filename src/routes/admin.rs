@@ -829,7 +829,8 @@ pub struct DeriveRow {
 
 pub(crate) async fn derive_handles_for(
     pool: &PgPool,
-    users: Vec<(Uuid, String, String)>,
+    admin_email: &str,
+    users: Vec<(Uuid, String, String, bool)>,
     dry_run: bool,
 ) -> Result<Vec<DeriveRow>, StatusCode> {
     use crate::handles::{derive_handle_candidate, handle_is_free, HandleError};
@@ -840,23 +841,46 @@ pub(crate) async fn derive_handles_for(
     let mut claimed = std::collections::HashSet::new();
     let mut rows = Vec::with_capacity(users.len());
 
-    for (user_id, email, old) in users {
-        let (new, mut reason) = match derive_handle_candidate(&email) {
-            Err(HandleError::Reserved) => (None, "reserved"),
-            Err(_) => (None, "invalid"),
-            Ok(c) if c == old => (Some(c), "already"),
-            Ok(c) if claimed.contains(&c) || !handle_is_free(pool, &c).await.map_err(db_err)? => (Some(c), "conflict"),
-            Ok(c) => (Some(c), "ok"),
+    for (user_id, email, old, verified) in users {
+        let (new, mut reason) = if !verified {
+            (None, "unverified")
+        } else {
+            match derive_handle_candidate(&email) {
+                Err(HandleError::Reserved) => (None, "reserved"),
+                Err(_) => (None, "invalid"),
+                Ok(c) if c == old => (Some(c), "already"),
+                Ok(c) if claimed.contains(&c) || !handle_is_free(pool, &c).await.map_err(db_err)? => (Some(c), "conflict"),
+                Ok(c) => (Some(c), "ok"),
+            }
         };
         if reason == "ok" {
             let candidate = new.clone().unwrap_or_default();
             claimed.insert(candidate.clone());
             if !dry_run {
                 let mut tx = pool.begin().await.map_err(db_err)?;
-                match crate::routes::users::set_handle(&mut tx, user_id, &old, &candidate).await {
-                    Ok(()) => tx.commit().await.map_err(db_err)?,
-                    Err(StatusCode::CONFLICT) => reason = "conflict",
-                    Err(status) => return Err(status),
+                let live: Option<String> = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1 FOR UPDATE")
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                if live.as_deref() != Some(old.as_str()) {
+                    reason = if live.as_deref() == Some(candidate.as_str()) { "already" } else { "conflict" };
+                } else {
+                    match crate::routes::users::set_handle(&mut tx, user_id, &old, &candidate).await {
+                        Ok(()) => {
+                            tx.commit().await.map_err(db_err)?;
+                            write_audit(
+                                pool,
+                                admin_email,
+                                Some(user_id),
+                                "set_handle",
+                                json!({ "old": old, "new": candidate, "via": "derive" }),
+                            )
+                            .await;
+                        }
+                        Err(StatusCode::CONFLICT) => reason = "conflict",
+                        Err(status) => return Err(status),
+                    }
                 }
             }
         }
@@ -874,8 +898,8 @@ pub async fn derive_handles(
     if !features.handles_from_email {
         return Err(StatusCode::CONFLICT);
     }
-    let users: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, email, handle FROM users WHERE deleted_at IS NULL ORDER BY created_at, id",
+    let users: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
+        "SELECT id, email, handle, email_verified FROM users WHERE deleted_at IS NULL ORDER BY created_at, id",
     )
     .fetch_all(&pool)
     .await
@@ -884,7 +908,7 @@ pub async fn derive_handles(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let rows = derive_handles_for(&pool, users, body.dry_run).await?;
+    let rows = derive_handles_for(&pool, &admin_email, users, body.dry_run).await?;
     if !body.dry_run {
         let applied = rows.iter().filter(|r| r.reason == "ok").count();
         write_audit(&pool, &admin_email, None, "derive_handles", json!({ "applied": applied })).await;
@@ -2150,12 +2174,7 @@ mod admin_handler_tests {
             .execute(pool)
             .await
             .unwrap();
-        let handle: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        (id, handle)
+        (id, handle_of(pool, id).await)
     }
 
     async fn handle_of(pool: &PgPool, id: Uuid) -> String {
@@ -2204,13 +2223,13 @@ mod admin_handler_tests {
         sqlx::query("UPDATE users SET handle = $1 WHERE id = $2").bind(&mine).bind(already).execute(&pool).await.unwrap();
 
         let users = vec![
-            (first, format!("{local}@a.test"), first_old.clone()),
-            (second, format!("{local}@b.test"), second_old.clone()),
-            (reserved, "admin@corp.test".into(), handle_of(&pool, reserved).await),
-            (short, "jn@corp.test".into(), handle_of(&pool, short).await),
-            (already, format!("{mine}@corp.test"), mine.clone()),
+            (first, format!("{local}@a.test"), first_old.clone(), true),
+            (second, format!("{local}@b.test"), second_old.clone(), true),
+            (reserved, "admin@corp.test".into(), handle_of(&pool, reserved).await, true),
+            (short, "jn@corp.test".into(), handle_of(&pool, short).await, true),
+            (already, format!("{mine}@corp.test"), mine.clone(), true),
         ];
-        let rows = derive_handles_for(&pool, users.clone(), true).await.unwrap();
+        let rows = derive_handles_for(&pool, "admin@test.local", users.clone(), true).await.unwrap();
         let reasons: Vec<_> = rows.iter().map(|r| (r.user_id, r.reason, r.new.clone())).collect();
         assert_eq!(reasons, vec![
             (first, "ok", Some(local.clone())),
@@ -2221,7 +2240,7 @@ mod admin_handler_tests {
         ]);
         assert_eq!(handle_of(&pool, first).await, first_old, "dry run must not write");
 
-        let applied = derive_handles_for(&pool, users, false).await.unwrap();
+        let applied = derive_handles_for(&pool, "admin@test.local", users, false).await.unwrap();
         assert_eq!(applied[0].reason, "ok");
         assert_eq!(handle_of(&pool, first).await, local);
         assert_eq!(handle_of(&pool, second).await, second_old);
@@ -2239,5 +2258,44 @@ mod admin_handler_tests {
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::CONFLICT));
+    }
+
+    async fn set_handle_audits(pool: &PgPool, id: Uuid) -> Vec<Value> {
+        sqlx::query_scalar("SELECT detail FROM admin_audit_log WHERE target_id = $1 AND action = 'set_handle'")
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn derive_never_renames_unverified_emails_and_audits_each_rename() {
+        let pool = test_pool_or_skip!();
+        let ok_local = unique_handle("vf");
+        let un_local = unique_handle("uv");
+        let (ok, ok_old) = user_with_email(&pool, &format!("{ok_local}@corp.test")).await;
+        let (unverified, un_old) = user_with_email(&pool, &format!("{un_local}@corp.test")).await;
+        let users = vec![
+            (ok, format!("{ok_local}@corp.test"), ok_old.clone(), true),
+            (unverified, format!("{un_local}@corp.test"), un_old.clone(), false),
+        ];
+        let rows = derive_handles_for(&pool, "admin@test.local", users, false).await.unwrap();
+        assert_eq!((rows[0].reason, rows[0].new.clone()), ("ok", Some(ok_local.clone())));
+        assert_eq!((rows[1].reason, rows[1].new.clone()), ("unverified", None));
+        assert_eq!(handle_of(&pool, unverified).await, un_old);
+        assert_eq!(set_handle_audits(&pool, ok).await, vec![json!({ "old": ok_old, "new": ok_local, "via": "derive" })]);
+        assert!(set_handle_audits(&pool, unverified).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn derive_skips_a_user_whose_handle_changed_since_the_snapshot() {
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("st");
+        let (id, current) = user_with_email(&pool, &format!("{local}@corp.test")).await;
+        let users = vec![(id, format!("{local}@corp.test"), "stale-snapshot-handle".to_string(), true)];
+        let rows = derive_handles_for(&pool, "admin@test.local", users, false).await.unwrap();
+        assert_eq!(rows[0].reason, "conflict");
+        assert_eq!(handle_of(&pool, id).await, current);
+        assert!(set_handle_audits(&pool, id).await.is_empty());
     }
 }

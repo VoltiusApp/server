@@ -121,14 +121,16 @@ pub fn generate_handle() -> String {
 /// Returns the DB error rather than panicking, so a transient hiccup here maps
 /// to the same controlled response as the `INSERT` that follows it.
 pub async fn generate_unique_handle(pool: &sqlx::PgPool) -> Result<String, sqlx::Error> {
+    generate_unique_handle_with(pool, generate_handle).await
+}
+
+async fn generate_unique_handle_with(
+    pool: &sqlx::PgPool,
+    mut next: impl FnMut() -> String,
+) -> Result<String, sqlx::Error> {
     loop {
-        let candidate = generate_handle();
-        let taken: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE lower(handle) = $1)")
-                .bind(&candidate)
-                .fetch_one(pool)
-                .await?;
-        if !taken {
+        let candidate = next();
+        if handle_is_free(pool, &candidate).await? {
             return Ok(candidate);
         }
     }
@@ -199,13 +201,13 @@ pub fn derive_handle_candidate(email: &str) -> Result<String, HandleError> {
     validate_custom_handle(&local.replace('.', "-"))
 }
 
-pub async fn handle_is_free(pool: &sqlx::PgPool, handle: &str) -> Result<bool, sqlx::Error> {
+pub async fn handle_is_free<'e>(db: impl sqlx::PgExecutor<'e>, handle: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT NOT EXISTS(SELECT 1 FROM users WHERE lower(handle) = $1)
             AND NOT EXISTS(SELECT 1 FROM retired_handles WHERE handle = $1)",
     )
     .bind(handle)
-    .fetch_one(pool)
+    .fetch_one(db)
     .await
 }
 
@@ -339,5 +341,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dupes, 0);
+    }
+
+    #[tokio::test]
+    async fn generated_handles_skip_retired_ones() {
+        let pool = crate::test_pool_or_skip!();
+        let user = crate::test_support::seed_user(&pool).await;
+        let retired = crate::test_support::unique_handle("rt");
+        sqlx::query("INSERT INTO retired_handles (handle, user_id) VALUES ($1, $2)")
+            .bind(&retired)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fresh = crate::test_support::unique_handle("fr");
+        let mut queue = vec![fresh.clone(), retired];
+        let got = generate_unique_handle_with(&pool, || queue.pop().unwrap()).await.unwrap();
+        assert_eq!(got, fresh);
     }
 }
