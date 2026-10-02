@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -106,64 +106,44 @@ pub(crate) async fn admit_member(
     Ok(())
 }
 
-// ─── Accept invitation (authed) ───────────────────────────────────────────────
+#[derive(sqlx::FromRow)]
+pub(crate) struct PendingInvitation {
+    id: Uuid,
+    team_id: Uuid,
+    email: String,
+    role: String,
+    invited_by: Option<Uuid>,
+    member_name: Option<String>,
+}
 
-pub async fn accept_invitation(
-    State(pool): State<PgPool>,
-    axum::Extension(auth): axum::Extension<AuthUser>,
-    axum::Extension(notifier): axum::Extension<SyncNotifier>,
-    axum::extract::Path(token): axum::extract::Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<Uuid>, Option<String>)>(
-        r#"SELECT pi.id, pi.team_id, pi.email, pi.role, pi.invited_by, pi.member_name
-           FROM pending_invitations pi
-           WHERE pi.token = $1
-             AND pi.accepted_at IS NULL
-             AND pi.expires_at > now()"#,
-    )
-    .bind(&token)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch invitation for acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
-        warn!("Invitation not found or expired: {token}");
-        StatusCode::NOT_FOUND
-    })?;
+pub(crate) const PENDING_INVITATION_COLUMNS: &str = "id, team_id, email, role, invited_by, member_name";
 
-    let (invitation_id, team_id, invited_email, role, invited_by, member_name) = row;
-
-    let user_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
-        .bind(auth.0)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to fetch accepting user email");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    if user_email.to_lowercase() != invited_email.to_lowercase() {
-        warn!(
-            user_id = %auth.0,
-            user_email = %user_email,
-            invited_email = %invited_email,
-            "Email mismatch on invitation acceptance"
-        );
-        return Err(StatusCode::FORBIDDEN);
-    }
-
+/// Every acceptance path ends here, so none can skip the audit row or the team fan-out.
+pub(crate) async fn accept_pending_invitation(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    invitation: &PendingInvitation,
+    user_id: Uuid,
+    user_email: Option<String>,
+    via: &str,
+) -> Result<(), StatusCode> {
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for invitation acceptance");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    admit_member(&mut tx, team_id, auth.0, invited_by, &role, member_name.as_deref()).await?;
+    admit_member(
+        &mut tx,
+        invitation.team_id,
+        user_id,
+        invitation.invited_by,
+        &invitation.role,
+        invitation.member_name.as_deref(),
+    )
+    .await?;
 
-    // Mark invitation accepted
     sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
-        .bind(invitation_id)
+        .bind(invitation.id)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -176,19 +156,87 @@ pub async fn accept_invitation(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!(user_id = %auth.0, team_id = %team_id, role = %role, "Invitation accepted");
-    tokio::spawn(write_audit_event(
+    info!(user_id = %user_id, team_id = %invitation.team_id, role = %invitation.role, via, "Invitation accepted");
+    announce_member_joined(
+        pool,
+        notifier,
+        invitation.team_id,
+        user_id,
+        user_email,
+        json!({ "role": invitation.role, "via": via }),
+    )
+    .await;
+    Ok(())
+}
+
+/// `team_members:<team_id>` is what makes an online key-holder wrap the vault key for the joiner.
+pub(crate) async fn announce_member_joined(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    team_id: Uuid,
+    user_id: Uuid,
+    target_name: Option<String>,
+    metadata: Value,
+) {
+    write_audit_event(
         pool.clone(),
         team_id,
-        auth.0,
+        user_id,
         "member.joined",
         Some("user"),
-        Some(auth.0.to_string()),
-        Some(user_email.clone()),
-        Some(json!({ "role": role, "via": "invitation" })),
-    ));
-    notifier.notify_membership_changed(auth.0, team_id, true);
-    notify_team_members_changed(&pool, &notifier, team_id).await;
+        Some(user_id.to_string()),
+        target_name,
+        Some(metadata),
+    )
+    .await;
+    notifier.notify_membership_changed(user_id, team_id, true);
+    notify_team_members_changed(pool, notifier, team_id).await;
+}
+
+// ─── Accept invitation (authed) ───────────────────────────────────────────────
+
+pub async fn accept_invitation(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let invitation = sqlx::query_as::<_, PendingInvitation>(&format!(
+        "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
+         WHERE token = $1 AND accepted_at IS NULL AND expires_at > now()"
+    ))
+    .bind(&token)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to fetch invitation for acceptance");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or_else(|| {
+        warn!("Invitation not found or expired: {token}");
+        StatusCode::NOT_FOUND
+    })?;
+
+    let user_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
+        .bind(auth.0)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to fetch accepting user email");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if user_email.to_lowercase() != invitation.email.to_lowercase() {
+        warn!(
+            user_id = %auth.0,
+            user_email = %user_email,
+            invited_email = %invitation.email,
+            "Email mismatch on invitation acceptance"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    accept_pending_invitation(&pool, &notifier, &invitation, auth.0, Some(user_email), "invitation").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -244,11 +292,10 @@ pub async fn accept_my_pending_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(invitation_id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<String>)>(
-        r#"SELECT team_id, role, invited_by, member_name FROM pending_invitations
-           WHERE id = $1 AND user_id = $2
-             AND accepted_at IS NULL AND expires_at > now()"#,
-    )
+    let invitation = sqlx::query_as::<_, PendingInvitation>(&format!(
+        "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
+         WHERE id = $1 AND user_id = $2 AND accepted_at IS NULL AND expires_at > now()"
+    ))
     .bind(invitation_id)
     .bind(auth.0)
     .fetch_optional(&pool)
@@ -262,29 +309,6 @@ pub async fn accept_my_pending_invitation(
         StatusCode::NOT_FOUND
     })?;
 
-    let (team_id, role, invited_by, member_name) = row;
-
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!(error = %e, "Failed to begin transaction for invitation acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    admit_member(&mut tx, team_id, auth.0, invited_by, &role, member_name.as_deref()).await?;
-
-    sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
-        .bind(invitation_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to mark invitation accepted");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    tx.commit().await.map_err(|e| {
-        error!(error = %e, "Failed to commit invitation acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     let user_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
         .bind(auth.0)
         .fetch_optional(&pool)
@@ -292,19 +316,7 @@ pub async fn accept_my_pending_invitation(
         .ok()
         .flatten();
 
-    info!(user_id = %auth.0, team_id = %team_id, role = %role, "Pending invitation accepted in-app");
-    tokio::spawn(write_audit_event(
-        pool.clone(),
-        team_id,
-        auth.0,
-        "member.joined",
-        Some("user"),
-        Some(auth.0.to_string()),
-        user_email,
-        Some(json!({ "role": role, "via": "in_app_invite" })),
-    ));
-    notifier.notify_membership_changed(auth.0, team_id, true);
-    notify_team_members_changed(&pool, &notifier, team_id).await;
+    accept_pending_invitation(&pool, &notifier, &invitation, auth.0, user_email, "in_app_invite").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

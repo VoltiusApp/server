@@ -257,6 +257,7 @@ async fn main() {
     // Register — stricter limit: 5/day per IP on top of the general auth 10/min
     let register_route = Router::new()
         .route("/v1/auth/register", post(routes::auth::register))
+        .layer(Extension(notifier.clone()))
         .layer(middleware::from_fn(rate_limit::register_rate_limit))
         .layer(Extension(register_limiter))
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))

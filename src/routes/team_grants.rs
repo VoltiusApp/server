@@ -24,7 +24,7 @@ use crate::auth::AuthUser;
 use crate::permissions::{require_all_team_permissions, PERM_INVITE_MEMBERS};
 use crate::rate_limit::{check_user_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
 use crate::routes::audit::write_audit_event;
-use crate::routes::invitations::admit_member;
+use crate::routes::invitations::{admit_member, announce_member_joined};
 use crate::routes::teams::{ensure_seat_available, notify_team_members_changed, team_owner};
 use crate::sync_notifier::SyncNotifier;
 use crate::team_join_grants::{self as grants, GrantRejection, GrantRow};
@@ -370,23 +370,15 @@ pub async fn redeem_grant(
         .unwrap_or(None);
 
     info!(user_id = %auth.0, team_id = %locked.team_id, role = %locked.role, "Team joined via join grant");
-    write_audit_event(
-        pool.clone(),
+    announce_member_joined(
+        &pool,
+        &notifier,
         locked.team_id,
         auth.0,
-        "member.joined",
-        Some("user"),
-        Some(auth.0.to_string()),
         joiner_handle,
-        Some(json!({ "role": locked.role, "via": "join_grant", "grant_id": grant_id })),
+        json!({ "role": locked.role, "via": "join_grant", "grant_id": grant_id }),
     )
     .await;
-
-    // The joiner's own devices refetch their team list; every member — the
-    // joiner included — gets `team_members:<team_id>`, which is the event an
-    // online key-holder's reconcileTeamVaultKeys listens for.
-    notifier.notify_membership_changed(auth.0, locked.team_id, true);
-    notify_team_members_changed(&pool, &notifier, locked.team_id).await;
 
     Ok(Json(response))
 }
