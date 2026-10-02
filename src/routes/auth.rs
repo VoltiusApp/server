@@ -139,6 +139,7 @@ pub struct AuthResponse {
 
 pub async fn register(
     State(pool): State<PgPool>,
+    axum::Extension(features): axum::Extension<crate::features::Features>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
     let email = crate::email::normalize(&body.email);
@@ -176,16 +177,17 @@ pub async fn register(
         ("pro", Some(Utc::now() + Duration::days(14)))
     };
 
-    let handle = crate::handles::generate_unique_handle(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to generate a handle for registration");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let (handle, handle_is_custom) =
+        crate::handles::registration_handle(&pool, &email, features.handles_from_email)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to choose a handle for registration");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle, handle_is_custom)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(&email)
     .bind(body.account_id)
@@ -195,6 +197,7 @@ pub async fn register(
     .bind(initial_tier)
     .bind(trial_ends_at)
     .bind(&handle)
+    .bind(handle_is_custom)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
@@ -871,6 +874,7 @@ mod handler_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{seed_user_with_credentials, set_user_tier, set_user_trial};
     use axum::extract::State;
+    use axum::Extension;
 
     #[allow(dead_code)]
     struct EnvGuard(crate::test_support::BillingMode);
@@ -909,6 +913,81 @@ mod handler_tests {
 
     // ── register ──────────────────────────────────────────────────────────────
 
+    use crate::features::Features;
+    use crate::test_support::unique_handle;
+
+    fn features(handles_from_email: bool) -> Extension<Features> {
+        Extension(Features { handles_from_email, ..Features::open() })
+    }
+
+    async fn handle_row(pool: &PgPool, id: Uuid) -> (String, bool) {
+        sqlx::query_as("SELECT handle, handle_is_custom FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn register_derives_the_handle_when_switched_on() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jn");
+        let email = format!("{local}@corp.test");
+        let (_, Json(resp)) = register(State(pool.clone()), features(true), Json(register_req(&email, Uuid::new_v4(), None)))
+            .await
+            .unwrap();
+        assert_eq!(handle_row(&pool, resp.user_id).await, (local, true));
+    }
+
+    #[tokio::test]
+    async fn register_falls_back_when_the_derived_handle_is_taken_or_retired() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jn");
+        let first = register(State(pool.clone()), features(true), Json(register_req(&format!("{local}@a.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap()
+            .1
+             .0;
+        let second = register(State(pool.clone()), features(true), Json(register_req(&format!("{local}@b.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap()
+            .1
+             .0;
+        assert_eq!(handle_row(&pool, first.user_id).await.0, local);
+        let (h2, custom2) = handle_row(&pool, second.user_id).await;
+        assert_ne!(h2, local);
+        assert!(!custom2, "a fallback is a generated handle");
+
+        let retired = unique_handle("jr");
+        sqlx::query("INSERT INTO retired_handles (handle, user_id) VALUES ($1, $2)")
+            .bind(&retired)
+            .bind(first.user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let third = register(State(pool.clone()), features(true), Json(register_req(&format!("{retired}@c.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap()
+            .1
+             .0;
+        assert_ne!(handle_row(&pool, third.user_id).await.0, retired);
+    }
+
+    #[tokio::test]
+    async fn register_generates_when_switched_off() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jn");
+        let (_, Json(resp)) = register(State(pool.clone()), features(false), Json(register_req(&format!("{local}@corp.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap();
+        let (h, custom) = handle_row(&pool, resp.user_id).await;
+        assert_ne!(h, local);
+        assert!(!custom);
+    }
+
     #[tokio::test]
     async fn register_self_hosted_grants_business_no_trial() {
         let _env = EnvGuard::new(true);
@@ -916,7 +995,7 @@ mod handler_tests {
         let account_id = Uuid::new_v4();
         let email = format!("{}@ex.test", Uuid::new_v4());
 
-        let (status, Json(resp)) = register(State(pool.clone()), Json(register_req(&email, account_id, None)))
+        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, None)))
             .await
             .expect("register ok");
 
@@ -941,7 +1020,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
         let before = Utc::now().timestamp();
 
-        let (status, Json(resp)) = register(State(pool.clone()), Json(register_req(&email, account_id, None)))
+        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, None)))
             .await
             .expect("register ok");
 
@@ -975,7 +1054,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
 
         let (status, Json(resp)) =
-            register(State(pool.clone()), Json(register_req(&email, account_id, Some(&fp))))
+            register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, Some(&fp))))
                 .await
                 .expect("register ok");
 
@@ -995,6 +1074,7 @@ mod handler_tests {
 
         let (status, _) = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1003,6 +1083,7 @@ mod handler_tests {
 
         match register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1190,6 +1271,7 @@ mod handler_tests {
 
         let (_, Json(resp)) = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&typed, Uuid::new_v4(), None)),
         )
         .await
@@ -1211,6 +1293,7 @@ mod handler_tests {
         let email = format!("case.{}@ex.test", Uuid::new_v4());
         let _ = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, account_id, None)),
         )
         .await
@@ -1236,6 +1319,7 @@ mod handler_tests {
 
         let _ = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1243,6 +1327,7 @@ mod handler_tests {
 
         match register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email.to_uppercase(), Uuid::new_v4(), None)),
         )
         .await

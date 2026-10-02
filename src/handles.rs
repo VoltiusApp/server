@@ -193,9 +193,59 @@ pub fn validate_custom_handle(input: &str) -> Result<String, HandleError> {
     Ok(handle)
 }
 
+pub fn derive_handle_candidate(email: &str) -> Result<String, HandleError> {
+    let local = email.split('@').next().unwrap_or_default();
+    let local = local.split('+').next().unwrap_or_default();
+    validate_custom_handle(&local.replace('.', "-"))
+}
+
+pub async fn handle_is_free(pool: &sqlx::PgPool, handle: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM users WHERE lower(handle) = $1)
+            AND NOT EXISTS(SELECT 1 FROM retired_handles WHERE handle = $1)",
+    )
+    .bind(handle)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn registration_handle(
+    pool: &sqlx::PgPool,
+    email: &str,
+    from_email: bool,
+) -> Result<(String, bool), sqlx::Error> {
+    if from_email {
+        if let Ok(candidate) = derive_handle_candidate(email) {
+            if handle_is_free(pool, &candidate).await? {
+                return Ok((candidate, true));
+            }
+        }
+    }
+    Ok((generate_unique_handle(pool).await?, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derives_from_the_local_part() {
+        assert_eq!(derive_handle_candidate("jnovak@corp.cz"), Ok("jnovak".into()));
+        assert_eq!(derive_handle_candidate("JNovak@corp.cz"), Ok("jnovak".into()));
+        assert_eq!(derive_handle_candidate("jan.novak+voltius@corp.cz"), Ok("jan-novak".into()));
+        assert_eq!(derive_handle_candidate("jan_novak@corp.cz"), Ok("jan_novak".into()));
+    }
+
+    #[test]
+    fn derivation_failures_are_typed_not_panics() {
+        assert_eq!(derive_handle_candidate("jn@corp.cz"), Err(HandleError::TooShort));
+        assert_eq!(derive_handle_candidate(".jan@corp.cz"), Err(HandleError::EdgeSeparator));
+        assert_eq!(derive_handle_candidate("jan.@corp.cz"), Err(HandleError::EdgeSeparator));
+        assert_eq!(derive_handle_candidate("jiří@corp.cz"), Err(HandleError::Charset));
+        assert_eq!(derive_handle_candidate("admin@corp.cz"), Err(HandleError::Reserved));
+        assert_eq!(derive_handle_candidate("not-an-email"), Ok("not-an-email".into()));
+        assert_eq!(derive_handle_candidate("@corp.cz"), Err(HandleError::TooShort));
+    }
 
     #[test]
     fn generated_handles_match_the_advertised_shape() {

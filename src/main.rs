@@ -250,6 +250,7 @@ async fn main() {
     tracing::info!(
         registration = features.registration,
         team_invites = features.team_invites,
+        handles_from_email = features.handles_from_email,
         "Configured features"
     );
 
