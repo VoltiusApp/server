@@ -363,7 +363,7 @@ pub async fn upsert_object(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -446,7 +446,7 @@ pub async fn reencrypt_objects(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -540,7 +540,7 @@ pub async fn reencrypt_secrets(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -597,7 +597,7 @@ pub async fn delete_object(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -769,7 +769,7 @@ pub async fn upsert_secret(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -823,7 +823,7 @@ pub async fn delete_secret(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

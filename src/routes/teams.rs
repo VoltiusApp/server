@@ -12,26 +12,8 @@ use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
 
-async fn notify_team_members(
-    pool: &PgPool,
-    notifier: &SyncNotifier,
-    team_id: Uuid,
-    payload: String,
-) {
-    let member_ids: Vec<Uuid> =
-        sqlx::query_scalar("SELECT user_id FROM team_members WHERE team_id = $1")
-            .bind(team_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-
-    for member_id in member_ids {
-        notifier.notify(member_id, payload.clone());
-    }
-}
-
 pub(crate) async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
-    notify_team_members(pool, notifier, team_id, format!("team_members:{team_id}")).await;
+    crate::sync_notifier::notify_team(pool, notifier, team_id, format!("team_members:{team_id}")).await;
 }
 
 // ─── Team owner and seat helpers ──────────────────────────────────────────────

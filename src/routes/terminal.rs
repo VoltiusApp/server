@@ -655,7 +655,7 @@ pub async fn create_session(
     // Notified last: a recipient acting on the push before its wrapped key row
     // lands gets a 404 from get_my_session_key.
     if !body.vault_ids.is_empty() {
-        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, auth.0, |recipient| {
+        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, Some(auth.0), |recipient| {
             notifier.notify_session_shared(recipient, session_id, auth.0);
         })
         .await;
@@ -1098,7 +1098,7 @@ async fn session_end_recipients(
             })?;
 
     let mut recipients = std::collections::HashSet::new();
-    crate::sync_notifier::notify_team_members(pool, &team_ids, host_user_id, |member_id| {
+    crate::sync_notifier::notify_team_members(pool, &team_ids, Some(host_user_id), |member_id| {
         recipients.insert(member_id);
     })
     .await;

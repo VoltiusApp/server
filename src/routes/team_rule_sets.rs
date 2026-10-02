@@ -229,7 +229,7 @@ pub async fn put_rule_set(
         .bind(set_id).execute(&mut *tx).await.map_err(|e| internal(e, "clear entries"))?;
     insert_entries(&mut tx, set_id, &entries).await?;
     tx.commit().await.map_err(|e| internal(e, "commit put"))?;
-    notify_team_vault_changed(&pool, &sync_notifier, team_id, auth.0).await;
+    notify_team_vault_changed(&pool, &sync_notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
