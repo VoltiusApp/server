@@ -392,6 +392,8 @@ pub struct AddMemberRequest {
     pub email: Option<String>,
     pub user_id: Option<Uuid>,
     pub role: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 pub async fn add_member(
@@ -409,6 +411,8 @@ pub async fn add_member(
         warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to invite members");
         return Err(StatusCode::FORBIDDEN);
     }
+
+    let member_name = crate::routes::member_names::invite_member_name(&pool, team_id, auth.0, body.name.as_deref()).await?;
 
     let invitee_id: Uuid = if let Some(uid) = body.user_id {
         let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
@@ -464,24 +468,15 @@ pub async fn add_member(
     .await
     .map_err(|e| { error!(error = %e, "Failed to fetch invitee"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    sqlx::query(
-        "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (team_id, email) DO UPDATE
-           SET user_id = EXCLUDED.user_id,
-               role = EXCLUDED.role,
-               invited_by = EXCLUDED.invited_by,
-               expires_at = now() + INTERVAL '7 days',
-               accepted_at = NULL",
-    )
-    .bind(team_id)
-    .bind(invitee_id)
-    .bind(&invitee_email)
-    .bind(&role_name)
-    .bind(auth.0)
-    .execute(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to create pending invitation"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    upsert_pending_invitation(&pool, PendingInvite {
+        team_id,
+        user_id: Some(invitee_id),
+        email: &invitee_email,
+        role: &role_name,
+        invited_by: auth.0,
+        member_name: member_name.as_deref(),
+    })
+    .await?;
 
     info!(team_id = %team_id, invitee_id = %invitee_id, role = %role_name, "Pending invitation created for existing user");
     tokio::spawn(write_audit_event(
@@ -1561,12 +1556,51 @@ pub async fn set_member_permissions(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(crate) struct PendingInvite<'a> {
+    pub team_id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub email: &'a str,
+    pub role: &'a str,
+    pub invited_by: Uuid,
+    pub member_name: Option<&'a str>,
+}
+
+// COALESCE keeps a name an admin set when someone without Manage members re-sends the invite.
+pub(crate) async fn upsert_pending_invitation(pool: &PgPool, invite: PendingInvite<'_>) -> Result<String, StatusCode> {
+    sqlx::query_scalar(
+        "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by, member_name)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (team_id, email) DO UPDATE
+           SET user_id = COALESCE(EXCLUDED.user_id, pending_invitations.user_id),
+               role = EXCLUDED.role,
+               invited_by = EXCLUDED.invited_by,
+               member_name = COALESCE(EXCLUDED.member_name, pending_invitations.member_name),
+               expires_at = now() + INTERVAL '7 days',
+               accepted_at = NULL
+         RETURNING token",
+    )
+    .bind(invite.team_id)
+    .bind(invite.user_id)
+    .bind(invite.email)
+    .bind(invite.role)
+    .bind(invite.invited_by)
+    .bind(invite.member_name)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to upsert pending invitation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 // ─── Invite member (email-based) ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct InviteMemberRequest {
     pub email: String,
     pub role: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1589,6 +1623,8 @@ pub async fn invite_member(
         warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to invite members");
         return Err(StatusCode::FORBIDDEN);
     }
+
+    let member_name = crate::routes::member_names::invite_member_name(&pool, team_id, auth.0, body.name.as_deref()).await?;
 
     let email = crate::email::normalize(&body.email);
     if email.is_empty() {
@@ -1625,24 +1661,15 @@ pub async fn invite_member(
             return Ok(Json(InviteMemberResponse { status: "already_member".to_string() }));
         }
 
-        sqlx::query(
-            "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (team_id, email) DO UPDATE
-               SET user_id = EXCLUDED.user_id,
-                   role = EXCLUDED.role,
-                   invited_by = EXCLUDED.invited_by,
-                   expires_at = now() + INTERVAL '7 days',
-                   accepted_at = NULL",
-        )
-        .bind(team_id)
-        .bind(user_id)
-        .bind(&email)
-        .bind(&role)
-        .bind(auth.0)
-        .execute(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to create pending invitation for existing user"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        upsert_pending_invitation(&pool, PendingInvite {
+            team_id,
+            user_id: Some(user_id),
+            email: &email,
+            role: &role,
+            invited_by: auth.0,
+            member_name: member_name.as_deref(),
+        })
+        .await?;
 
         info!(team_id = %team_id, user_id = %user_id, role = %role, "Pending invitation created for existing user via invite endpoint");
         let invite_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
@@ -1678,23 +1705,15 @@ pub async fn invite_member(
         .await
         .map_err(|e| { error!(error = %e, "Failed to fetch team name"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    let token: String = sqlx::query_scalar(
-        "INSERT INTO pending_invitations (team_id, email, role, invited_by)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (team_id, email) DO UPDATE
-           SET role = EXCLUDED.role,
-               invited_by = EXCLUDED.invited_by,
-               expires_at = now() + INTERVAL '7 days',
-               accepted_at = NULL
-         RETURNING token",
-    )
-    .bind(team_id)
-    .bind(&email)
-    .bind(&role)
-    .bind(auth.0)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to create pending invitation"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let token = upsert_pending_invitation(&pool, PendingInvite {
+        team_id,
+        user_id: None,
+        email: &email,
+        role: &role,
+        invited_by: auth.0,
+        member_name: member_name.as_deref(),
+    })
+    .await?;
 
     let app_url = std::env::var("VOLTIUS_APP_URL")
         .unwrap_or_else(|_| "https://app.voltius.app".to_string());
@@ -2058,6 +2077,7 @@ mod authz_tests {
                 user_id: Some(invitee),
                 email: None,
                 role: None,
+                name: None,
             }),
         )
         .await;
@@ -2087,6 +2107,7 @@ mod authz_tests {
                 user_id: Some(invitee),
                 email: None,
                 role: None,
+                name: None,
             }),
         )
         .await;
@@ -2894,6 +2915,7 @@ mod authz_tests {
                 user_id: Some(invitee),
                 email: None,
                 role: None,
+                name: None,
             }),
         )
         .await;
@@ -2924,6 +2946,7 @@ mod authz_tests {
                 user_id: Some(invitee),
                 email: None,
                 role: None,
+                name: None,
             }),
         )
         .await;
@@ -2964,6 +2987,7 @@ mod authz_tests {
                 user_id: Some(invitee),
                 email: None,
                 role: None,
+                name: None,
             }),
         )
         .await;
@@ -2995,6 +3019,7 @@ mod authz_tests {
                 user_id: Some(invitee),
                 email: None,
                 role: None,
+                name: None,
             }),
         )
         .await;
@@ -3023,6 +3048,7 @@ mod authz_tests {
             Json(InviteMemberRequest {
                 email: "newcomer@test.local".to_string(),
                 role: None,
+                name: None,
             }),
         )
         .await;

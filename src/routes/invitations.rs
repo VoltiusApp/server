@@ -66,6 +66,7 @@ pub(crate) async fn admit_member(
     user_id: Uuid,
     invited_by: Option<Uuid>,
     role: &str,
+    member_name: Option<&str>,
 ) -> Result<(), StatusCode> {
     sqlx::query(
         "INSERT INTO team_members (team_id, user_id, invited_by) VALUES ($1, $2, $3)
@@ -98,6 +99,10 @@ pub(crate) async fn admit_member(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    if let Some(name) = member_name {
+        crate::routes::member_names::store_member_name(conn, team_id, user_id, Some(name), invited_by).await?;
+    }
+
     Ok(())
 }
 
@@ -109,8 +114,8 @@ pub async fn accept_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<Uuid>)>(
-        r#"SELECT pi.id, pi.team_id, pi.email, pi.role, pi.invited_by
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<Uuid>, Option<String>)>(
+        r#"SELECT pi.id, pi.team_id, pi.email, pi.role, pi.invited_by, pi.member_name
            FROM pending_invitations pi
            WHERE pi.token = $1
              AND pi.accepted_at IS NULL
@@ -128,7 +133,7 @@ pub async fn accept_invitation(
         StatusCode::NOT_FOUND
     })?;
 
-    let (invitation_id, team_id, invited_email, role, invited_by) = row;
+    let (invitation_id, team_id, invited_email, role, invited_by, member_name) = row;
 
     let user_email = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
         .bind(auth.0)
@@ -154,7 +159,7 @@ pub async fn accept_invitation(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    admit_member(&mut tx, team_id, auth.0, invited_by, &role).await?;
+    admit_member(&mut tx, team_id, auth.0, invited_by, &role, member_name.as_deref()).await?;
 
     // Mark invitation accepted
     sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
@@ -239,8 +244,8 @@ pub async fn accept_my_pending_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(invitation_id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
-        r#"SELECT team_id, role, invited_by FROM pending_invitations
+    let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<String>)>(
+        r#"SELECT team_id, role, invited_by, member_name FROM pending_invitations
            WHERE id = $1 AND user_id = $2
              AND accepted_at IS NULL AND expires_at > now()"#,
     )
@@ -257,14 +262,14 @@ pub async fn accept_my_pending_invitation(
         StatusCode::NOT_FOUND
     })?;
 
-    let (team_id, role, invited_by) = row;
+    let (team_id, role, invited_by, member_name) = row;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for invitation acceptance");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    admit_member(&mut tx, team_id, auth.0, invited_by, &role).await?;
+    admit_member(&mut tx, team_id, auth.0, invited_by, &role, member_name.as_deref()).await?;
 
     sqlx::query("UPDATE pending_invitations SET accepted_at = now() WHERE id = $1")
         .bind(invitation_id)
@@ -665,7 +670,7 @@ mod admit_tests {
         let invitee = seed_user(&pool).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        admit_member(&mut conn, team, invitee, Some(owner), "member")
+        admit_member(&mut conn, team, invitee, Some(owner), "member", None)
             .await
             .unwrap();
         drop(conn);
@@ -697,18 +702,18 @@ mod admit_tests {
 
         let mut conn = pool.acquire().await.unwrap();
         // A link-only invite carries no inviter; a later accept fills it in.
-        admit_member(&mut conn, team, invitee, None, "member")
+        admit_member(&mut conn, team, invitee, None, "member", None)
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, None);
 
-        admit_member(&mut conn, team, invitee, Some(owner), "member")
+        admit_member(&mut conn, team, invitee, Some(owner), "member", None)
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
 
         // …and a second invitation cannot claim credit for a member already in.
-        admit_member(&mut conn, team, invitee, Some(other), "member")
+        admit_member(&mut conn, team, invitee, Some(other), "member", None)
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));

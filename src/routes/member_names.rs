@@ -69,7 +69,6 @@ pub(crate) async fn require_can_name_members(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) async fn invite_member_name(
     pool: &PgPool,
     team_id: Uuid,
@@ -178,6 +177,7 @@ pub async fn set_member_name(
     }
     Ok(StatusCode::NO_CONTENT)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +315,118 @@ mod db_tests {
         .unwrap();
         assert_eq!(rows.len(), 1, "an unchanged name must not write a second event");
         assert_eq!(rows[0], serde_json::json!({ "old": null, "new": "Jan" }));
+    }
+
+    use crate::routes::teams::{add_member as add_member_route, invite_member, AddMemberRequest, InviteMemberRequest};
+    use crate::test_support::{seed_builtin_roles, set_user_tier};
+
+    async fn invite_email(pool: &PgPool, actor: Uuid, team: Uuid, email: &str, name: Option<&str>) -> Result<(), StatusCode> {
+        invite_member(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(InviteMemberRequest { email: email.into(), role: None, name: name.map(str::to_string) }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn pending_name(pool: &PgPool, team: Uuid, email: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT member_name FROM pending_invitations WHERE team_id = $1 AND email = $2")
+            .bind(team)
+            .bind(email)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn team_for_invites(pool: &PgPool) -> (Uuid, Uuid) {
+        let owner = seed_user(pool).await;
+        set_user_tier(pool, owner, "business").await;
+        let team = seed_team(pool, owner).await;
+        seed_builtin_roles(pool, team).await;
+        (owner, team)
+    }
+
+    #[tokio::test]
+    async fn invite_with_name_needs_manage_members() {
+        let pool = test_pool_or_skip!();
+        let (_, team) = team_for_invites(&pool).await;
+        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let email = format!("{}@corp.test", Uuid::new_v4());
+
+        assert_eq!(invite_email(&pool, inviter, team, &email, Some("Jan")).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(invite_email(&pool, inviter, team, &email, None).await, Ok(()));
+        assert_eq!(pending_name(&pool, team, &email).await, None);
+    }
+
+    #[tokio::test]
+    async fn invite_stores_name_and_reinvite_without_name_keeps_it() {
+        let pool = test_pool_or_skip!();
+        let (_, team) = team_for_invites(&pool).await;
+        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let email = format!("{}@corp.test", Uuid::new_v4());
+
+        invite_email(&pool, admin, team, &email, Some("Jan Novák")).await.unwrap();
+        assert_eq!(pending_name(&pool, team, &email).await.as_deref(), Some("Jan Novák"));
+        invite_email(&pool, admin, team, &email, None).await.unwrap();
+        assert_eq!(pending_name(&pool, team, &email).await.as_deref(), Some("Jan Novák"));
+        invite_email(&pool, admin, team, &email, Some("Jan N.")).await.unwrap();
+        assert_eq!(pending_name(&pool, team, &email).await.as_deref(), Some("Jan N."));
+    }
+
+    #[tokio::test]
+    async fn add_member_by_id_carries_the_name_into_membership() {
+        let pool = test_pool_or_skip!();
+        let (_, team) = team_for_invites(&pool).await;
+        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let invitee = seed_user(&pool).await;
+
+        let _ = add_member_route(
+            State(pool.clone()),
+            Extension(AuthUser(admin)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest { email: None, user_id: Some(invitee), role: None, name: Some("Eva".into()) }),
+        )
+        .await
+        .expect("invite");
+
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM pending_invitations WHERE team_id = $1 AND user_id = $2")
+            .bind(team)
+            .bind(invitee)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        crate::routes::invitations::accept_my_pending_invitation(
+            State(pool.clone()),
+            Extension(AuthUser(invitee)),
+            Extension(SyncNotifier::new()),
+            Path(id),
+        )
+        .await
+        .expect("accept");
+
+        assert_eq!(stored(&pool, team, invitee).await.as_deref(), Some("Eva"));
+    }
+
+    #[tokio::test]
+    async fn rejoin_keeps_old_name_unless_the_invite_names_them() {
+        let pool = test_pool_or_skip!();
+        let (owner, team) = team_for_invites(&pool).await;
+        let user = seed_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", Some("Jan")).await.unwrap();
+        sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(user).execute(&pool).await.unwrap();
+        assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan"), "name survives departure");
+
+        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", None).await.unwrap();
+        assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan"));
+
+        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", Some("Jan Nováková")).await.unwrap();
+        assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan Nováková"));
     }
 }

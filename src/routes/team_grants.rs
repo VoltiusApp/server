@@ -322,7 +322,7 @@ pub async fn redeem_grant(
 
     // `invited_by` is the grant's creator, so the roster attributes the joiner
     // to whoever minted the link.
-    admit_member(&mut tx, locked.team_id, auth.0, Some(locked.created_by), &locked.role).await?;
+    admit_member(&mut tx, locked.team_id, auth.0, Some(locked.created_by), &locked.role, None).await?;
 
     // Fill a missing key only. Overwriting a key a user already published
     // would orphan every vault key already wrapped to it, in this team and

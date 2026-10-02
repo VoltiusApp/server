@@ -258,8 +258,8 @@ pub async fn register(
     };
 
     // Auto-accept any pending invitations for this email
-    let pending = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
-        "SELECT team_id, role, invited_by FROM pending_invitations
+    let pending = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<String>)>(
+        "SELECT team_id, role, invited_by, member_name FROM pending_invitations
          WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()",
     )
     .bind(&email)
@@ -271,11 +271,11 @@ pub async fn register(
     // INSERT naming a `role` column that `team_members` has not had since the
     // roles migration — the error was swallowed, so the invitations below were
     // marked accepted while nobody was ever added to the team.
-    for (team_id, role, invited_by) in &pending {
+    for (team_id, role, invited_by, member_name) in &pending {
         match pool.acquire().await {
             Ok(mut conn) => {
                 if let Err(status) = crate::routes::invitations::admit_member(
-                    &mut conn, *team_id, user_id, *invited_by, role,
+                    &mut conn, *team_id, user_id, *invited_by, role, member_name.as_deref(),
                 )
                 .await
                 {
