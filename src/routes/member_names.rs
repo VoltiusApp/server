@@ -214,6 +214,21 @@ mod db_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, member_with_role, seed_team, seed_user};
 
+    async fn wait_for_audit_rows(pool: &PgPool, team: Uuid, action: &str, expected: i64) {
+        for _ in 0..100 {
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE team_id = $1 AND action = $2")
+                .bind(team)
+                .bind(action)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if n >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn stored(pool: &PgPool, team: Uuid, user: Uuid) -> Option<String> {
         sqlx::query_scalar("SELECT name FROM team_member_names WHERE team_id = $1 AND user_id = $2")
             .bind(team)
@@ -297,7 +312,7 @@ mod db_tests {
 
         put(&pool, admin, team, target, Some("Jan")).await.unwrap();
         put(&pool, admin, team, target, Some("Jan")).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        wait_for_audit_rows(&pool, team, "member.renamed", 1).await;
 
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(
             "SELECT metadata FROM audit_logs WHERE team_id = $1 AND action = 'member.renamed' AND target_id = $2",
@@ -577,7 +592,7 @@ mod db_tests {
         )
         .await
         .expect("invite");
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_for_audit_rows(&pool, team, "member.invited", 3).await;
 
         let mut names: Vec<Option<String>> = sqlx::query_scalar(
             "SELECT metadata->>'name' FROM audit_logs WHERE team_id = $1 AND action = 'member.invited'",
