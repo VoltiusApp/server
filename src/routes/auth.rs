@@ -137,9 +137,75 @@ pub struct AuthResponse {
     pub wrapped_user_secrets: Option<String>,
 }
 
+struct NewUser<'a> {
+    email: &'a str,
+    account_id: Uuid,
+    auth_hash: &'a str,
+    public_key: Option<&'a str>,
+    wrapped_user_secrets: Option<&'a str>,
+    tier: &'a str,
+    trial_ends_at: Option<DateTime<Utc>>,
+}
+
+fn is_handle_taken(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(e) if e.constraint() == Some("idx_users_handle"))
+}
+
+async fn insert_user(
+    pool: &PgPool,
+    u: &NewUser<'_>,
+    handle: &str,
+    handle_is_custom: bool,
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle, handle_is_custom)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+    )
+    .bind(u.email)
+    .bind(u.account_id)
+    .bind(u.auth_hash)
+    .bind(u.public_key)
+    .bind(u.wrapped_user_secrets)
+    .bind(u.tier)
+    .bind(u.trial_ends_at)
+    .bind(handle)
+    .bind(handle_is_custom)
+    .fetch_one(pool)
+    .await
+}
+
+async fn insert_user_with_handle_fallback(
+    pool: &PgPool,
+    u: &NewUser<'_>,
+    handle: &str,
+    handle_is_custom: bool,
+) -> Result<Uuid, sqlx::Error> {
+    match insert_user(pool, u, handle, handle_is_custom).await {
+        Err(e) if is_handle_taken(&e) => {
+            let generated = crate::handles::generate_unique_handle(pool).await?;
+            insert_user(pool, u, &generated, false).await
+        }
+        other => other,
+    }
+}
+
+fn email_delivery_configured() -> bool {
+    !std::env::var("RESEND_API_KEY").unwrap_or_default().is_empty()
+}
+
 pub async fn register(
     State(pool): State<PgPool>,
+    axum::Extension(features): axum::Extension<crate::features::Features>,
     Json(body): Json<RegisterRequest>,
+) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+    register_with(pool, features, email_delivery_configured(), body).await
+}
+
+async fn register_with(
+    pool: PgPool,
+    features: crate::features::Features,
+    delivery_configured: bool,
+    body: RegisterRequest,
 ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
     let email = crate::email::normalize(&body.email);
 
@@ -176,35 +242,33 @@ pub async fn register(
         ("pro", Some(Utc::now() + Duration::days(14)))
     };
 
-    let handle = crate::handles::generate_unique_handle(&pool)
+    let (handle, handle_is_custom) =
+        crate::handles::registration_handle(&pool, &email, features.handles_from_email && !delivery_configured)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to choose a handle for registration");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let new_user = NewUser {
+        email: &email,
+        account_id: body.account_id,
+        auth_hash: &auth_hash,
+        public_key: body.public_key.as_deref(),
+        wrapped_user_secrets: body.wrapped_user_secrets.as_deref(),
+        tier: initial_tier,
+        trial_ends_at,
+    };
+    let user_id = insert_user_with_handle_fallback(&pool, &new_user, &handle, handle_is_custom)
         .await
         .map_err(|e| {
-            error!(error = %e, "Failed to generate a handle for registration");
+            if is_email_taken(&e) {
+                warn!("Registration conflict for existing account");
+                return StatusCode::CONFLICT;
+            }
+            error!(error = %e, "Failed to register user");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    let row = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-    )
-    .bind(&email)
-    .bind(body.account_id)
-    .bind(&auth_hash)
-    .bind(body.public_key.as_deref())
-    .bind(body.wrapped_user_secrets.as_deref())
-    .bind(initial_tier)
-    .bind(trial_ends_at)
-    .bind(&handle)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        if is_email_taken(&e) {
-            warn!("Registration conflict for existing account");
-            return StatusCode::CONFLICT;
-        }
-        error!(error = %e, "Failed to register user");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
 
     // Record fingerprint so future accounts from this machine don't get a trial
     if !trial_blocked {
@@ -221,11 +285,7 @@ pub async fn register(
         }
     }
 
-    let user_id = row.0;
-    let email_verified = if std::env::var("RESEND_API_KEY")
-        .unwrap_or_default()
-        .is_empty()
-    {
+    let email_verified = if !delivery_configured {
         sqlx::query(
             "UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1",
         )
@@ -474,11 +534,34 @@ pub struct VerifyEmailResponse {
     pub user_id: Uuid,
 }
 
+async fn derive_handle_on_verify(tx: &mut sqlx::PgConnection, user_id: Uuid, email: &str, current: &str) {
+    let Ok(candidate) = crate::handles::derive_handle_candidate(email) else {
+        return;
+    };
+    let Ok(mut savepoint) = sqlx::Acquire::begin(&mut *tx).await else {
+        return;
+    };
+    let free = crate::handles::handle_is_free(&mut *savepoint, &candidate).await;
+    if matches!(free, Ok(true))
+        && crate::routes::users::set_handle(&mut savepoint, user_id, current, &candidate).await.is_ok()
+    {
+        let _ = savepoint.commit().await;
+    }
+}
+
 pub async fn verify_email(
     State(pool): State<PgPool>,
+    axum::Extension(features): axum::Extension<crate::features::Features>,
     Json(body): Json<VerifyEmailRequest>,
 ) -> Result<Json<VerifyEmailResponse>, StatusCode> {
-    let verified = sqlx::query_as::<_, (String, Uuid)>(
+    let db_err = |what: &'static str| {
+        move |e: sqlx::Error| {
+            error!(error = %e, "{what}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    let mut tx = pool.begin().await.map_err(db_err("Failed to begin email verification"))?;
+    let verified = sqlx::query_as::<_, (String, Uuid, String, bool)>(
         "WITH consumed AS (
            UPDATE email_verification_tokens
            SET consumed_at = now()
@@ -489,20 +572,22 @@ pub async fn verify_email(
          SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now())
          FROM consumed
          WHERE users.id = consumed.user_id
-         RETURNING users.email, users.id",
+         RETURNING users.email, users.id, users.handle, users.handle_is_custom",
     )
     .bind(&body.token)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to verify email token");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .map_err(db_err("Failed to verify email token"))?;
 
-    if let Some((email, user_id)) = verified {
+    if let Some((email, user_id, handle, handle_is_custom)) = verified {
+        if features.handles_from_email && !handle_is_custom {
+            derive_handle_on_verify(&mut tx, user_id, &email, &handle).await;
+        }
+        tx.commit().await.map_err(db_err("Failed to commit email verification"))?;
         info!(email = %email, "User email verified");
         return Ok(Json(VerifyEmailResponse { email, user_id }));
     }
+    drop(tx);
 
     let token_status = sqlx::query_as::<_, (DateTime<Utc>, Option<DateTime<Utc>>)>(
         "SELECT expires_at, consumed_at FROM email_verification_tokens WHERE token = $1",
@@ -602,9 +687,14 @@ pub struct MeResponse {
     pub handle: String,
     pub handle_is_custom: bool,
     pub allow_stranger_invites: bool,
+    pub handle_managed: bool,
 }
 
-pub(crate) async fn fetch_me_inner(pool: &PgPool, user_id: Uuid) -> Result<MeResponse, StatusCode> {
+pub(crate) async fn fetch_me_inner(
+    pool: &PgPool,
+    user_id: Uuid,
+    handle_managed: bool,
+) -> Result<MeResponse, StatusCode> {
     let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool)>(
         "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites FROM users WHERE id = $1",
     )
@@ -629,14 +719,16 @@ pub(crate) async fn fetch_me_inner(pool: &PgPool, user_id: Uuid) -> Result<MeRes
         handle: row.4,
         handle_is_custom: row.5,
         allow_stranger_invites: row.6,
+        handle_managed,
     })
 }
 
 pub async fn get_me(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(features): axum::Extension<crate::features::Features>,
 ) -> Result<Json<MeResponse>, StatusCode> {
-    Ok(Json(fetch_me_inner(&pool, auth.0).await?))
+    Ok(Json(fetch_me_inner(&pool, auth.0, features.handles_from_email).await?))
 }
 
 // ─── Update email ─────────────────────────────────────────────────────────────
@@ -871,6 +963,7 @@ mod handler_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{seed_user_with_credentials, set_user_tier, set_user_trial};
     use axum::extract::State;
+    use axum::Extension;
 
     #[allow(dead_code)]
     struct EnvGuard(crate::test_support::BillingMode);
@@ -909,6 +1002,93 @@ mod handler_tests {
 
     // ── register ──────────────────────────────────────────────────────────────
 
+    use crate::features::Features;
+    use crate::test_support::unique_handle;
+
+    fn features(handles_from_email: bool) -> Extension<Features> {
+        Extension(Features { handles_from_email, ..Features::open() })
+    }
+
+    fn test_new_user(email: &str) -> NewUser<'_> {
+        NewUser {
+            email,
+            account_id: Uuid::new_v4(),
+            auth_hash: "hash",
+            public_key: None,
+            wrapped_user_secrets: None,
+            tier: "free",
+            trial_ends_at: None,
+        }
+    }
+
+    async fn handle_row(pool: &PgPool, id: Uuid) -> (String, bool) {
+        sqlx::query_as("SELECT handle, handle_is_custom FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn register_derives_the_handle_when_switched_on() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jn");
+        let email = format!("{local}@corp.test");
+        let (_, Json(resp)) = register(State(pool.clone()), features(true), Json(register_req(&email, Uuid::new_v4(), None)))
+            .await
+            .unwrap();
+        assert_eq!(handle_row(&pool, resp.user_id).await, (local, true));
+    }
+
+    #[tokio::test]
+    async fn register_falls_back_when_the_derived_handle_is_taken_or_retired() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jn");
+        let first = register(State(pool.clone()), features(true), Json(register_req(&format!("{local}@a.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap()
+            .1
+             .0;
+        let second = register(State(pool.clone()), features(true), Json(register_req(&format!("{local}@b.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap()
+            .1
+             .0;
+        assert_eq!(handle_row(&pool, first.user_id).await.0, local);
+        let (h2, custom2) = handle_row(&pool, second.user_id).await;
+        assert_ne!(h2, local);
+        assert!(!custom2, "a fallback is a generated handle");
+
+        let retired = unique_handle("jr");
+        sqlx::query("INSERT INTO retired_handles (handle, user_id) VALUES ($1, $2)")
+            .bind(&retired)
+            .bind(first.user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let third = register(State(pool.clone()), features(true), Json(register_req(&format!("{retired}@c.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap()
+            .1
+             .0;
+        assert_ne!(handle_row(&pool, third.user_id).await.0, retired);
+    }
+
+    #[tokio::test]
+    async fn register_generates_when_switched_off() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jn");
+        let (_, Json(resp)) = register(State(pool.clone()), features(false), Json(register_req(&format!("{local}@corp.test"), Uuid::new_v4(), None)))
+            .await
+            .unwrap();
+        let (h, custom) = handle_row(&pool, resp.user_id).await;
+        assert_ne!(h, local);
+        assert!(!custom);
+    }
+
     #[tokio::test]
     async fn register_self_hosted_grants_business_no_trial() {
         let _env = EnvGuard::new(true);
@@ -916,7 +1096,7 @@ mod handler_tests {
         let account_id = Uuid::new_v4();
         let email = format!("{}@ex.test", Uuid::new_v4());
 
-        let (status, Json(resp)) = register(State(pool.clone()), Json(register_req(&email, account_id, None)))
+        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, None)))
             .await
             .expect("register ok");
 
@@ -941,7 +1121,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
         let before = Utc::now().timestamp();
 
-        let (status, Json(resp)) = register(State(pool.clone()), Json(register_req(&email, account_id, None)))
+        let (status, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, None)))
             .await
             .expect("register ok");
 
@@ -975,7 +1155,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
 
         let (status, Json(resp)) =
-            register(State(pool.clone()), Json(register_req(&email, account_id, Some(&fp))))
+            register(State(pool.clone()), Extension(Features::open()), Json(register_req(&email, account_id, Some(&fp))))
                 .await
                 .expect("register ok");
 
@@ -995,6 +1175,7 @@ mod handler_tests {
 
         let (status, _) = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1003,6 +1184,7 @@ mod handler_tests {
 
         match register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1190,6 +1372,7 @@ mod handler_tests {
 
         let (_, Json(resp)) = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&typed, Uuid::new_v4(), None)),
         )
         .await
@@ -1211,6 +1394,7 @@ mod handler_tests {
         let email = format!("case.{}@ex.test", Uuid::new_v4());
         let _ = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, account_id, None)),
         )
         .await
@@ -1236,6 +1420,7 @@ mod handler_tests {
 
         let _ = register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email, Uuid::new_v4(), None)),
         )
         .await
@@ -1243,6 +1428,7 @@ mod handler_tests {
 
         match register(
             State(pool.clone()),
+            Extension(Features::open()),
             Json(register_req(&email.to_uppercase(), Uuid::new_v4(), None)),
         )
         .await
@@ -1343,9 +1529,104 @@ mod handler_tests {
             .await
             .unwrap();
 
-        let me = fetch_me_inner(&pool, user).await.unwrap();
+        let me = fetch_me_inner(&pool, user, false).await.unwrap();
         assert_eq!(me.handle, handle);
         // ALIAS for pre-0.26 clients.
         assert_eq!(me.display_name, handle);
+    }
+
+    #[tokio::test]
+    async fn me_reports_whether_handles_are_managed() {
+        let pool = test_pool_or_skip!();
+        let user = crate::test_support::seed_user(&pool).await;
+        assert!(!fetch_me_inner(&pool, user, false).await.unwrap().handle_managed);
+        assert!(fetch_me_inner(&pool, user, true).await.unwrap().handle_managed);
+    }
+
+    #[tokio::test]
+    async fn insert_falls_back_to_a_generated_handle_when_the_chosen_one_is_taken() {
+        let pool = test_pool_or_skip!();
+        let other = crate::test_support::seed_user(&pool).await;
+        let taken: String = sqlx::query_scalar("SELECT handle FROM users WHERE id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let email = format!("{}@race.test", Uuid::new_v4());
+        let new_user = test_new_user(&email);
+        let id = insert_user_with_handle_fallback(&pool, &new_user, &taken.to_uppercase(), true)
+            .await
+            .unwrap();
+        let (handle, custom) = handle_row(&pool, id).await;
+        assert_ne!(handle.to_lowercase(), taken.to_lowercase());
+        assert!(!custom);
+    }
+
+    #[tokio::test]
+    async fn insert_still_reports_a_taken_email() {
+        let pool = test_pool_or_skip!();
+        let other = crate::test_support::seed_user(&pool).await;
+        let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let new_user = test_new_user(&email);
+        let err = insert_user_with_handle_fallback(&pool, &new_user, "fresh-handle-xyz", false)
+            .await
+            .unwrap_err();
+        assert!(is_email_taken(&err));
+    }
+
+    async fn registered_unverified(pool: &PgPool, switch: bool, email: &str) -> (Uuid, String) {
+        let (_, Json(resp)) = register_with(pool.clone(), features(switch).0, true, register_req(email, Uuid::new_v4(), None))
+            .await
+            .unwrap();
+        let token = sqlx::query_scalar("SELECT token FROM email_verification_tokens WHERE user_id = $1")
+            .bind(resp.user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (resp.user_id, token)
+    }
+
+    async fn verify(pool: &PgPool, switch: bool, token: String) {
+        let _ = verify_email(State(pool.clone()), features(switch), Json(VerifyEmailRequest { token })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn derivation_waits_for_email_verification_when_delivery_is_configured() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let local = unique_handle("jv");
+        let (id, token) = registered_unverified(&pool, true, &format!("{local}@corp.test")).await;
+        let (before, custom) = handle_row(&pool, id).await;
+        assert_ne!(before, local);
+        assert!(!custom);
+        verify(&pool, true, token).await;
+        assert_eq!(handle_row(&pool, id).await, (local, true));
+    }
+
+    #[tokio::test]
+    async fn verification_never_touches_a_custom_handle_or_renames_with_the_switch_off() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let custom_local = unique_handle("jc");
+        let (custom_id, custom_token) = registered_unverified(&pool, true, &format!("{custom_local}@corp.test")).await;
+        let mine = unique_handle("mine");
+        sqlx::query("UPDATE users SET handle = $1, handle_is_custom = TRUE WHERE id = $2")
+            .bind(&mine)
+            .bind(custom_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        verify(&pool, true, custom_token).await;
+        assert_eq!(handle_row(&pool, custom_id).await, (mine, true));
+
+        let off_local = unique_handle("jo");
+        let (off_id, off_token) = registered_unverified(&pool, false, &format!("{off_local}@corp.test")).await;
+        let (generated, _) = handle_row(&pool, off_id).await;
+        verify(&pool, false, off_token).await;
+        assert_eq!(handle_row(&pool, off_id).await, (generated, false));
     }
 }

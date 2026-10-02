@@ -250,6 +250,7 @@ async fn main() {
     tracing::info!(
         registration = features.registration,
         team_invites = features.team_invites,
+        handles_from_email = features.handles_from_email,
         "Configured features"
     );
 
@@ -347,7 +348,11 @@ async fn main() {
             post(routes::auth::resend_verification_email),
         )
         .route("/v1/auth/public-key", put(routes::teams::update_public_key))
-        .route("/v1/users/me/handle", put(routes::users::claim_handle))
+        .route(
+            "/v1/users/me/handle",
+            put(routes::users::claim_handle)
+                .layer(middleware::from_fn(features::require_handle_self_service)),
+        )
         .route(
             "/v1/users/me/preferences",
             put(routes::users::update_preferences),
@@ -683,6 +688,8 @@ async fn main() {
             post(routes::admin::restore_user),
         )
         .route("/v1/admin/users/:id/ban", post(routes::admin::ban_user))
+        .route("/v1/admin/users/:id/handle", put(routes::admin::set_user_handle))
+        .route("/v1/admin/handles/derive", post(routes::admin::derive_handles))
         .route("/v1/admin/users/:id/unban", post(routes::admin::unban_user))
         .route(
             "/v1/admin/users/:id/extend-trial",

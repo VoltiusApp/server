@@ -16,6 +16,7 @@ pub struct MetaResponse {
     pub registration_enabled: bool,
     pub team_invites_enabled: bool,
     pub identity_picks: bool,
+    pub handles_from_email: bool,
 }
 
 pub async fn get_meta(Extension(features): Extension<Features>) -> Json<MetaResponse> {
@@ -26,6 +27,7 @@ pub async fn get_meta(Extension(features): Extension<Features>) -> Json<MetaResp
         registration_enabled: features.registration,
         team_invites_enabled: features.team_invites,
         identity_picks: true,
+        handles_from_email: features.handles_from_email,
     })
 }
 
@@ -35,12 +37,14 @@ mod tests {
 
     #[tokio::test]
     async fn meta_advertises_identity_picks() {
-        let Json(meta) = get_meta(Extension(Features {
-            registration: true,
-            team_invites: true,
-        }))
-        .await;
+        let Json(meta) = get_meta(Extension(Features::open())).await;
         let body = serde_json::to_value(&meta).unwrap();
         assert_eq!(body["identity_picks"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn meta_reports_the_handle_switch() {
+        let Json(meta) = get_meta(Extension(Features { handles_from_email: true, ..Features::open() })).await;
+        assert_eq!(serde_json::to_value(&meta).unwrap()["handles_from_email"], serde_json::json!(true));
     }
 }
