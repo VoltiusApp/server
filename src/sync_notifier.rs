@@ -121,18 +121,19 @@ pub fn team_vault_notification_payload(team_id: Uuid) -> String {
     format!("team:{}", team_id)
 }
 
-/// Runs `make` once per distinct member of the given teams, excluding the actor.
+/// Runs `make` once per distinct member of the given teams, skipping `except` when set.
 pub async fn notify_team_members(
     pool: &PgPool,
     team_ids: &[Uuid],
-    actor_user_id: Uuid,
+    except: Option<Uuid>,
     mut make: impl FnMut(Uuid),
 ) {
     let member_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
-        "SELECT DISTINCT user_id FROM team_members WHERE team_id = ANY($1) AND user_id != $2",
+        "SELECT DISTINCT user_id FROM team_members \
+         WHERE team_id = ANY($1) AND ($2::uuid IS NULL OR user_id <> $2)",
     )
     .bind(team_ids)
-    .bind(actor_user_id)
+    .bind(except)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -142,14 +143,13 @@ pub async fn notify_team_members(
     }
 }
 
-pub async fn notify_team_vault_changed(
-    pool: &PgPool,
-    notifier: &SyncNotifier,
-    team_id: Uuid,
-    actor_user_id: Uuid,
-) {
-    let payload = team_vault_notification_payload(team_id);
-    notify_team_members(pool, &[team_id], actor_user_id, |member_id| {
+/// Includes the actor: their other devices hold the same stale copy.
+pub async fn notify_team_vault_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
+    notify_team(pool, notifier, team_id, team_vault_notification_payload(team_id)).await;
+}
+
+pub async fn notify_team(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid, payload: String) {
+    notify_team_members(pool, &[team_id], None, |member_id| {
         notifier.notify(member_id, payload.clone());
     })
     .await;
@@ -162,7 +162,7 @@ mod tests {
     use crate::test_support::{add_member, seed_team, seed_user};
 
     #[tokio::test]
-    async fn team_member_fanout_excludes_the_actor_and_dedupes_across_teams() {
+    async fn team_member_fanout_skips_only_the_excepted_user_and_dedupes_across_teams() {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
         let member = seed_user(&pool).await;
@@ -175,12 +175,14 @@ mod tests {
         }
 
         let mut recipients: Vec<Uuid> = Vec::new();
-        notify_team_members(&pool, &[team_a, team_b], host, |r| recipients.push(r)).await;
+        notify_team_members(&pool, &[team_a, team_b], Some(host), |r| recipients.push(r)).await;
+        assert_eq!(recipients, vec![member], "host skipped, member not duplicated across two teams");
 
-        assert_eq!(
-            recipients,
-            vec![member],
-            "actor excluded, member not duplicated across two teams"
-        );
+        let mut everyone: Vec<Uuid> = Vec::new();
+        notify_team_members(&pool, &[team_a, team_b], None, |r| everyone.push(r)).await;
+        everyone.sort();
+        let mut expected = vec![host, member];
+        expected.sort();
+        assert_eq!(everyone, expected, "no exception reaches every member once");
     }
 }
