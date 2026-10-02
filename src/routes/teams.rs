@@ -324,17 +324,18 @@ pub async fn list_members(
         (
             Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>,
             String, String, Option<String>, Option<Uuid>, i64, i64,
-            Option<String>, bool,
+            Option<String>, bool, Option<String>,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.handle AS invited_by_display_name, tm.joined_at,
                u.handle AS display_name, u.handle, u.public_key, tmr.role_id,
                COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
-               tm.last_client_version, tm.last_client_rule_sets
+               tm.last_client_version, tm.last_client_rule_sets, mn.name
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
+        LEFT JOIN team_member_names mn ON mn.team_id = tm.team_id AND mn.user_id = tm.user_id
         LEFT JOIN team_member_roles tmr ON tmr.team_id = tm.team_id AND tmr.user_id = tm.user_id
         LEFT JOIN team_member_permission_overrides o
                ON o.team_id = tm.team_id AND o.user_id = tm.user_id
@@ -352,7 +353,7 @@ pub async fn list_members(
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
     for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key,
-         role_id, permission_allow, permission_deny, last_client_version, last_client_rule_sets) in rows
+         role_id, permission_allow, permission_deny, last_client_version, last_client_rule_sets, member_name) in rows
     {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
@@ -368,6 +369,7 @@ pub async fn list_members(
                         user_id,
                         display_name,
                         handle,
+                        member_name,
                         public_key: member_public_key_for_response(public_key),
                         invited_by_display_name,
                         joined_at,
@@ -1751,6 +1753,7 @@ pub struct PendingInvitation {
     pub invited_by_display_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub member_name: Option<String>,
     /// "pending" or "expired", derived here rather than on the client: the
     /// client's clock is not the one the accept path checks against.
     pub status: String,
@@ -1774,8 +1777,8 @@ pub async fn list_pending_invitations(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT pi.id, COALESCE(invitee.handle, pi.email), pi.role, inv.handle, pi.created_at, pi.expires_at
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<String>)>(
+        r#"SELECT pi.id, COALESCE(invitee.handle, pi.email), pi.role, inv.handle, pi.created_at, pi.expires_at, pi.member_name
            FROM pending_invitations pi
            LEFT JOIN users inv ON inv.id = pi.invited_by
            LEFT JOIN users invitee ON invitee.id = pi.user_id
@@ -1794,8 +1797,8 @@ pub async fn list_pending_invitations(
     let now = chrono::Utc::now();
     Ok(Json(
         rows.into_iter()
-            .map(|(id, display_name, role, invited_by_display_name, created_at, expires_at)| PendingInvitation {
-                id, display_name, role, invited_by_display_name, created_at, expires_at,
+            .map(|(id, display_name, role, invited_by_display_name, created_at, expires_at, member_name)| PendingInvitation {
+                id, display_name, role, invited_by_display_name, created_at, expires_at, member_name,
                 status: if expires_at > now { "pending" } else { "expired" }.to_string(),
             })
             .collect(),

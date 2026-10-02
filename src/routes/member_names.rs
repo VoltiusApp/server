@@ -429,4 +429,87 @@ mod db_tests {
         crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", Some("Jan Nováková")).await.unwrap();
         assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan Nováková"));
     }
+
+    use crate::PresenceMap;
+
+    #[tokio::test]
+    async fn members_list_returns_the_name() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS).await;
+        let target = seed_user(&pool).await;
+        add_member(&pool, team, target).await;
+        put(&pool, admin, team, target, Some("Jan")).await.unwrap();
+
+        let presence: PresenceMap = std::sync::Arc::new(dashmap::DashMap::new());
+        let Json(rows) = crate::routes::teams::list_members(
+            State(pool.clone()), Extension(AuthUser(admin)), Extension(presence), Path(team),
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&rows).unwrap();
+        let row = json.as_array().unwrap().iter().find(|r| r["user_id"] == target.to_string()).unwrap();
+        assert_eq!(row["member_name"], "Jan");
+        let other = json.as_array().unwrap().iter().find(|r| r["user_id"] == admin.to_string()).unwrap();
+        assert!(other["member_name"].is_null());
+    }
+
+    #[tokio::test]
+    async fn audit_names_an_actor_who_has_left() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | crate::permissions::PERM_VIEW_AUDIT_LOG).await;
+        let leaver = seed_user(&pool).await;
+        add_member(&pool, team, leaver).await;
+        put(&pool, admin, team, leaver, Some("Ex Employee")).await.unwrap();
+        write_audit_event(pool.clone(), team, leaver, "vault.deleted", None, None, None, None).await;
+        sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(leaver).execute(&pool).await.unwrap();
+
+        let name: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM audit_logs al {} WHERE al.team_id = $1 AND al.actor_id = $2",
+            "mn.name", crate::routes::audit::AUDIT_ACTOR_JOINS
+        ))
+        .bind(team)
+        .bind(leaver)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(name.as_deref(), Some("Ex Employee"));
+    }
+
+    #[test]
+    fn member_names_are_read_only_by_team_scoped_modules() {
+        let allowed = [
+            "src/main.rs",
+            "src/routes/mod.rs",
+            "src/routes/member_names.rs",
+            "src/routes/teams.rs",
+            "src/routes/audit.rs",
+            "src/routes/invitations.rs",
+            "src/routes/auth.rs",
+        ];
+        let mut offenders = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let rel = path.to_string_lossy().replace('\\', "/");
+                    if (text.contains("team_member_names") || text.contains("member_name"))
+                        && !allowed.contains(&rel.as_str())
+                        && rel != "src/models/team.rs"
+                    {
+                        offenders.push(rel);
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "member names must stay out of session/presence/search code: {offenders:?}");
+    }
 }
