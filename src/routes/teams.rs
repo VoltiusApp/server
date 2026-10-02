@@ -489,7 +489,7 @@ pub async fn add_member(
         Some("user"),
         Some(invitee_id.to_string()),
         Some(invitee_display_name),
-        Some(json!({ "role": role_name, "status": "pending" })),
+        Some(json!({ "role": role_name, "status": "pending", "name": member_name })),
     ));
     // Notify the invitee so their client refreshes pending invitations
     notifier.notify_pending_invitations_changed(invitee_id);
@@ -1567,7 +1567,7 @@ pub(crate) struct PendingInvite<'a> {
     pub member_name: Option<&'a str>,
 }
 
-// COALESCE keeps a name an admin set when someone without Manage members re-sends the invite.
+// A name survives a re-send only while the invite is still pending; an accepted row must not revive it.
 pub(crate) async fn upsert_pending_invitation(pool: &PgPool, invite: PendingInvite<'_>) -> Result<String, StatusCode> {
     sqlx::query_scalar(
         "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by, member_name)
@@ -1576,7 +1576,9 @@ pub(crate) async fn upsert_pending_invitation(pool: &PgPool, invite: PendingInvi
            SET user_id = COALESCE(EXCLUDED.user_id, pending_invitations.user_id),
                role = EXCLUDED.role,
                invited_by = EXCLUDED.invited_by,
-               member_name = COALESCE(EXCLUDED.member_name, pending_invitations.member_name),
+               member_name = CASE WHEN pending_invitations.accepted_at IS NULL
+                                  THEN COALESCE(EXCLUDED.member_name, pending_invitations.member_name)
+                                  ELSE EXCLUDED.member_name END,
                expires_at = now() + INTERVAL '7 days',
                accepted_at = NULL
          RETURNING token",
@@ -1687,7 +1689,7 @@ pub async fn invite_member(
             Some("user"),
             Some(user_id.to_string()),
             invite_display_name,
-            Some(json!({ "role": role, "status": "pending" })),
+            Some(json!({ "role": role, "status": "pending", "name": member_name })),
         ));
         notifier.notify_pending_invitations_changed(user_id);
         notify_team_members_changed(&pool, &notifier, team_id).await;
@@ -1734,7 +1736,7 @@ pub async fn invite_member(
         Some("user"),
         None,
         Some(invite_display_name),
-        Some(json!({ "role": role, "status": "pending" })),
+        Some(json!({ "role": role, "status": "pending", "name": member_name })),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(Json(InviteMemberResponse { status: "invited".to_string() }))

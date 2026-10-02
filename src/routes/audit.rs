@@ -258,7 +258,7 @@ pub async fn export_audit_logs(
     match format {
         "csv" => {
             let mut csv = String::from(
-                "id,team_id,vault_id,actor_id,actor_name,actor_member_name,action,source,target_type,target_id,target_name,ip_address,created_at,metadata\n",
+                "id,team_id,vault_id,actor_id,actor_name,action,source,target_type,target_id,target_name,ip_address,created_at,metadata,actor_member_name\n",
             );
             for log in &logs {
                 csv.push_str(&format!(
@@ -268,7 +268,6 @@ pub async fn export_audit_logs(
                     log.vault_id.map(|v| v.to_string()).unwrap_or_default(),
                     log.actor_id,
                     csv_escape(&log.actor_name),
-                    csv_escape(log.actor_member_name.as_deref().unwrap_or("")),
                     log.action,
                     log.source,
                     log.target_type.as_deref().unwrap_or(""),
@@ -282,6 +281,7 @@ pub async fn export_audit_logs(
                             .map(|m| m.to_string())
                             .unwrap_or_default()
                     ),
+                    csv_escape(log.actor_member_name.as_deref().unwrap_or("")),
                 ));
             }
             Ok((
