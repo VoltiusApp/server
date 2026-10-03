@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::object_authz::{
-    gc_rule_sets, live_rule_set_ids, object_row, record_member_client, rule_set_in_team, ObjectAuthz,
+    gc_rule_sets, live_rule_set_ids, object_row, rule_set_in_team, ObjectAuthz,
 };
 use crate::permissions::{
     PERM_CONNECT, PERM_EDIT_CONNECTIONS, PERM_EDIT_FOLDERS, PERM_EDIT_IDENTITIES, PERM_EDIT_KEYS,
@@ -205,7 +205,6 @@ pub async fn list_objects(
 ) -> Result<Json<Vec<TeamObjectResponse>>, StatusCode> {
     let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
     require_rule_set_feature(&headers)?;
-    record_member_client(&pool, team_id, auth.0, &headers).await;
 
     let rows = sqlx::query_as::<
         _,

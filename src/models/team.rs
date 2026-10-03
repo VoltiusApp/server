@@ -39,6 +39,4 @@ pub struct TeamMember {
     pub role_ids: Vec<Uuid>,
     pub permission_allow: i64,
     pub permission_deny: i64,
-    pub last_client_version: Option<String>,
-    pub last_client_rule_sets: bool,
 }

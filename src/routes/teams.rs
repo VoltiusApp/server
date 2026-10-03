@@ -323,14 +323,14 @@ pub async fn list_members(
         (
             Uuid, Uuid, Option<String>, chrono::DateTime<chrono::Utc>,
             String, String, Option<String>, Option<Uuid>, i64, i64,
-            Option<String>, bool, Option<String>,
+            Option<String>,
         ),
     >(
         r#"
         SELECT tm.team_id, tm.user_id, inv.handle AS invited_by_display_name, tm.joined_at,
                u.handle AS display_name, u.handle, u.public_key, tmr.role_id,
                COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
-               tm.last_client_version, tm.last_client_rule_sets, mn.name
+               mn.name
         FROM team_members tm
         JOIN users u ON u.id = tm.user_id
         LEFT JOIN users inv ON inv.id = tm.invited_by
@@ -352,7 +352,7 @@ pub async fn list_members(
 
     let mut members: Vec<TeamMemberResponse> = Vec::new();
     for (t_id, user_id, invited_by_display_name, joined_at, display_name, handle, public_key,
-         role_id, permission_allow, permission_deny, last_client_version, last_client_rule_sets, member_name) in rows
+         role_id, permission_allow, permission_deny, member_name) in rows
     {
         match members.last_mut() {
             Some(last) if last.member.user_id == user_id => {
@@ -375,8 +375,6 @@ pub async fn list_members(
                         role_ids: role_id.into_iter().collect(),
                         permission_allow,
                         permission_deny,
-                        last_client_version,
-                        last_client_rule_sets,
                     },
                 });
             }
@@ -3835,23 +3833,5 @@ mod rule_set_era_tests {
         let deny: i64 = sqlx::query_scalar("SELECT deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
             .bind(team).bind(target).fetch_one(&pool).await.unwrap();
         assert_eq!(deny, PERM_COPY_SECRETS | PERM_VIEW);
-    }
-
-    #[tokio::test]
-    async fn list_members_reports_the_last_client() {
-        let pool = test_pool_or_skip!();
-        let owner = seed_user(&pool).await;
-        let team = seed_team_with_roles(&pool, owner).await;
-        crate::object_authz::record_member_client(&pool, team, owner, &rule_set_client_headers()).await;
-        let presence: crate::PresenceMap = std::sync::Arc::new(dashmap::DashMap::new());
-
-        let members = list_members(State(pool.clone()), Extension(AuthUser(owner)), Extension(presence), Path(team))
-            .await
-            .unwrap()
-            .0;
-
-        let me = members.iter().find(|m| m.member.user_id == owner).unwrap();
-        assert_eq!(me.member.last_client_version.as_deref(), Some("0.99.0"));
-        assert!(me.member.last_client_rule_sets);
     }
 }
