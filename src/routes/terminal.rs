@@ -1344,6 +1344,17 @@ pub async fn ws_handler(
     })
 }
 
+// Token claims carry `is_banned` from issue time, so a ban needs this read.
+async fn account_in_good_standing(pool: &PgPool, user_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND NOT is_banned AND deleted_at IS NULL)",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn is_authorized_participant(
     pool: &PgPool,
@@ -1356,6 +1367,9 @@ pub(crate) async fn is_authorized_participant(
     presented_token: Option<&str>,
     invitees: &std::collections::HashSet<Uuid>,
 ) -> bool {
+    if !account_in_good_standing(pool, user_id).await {
+        return false;
+    }
     if user_id == host_user_id {
         return true;
     }
@@ -3583,12 +3597,15 @@ mod live_revoke_tests {
         addr
     }
 
-    async fn connect(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid) -> Client {
+    async fn try_connect(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid) -> Option<Client> {
         let token = crate::auth::jwt::create_access_token(user, "business", None, false, false, false, true).unwrap();
         let url = format!("ws://{addr}/v1/terminal-sessions/{session_id}/ws?token={token}");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        next_of_type(&mut ws, "participant_list").await.expect("admitted");
-        ws
+        next_of_type(&mut ws, "participant_list").await.map(|_| ws)
+    }
+
+    async fn connect(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid) -> Client {
+        try_connect(addr, session_id, user).await.expect("admitted")
     }
 
     /// Next frame of `kind`, skipping others; `None` once the server closes the socket.
@@ -3630,12 +3647,12 @@ mod live_revoke_tests {
     }
 
     /// Host on a Teams plan with a live `direct` session `mate` is invited to.
-    async fn direct_session_with_joined_mate(
+    async fn direct_session_inviting(
         pool: &PgPool,
         teams: &[Uuid],
         host: Uuid,
         mate: Uuid,
-    ) -> (TerminalManager, Uuid, Client, Client) {
+    ) -> (TerminalManager, Uuid, std::net::SocketAddr) {
         set_user_tier(pool, host, "teams").await;
         for team in teams {
             add_member(pool, *team, host).await;
@@ -3648,9 +3665,83 @@ mod live_revoke_tests {
             .await
             .unwrap();
         let addr = serve(pool.clone(), manager.clone()).await;
+        (manager, session_id, addr)
+    }
+
+    async fn direct_session_with_joined_mate(
+        pool: &PgPool,
+        teams: &[Uuid],
+        host: Uuid,
+        mate: Uuid,
+    ) -> (TerminalManager, Uuid, Client, Client) {
+        let (manager, session_id, addr) = direct_session_inviting(pool, teams, host, mate).await;
         let host_ws = connect(addr, session_id, host).await;
         let mate_ws = connect(addr, session_id, mate).await;
         (manager, session_id, host_ws, mate_ws)
+    }
+
+    const BAN: &str = "UPDATE users SET is_banned = TRUE WHERE id = $1";
+    const SOFT_DELETE: &str = "UPDATE users SET deleted_at = now() WHERE id = $1";
+    const HARD_DELETE: &str = "DELETE FROM users WHERE id = $1";
+
+    async fn lose_account(pool: &PgPool, user: Uuid, how: &str) {
+        sqlx::query(how).bind(user).execute(pool).await.unwrap();
+    }
+
+    async fn losing_the_account_drops_the_invitees_live_socket(how: &str) {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (manager, _, _host_ws, mut mate_ws) = direct_session_with_joined_mate(&pool, &[team], host, mate).await;
+
+        lose_account(&pool, mate, how).await;
+        manager.recheck_sessions(None).await;
+
+        assert_evicted(&mut mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn banning_an_invitee_drops_their_live_socket() {
+        losing_the_account_drops_the_invitees_live_socket(BAN).await;
+    }
+
+    #[tokio::test]
+    async fn soft_deleting_an_invitee_drops_their_live_socket() {
+        losing_the_account_drops_the_invitees_live_socket(SOFT_DELETE).await;
+    }
+
+    #[tokio::test]
+    async fn hard_deleting_an_invitee_drops_their_live_socket() {
+        losing_the_account_drops_the_invitees_live_socket(HARD_DELETE).await;
+    }
+
+    #[tokio::test]
+    async fn a_banned_host_is_dropped_too() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (manager, _, mut host_ws, _mate_ws) = direct_session_with_joined_mate(&pool, &[team], host, mate).await;
+
+        lose_account(&pool, host, BAN).await;
+        manager.recheck_sessions(None).await;
+
+        assert_evicted(&mut host_ws).await;
+    }
+
+    #[tokio::test]
+    async fn a_banned_invitee_cannot_join_with_an_unexpired_token() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (_manager, session_id, addr) = direct_session_inviting(&pool, &[team], host, mate).await;
+        let _host_ws = connect(addr, session_id, host).await;
+
+        lose_account(&pool, mate, BAN).await;
+
+        assert!(try_connect(addr, session_id, mate).await.is_none());
     }
 
     #[tokio::test]
