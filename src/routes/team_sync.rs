@@ -102,6 +102,23 @@ async fn require_vault_access(
 /// Team-level `CONNECT`, or `CONNECT` on any live object: one granted host still needs the key.
 async fn require_vault_key_access(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
     require_vault_member(pool, team_id, user_id, action).await?;
+    require_key_gate(pool, team_id, user_id).await
+}
+
+/// Wrapping the key makes the caller a holder, so a writer failing the gate would re-trigger the exposure sweep.
+async fn require_vault_key_writer(pool: &PgPool, team_id: Uuid, user_id: Uuid, action: &str) -> Result<(), StatusCode> {
+    require_vault_access(
+        pool,
+        team_id,
+        user_id,
+        action,
+        PermCheck::All(&[crate::permissions::PERM_VIEW_SECRETS, crate::permissions::PERM_COPY_SECRETS]),
+    )
+    .await?;
+    require_key_gate(pool, team_id, user_id).await
+}
+
+async fn require_key_gate(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<(), StatusCode> {
     let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
     let live = live_rule_set_ids(pool, team_id).await?;
     if authz.holds_vault_key_gate(&live) {
@@ -356,17 +373,7 @@ pub async fn put_vault_keys(
     Path(team_id): Path<Uuid>,
     Json(body): Json<PutVaultKeysRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    require_vault_access(
-        &pool,
-        team_id,
-        auth.0,
-        "put_vault_keys",
-        PermCheck::All(&[
-            crate::permissions::PERM_VIEW_SECRETS,
-            crate::permissions::PERM_COPY_SECRETS,
-        ]),
-    )
-    .await?;
+    require_vault_key_writer(&pool, team_id, auth.0, "put_vault_keys").await?;
 
     if body.keys.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -450,17 +457,7 @@ pub async fn rotate_vault_key(
     Path(team_id): Path<Uuid>,
     Json(body): Json<RotateVaultKeyRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    require_vault_access(
-        &pool,
-        team_id,
-        auth.0,
-        "rotate_vault_key",
-        PermCheck::All(&[
-            crate::permissions::PERM_VIEW_SECRETS,
-            crate::permissions::PERM_COPY_SECRETS,
-        ]),
-    )
-    .await?;
+    require_vault_key_writer(&pool, team_id, auth.0, "rotate_vault_key").await?;
 
     let required_ids: Vec<Uuid> = sqlx::query_scalar(
         r#"SELECT tm.user_id FROM team_members tm
@@ -736,7 +733,7 @@ mod tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_team,
-        seed_user, seed_vault_key,
+        seed_user, seed_vault_key, set_member_overrides,
     };
     use axum::extract::{Path, State};
     use axum::Extension;
@@ -1631,22 +1628,88 @@ mod tests {
             &pool, team, PERM_CONNECT | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS,
         )
         .await;
-        let keys = sqlx::query_scalar::<_, Uuid>(
-            "SELECT tm.user_id FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id = $1 AND u.public_key IS NOT NULL",
-        )
-        .bind(team).fetch_all(&pool).await.unwrap()
-        .into_iter().map(|user_id| WrappedKeyEntry { user_id, wrapped_key: "w".to_string() }).collect();
-
         let res = rotate_vault_key(
             State(pool.clone()), Extension(AuthUser(newcomer)), Extension(SyncNotifier::new()), Path(team),
-            Json(RotateVaultKeyRequest { keys }),
+            Json(RotateVaultKeyRequest { keys: keyed_member_wraps(&pool, team).await }),
         )
         .await;
 
         assert_eq!(res, Err(StatusCode::CONFLICT));
-        let epochs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_key_epochs WHERE team_id = $1")
-            .bind(team).fetch_one(&pool).await.unwrap();
-        assert_eq!(epochs, 0);
+        assert_eq!(epoch_count(&pool, team).await, 0);
+    }
+
+    async fn keyed_member_wraps(pool: &PgPool, team: Uuid) -> Vec<WrappedKeyEntry> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT tm.user_id FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id = $1 AND u.public_key IS NOT NULL",
+        )
+        .bind(team).fetch_all(pool).await.unwrap()
+        .into_iter().map(|user_id| WrappedKeyEntry { user_id, wrapped_key: "w".to_string() }).collect()
+    }
+
+    async fn epoch_count(pool: &PgPool, team: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM team_key_epochs WHERE team_id = $1")
+            .bind(team).fetch_one(pool).await.unwrap()
+    }
+
+    /// A key holder whose role passes the secret-rights check but fails the key gate.
+    async fn holder_failing_the_key_gate(pool: &PgPool, (role_perms, denied): (i64, i64)) -> (Uuid, Uuid) {
+        let owner = seed_user(pool).await;
+        let team = seed_team(pool, owner).await;
+        add_member(pool, team, owner).await;
+        grant_view_secrets_and_copy(pool, team, owner).await;
+        seed_vault_key(pool, team, owner, owner, 1, true).await;
+        let holder = seed_user(pool).await;
+        add_member(pool, team, holder).await;
+        assign_role(pool, team, holder, seed_role(pool, team, "gate-failing", role_perms).await).await;
+        seed_vault_key(pool, team, holder, owner, 1, true).await;
+        set_member_overrides(pool, team, holder, 0, denied).await;
+        (team, holder)
+    }
+
+    const SECRETS: i64 = crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS;
+    const VIEWLESS_SECRET_ROLE: (i64, i64) = (PERM_CONNECT | SECRETS, 0);
+    const ADMIN_DENIED_CONNECT: (i64, i64) = (crate::permissions::PERM_ADMINISTRATOR | PERM_VIEW | SECRETS, PERM_CONNECT);
+
+    async fn rotate_as_gate_failing_holder(holder_perms: (i64, i64)) {
+        let pool = test_pool_or_skip!();
+        let (team, holder) = holder_failing_the_key_gate(&pool, holder_perms).await;
+
+        let res = rotate_vault_key(
+            State(pool.clone()), Extension(AuthUser(holder)), Extension(SyncNotifier::new()), Path(team),
+            Json(RotateVaultKeyRequest { keys: keyed_member_wraps(&pool, team).await }),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
+        assert_eq!(epoch_count(&pool, team).await, 0);
+    }
+
+    #[tokio::test]
+    async fn rotate_refused_for_a_viewless_holder() {
+        rotate_as_gate_failing_holder(VIEWLESS_SECRET_ROLE).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_refused_for_an_administrator_denied_connect() {
+        rotate_as_gate_failing_holder(ADMIN_DENIED_CONNECT).await;
+    }
+
+    #[tokio::test]
+    async fn put_vault_keys_refused_for_a_holder_who_fails_the_key_gate() {
+        let pool = test_pool_or_skip!();
+        let (team, holder) = holder_failing_the_key_gate(&pool, VIEWLESS_SECRET_ROLE).await;
+        let target = member_with_role(&pool, team, PERM_CONNECT).await;
+
+        let res = put_vault_keys(
+            State(pool.clone()), Extension(AuthUser(holder)), Extension(SyncNotifier::new()), Path(team),
+            put_body(target, "wrapped", Some(1)),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::FORBIDDEN));
+        let wrapped_for_target: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_vault_keys WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(target).fetch_one(&pool).await.unwrap();
+        assert_eq!(wrapped_for_target, 0);
     }
 
     #[tokio::test]
