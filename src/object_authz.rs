@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use sqlx::PgPool;
-use tracing::{error, warn};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::permissions::{
     object_permissions, RuleLayers, PERMISSION_JOINS, PERM_ADMINISTRATOR, PERM_CONNECT, PERM_VIEW,
 };
-use crate::routes::client_version::client_supports_rule_sets;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
@@ -335,28 +334,6 @@ pub async fn sweep_unattached_rule_sets(pool: &PgPool) -> Result<u64, sqlx::Erro
     .map(|r| r.rows_affected())
 }
 
-pub async fn record_member_client(pool: &PgPool, team_id: Uuid, user_id: Uuid, headers: &HeaderMap) {
-    let version = headers
-        .get("x-client-version")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().chars().take(32).collect::<String>());
-    let rule_sets = client_supports_rule_sets(headers);
-    let res = sqlx::query(
-        "UPDATE team_members SET last_client_version = $3, last_client_rule_sets = $4 \
-         WHERE team_id = $1 AND user_id = $2 \
-           AND (last_client_version IS DISTINCT FROM $3 OR last_client_rule_sets IS DISTINCT FROM $4)",
-    )
-    .bind(team_id)
-    .bind(user_id)
-    .bind(version)
-    .bind(rule_sets)
-    .execute(pool)
-    .await;
-    if let Err(e) = res {
-        warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to record member client");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,27 +515,6 @@ mod tests {
         assert!(viewers.contains(&f.admin));
         assert!(!viewers.contains(&f.blocked));
         assert!(!viewers.contains(&f.viewer));
-    }
-
-    #[tokio::test]
-    async fn record_member_client_stamps_version_and_feature() {
-        let pool = test_pool_or_skip!();
-        let owner = seed_user(&pool).await;
-        let team = seed_team(&pool, owner).await;
-        let member = member_with_role(&pool, team, PERM_CONNECT).await;
-
-        record_member_client(&pool, team, member, &rule_set_client_headers()).await;
-
-        let (version, rule_sets): (Option<String>, bool) = sqlx::query_as(
-            "SELECT last_client_version, last_client_rule_sets FROM team_members WHERE team_id = $1 AND user_id = $2",
-        )
-        .bind(team)
-        .bind(member)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(version.as_deref(), Some("0.99.0"));
-        assert!(rule_sets);
     }
 
     #[tokio::test]
