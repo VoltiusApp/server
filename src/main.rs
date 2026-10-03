@@ -157,18 +157,19 @@ async fn main() {
     observability::spawn_storage_refresher(pool.clone());
 
     let notifier = SyncNotifier::new();
+    let terminal_manager = TerminalManager::new();
     {
-        let (pool, notifier) = (pool.clone(), notifier.clone());
+        let (pool, notifier, terminal_manager) = (pool.clone(), notifier.clone(), terminal_manager.clone());
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 team_plan::reconcile_all_teams(&pool, &notifier).await;
                 vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, None).await;
+                terminal_manager.recheck_sessions(None).await;
             }
         });
     }
-    let terminal_manager = TerminalManager::new();
     let presence_map: PresenceMap = Arc::new(DashMap::new());
     let usage_map: UsageMap = Arc::new(DashMap::new());
 
@@ -656,6 +657,7 @@ async fn main() {
             "/v1/billing/subscription/resume",
             post(routes::billing::resume_subscription),
         )
+        .layer(middleware::from_fn(terminal_manager::recheck_sessions_after_team_write))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
         .layer(Extension(search_limiter))

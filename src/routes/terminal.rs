@@ -3725,15 +3725,24 @@ mod live_revoke_tests {
         assert_eq!(grants, 0);
     }
 
-    #[tokio::test]
-    async fn leaving_a_vault_sessions_team_drops_the_live_socket() {
-        let pool = test_pool_or_skip!();
-        let host = seed_user(&pool).await;
-        set_user_tier(&pool, host, "teams").await;
-        let team = seed_team(&pool, host).await;
-        add_member(&pool, team, host).await;
-        let mate = member_with_role(&pool, team, PERM_JOIN_TERMINAL_SESSION).await;
-        let session_id = seed_session(&pool, host, "vault").await;
+    struct VaultSession {
+        manager: TerminalManager,
+        team: Uuid,
+        host: Uuid,
+        mate: Uuid,
+        session_id: Uuid,
+        host_ws: Client,
+        mate_ws: Client,
+    }
+
+    /// Host on a Teams plan sharing a `vault` session that `mate` joined through a Join role.
+    async fn vault_session_with_joined_mate(pool: &PgPool) -> VaultSession {
+        let host = seed_user(pool).await;
+        set_user_tier(pool, host, "teams").await;
+        let team = seed_team(pool, host).await;
+        add_member(pool, team, host).await;
+        let mate = member_with_role(pool, team, PERM_JOIN_TERMINAL_SESSION).await;
+        let session_id = seed_session(pool, host, "vault").await;
         let manager = TerminalManager::new();
         manager.insert_test_session(session_id, host).await;
         {
@@ -3743,11 +3752,68 @@ mod live_revoke_tests {
             state.vault_ids = vec![team];
         }
         let addr = serve(pool.clone(), manager.clone()).await;
-        let _host_ws = connect(addr, session_id, host).await;
-        let mut mate_ws = connect(addr, session_id, mate).await;
+        let host_ws = connect(addr, session_id, host).await;
+        let mate_ws = connect(addr, session_id, mate).await;
+        VaultSession { manager, team, host, mate, session_id, host_ws, mate_ws }
+    }
 
-        leave_team(&pool, &manager, team, mate).await;
+    #[tokio::test]
+    async fn leaving_a_vault_sessions_team_drops_the_live_socket() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
 
-        assert_evicted(&mut mate_ws).await;
+        leave_team(&pool, &s.manager, s.team, s.mate).await;
+
+        assert_evicted(&mut s.mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn stripping_join_from_a_role_drops_the_live_socket_on_recheck() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+
+        sqlx::query("UPDATE team_roles SET permissions = $2 WHERE team_id = $1 AND NOT is_builtin")
+            .bind(s.team)
+            .bind(crate::permissions::PERM_VIEW)
+            .execute(&pool)
+            .await
+            .unwrap();
+        s.manager.recheck_sessions(Some(s.team)).await;
+
+        assert_evicted(&mut s.mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn hiding_the_shared_host_drops_the_live_socket_on_recheck() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+        let object_id = format!("conn-{}", Uuid::new_v4());
+        crate::test_support::seed_team_object(&pool, s.team, s.host, &object_id, "connection").await;
+        sqlx::query("UPDATE terminal_sessions SET connection_object_id = $2 WHERE id = $1")
+            .bind(s.session_id)
+            .bind(&object_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO terminal_session_vaults (session_id, team_id) VALUES ($1, $2)")
+            .bind(s.session_id)
+            .bind(s.team)
+            .execute(&pool)
+            .await
+            .unwrap();
+        s.manager.recheck_sessions(Some(s.team)).await;
+        assert_still_relayed(&mut s.host_ws, &mut s.mate_ws).await;
+
+        let hidden = crate::test_support::seed_rule_set(
+            &pool,
+            s.team,
+            s.host,
+            &[("everyone", None, 0, crate::permissions::PERM_VIEW)],
+        )
+        .await;
+        crate::test_support::point_object(&pool, s.team, &object_id, Some(hidden)).await;
+        s.manager.recheck_sessions(Some(s.team)).await;
+
+        assert_evicted(&mut s.mate_ws).await;
     }
 }
