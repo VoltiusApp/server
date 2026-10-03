@@ -861,7 +861,7 @@ async fn listed_sessions(
 /// link, never listed here.
 async fn visible_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<VisibleSessionRow>, StatusCode> {
     let rows = listed_sessions(pool, user_id).await?;
-    let mut authz: std::collections::HashMap<Uuid, Option<crate::object_authz::ObjectAuthz>> = Default::default();
+    let mut authz = AuthzCache::new();
     let mut may_view: std::collections::HashMap<Uuid, bool> = Default::default();
     let mut kept = Vec::with_capacity(rows.len());
     for row in rows {
@@ -891,41 +891,60 @@ async fn visible_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<VisibleSes
                 continue;
             }
         }
-        let hidden = match row.connection_object_id.as_deref() {
-            Some(object_id) if row.host_user_id != user_id && row.invited_by.is_none() => {
-                let owners: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
-                    "SELECT team_id, rule_set_id FROM team_vault_objects WHERE object_id = $1 AND team_id = ANY($2)",
-                )
-                .bind(object_id)
-                .bind(&row.vault_ids)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| {
-                    error!(error = %e, "Failed to resolve shared host visibility");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-                let mut visible = owners.is_empty();
-                for (team_id, set) in owners {
-                    let entry = match authz.entry(team_id) {
-                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(crate::object_authz::ObjectAuthz::load(pool, team_id, user_id).await?)
-                        }
-                    };
-                    if entry.as_ref().is_some_and(|a| a.can(set, crate::permissions::PERM_VIEW)) {
-                        visible = true;
-                        break;
-                    }
-                }
-                !visible
-            }
-            _ => false,
-        };
-        if !hidden {
+        let object_id = row.connection_object_id.as_deref();
+        if !host_hidden_from(pool, user_id, row.id, row.host_user_id, row.invited_by.is_some(), object_id, &mut authz).await? {
             kept.push(row);
         }
     }
     Ok(kept)
+}
+
+type AuthzCache = std::collections::HashMap<Uuid, Option<crate::object_authz::ObjectAuthz>>;
+
+/// A teammate who is neither host nor invitee needs `View` on the session's host in one of its vaults.
+async fn host_hidden_from(
+    pool: &PgPool,
+    user_id: Uuid,
+    session_id: Uuid,
+    host_user_id: Uuid,
+    invited: bool,
+    connection_object_id: Option<&str>,
+    authz: &mut AuthzCache,
+) -> Result<bool, StatusCode> {
+    let Some(object_id) = connection_object_id else {
+        return Ok(false);
+    };
+    if host_user_id == user_id || invited {
+        return Ok(false);
+    }
+    let owners: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT tvo.team_id, tvo.rule_set_id FROM team_vault_objects tvo \
+           JOIN terminal_session_vaults tsv ON tsv.team_id = tvo.team_id \
+          WHERE tsv.session_id = $1 AND tvo.object_id = $2",
+    )
+    .bind(session_id)
+    .bind(object_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to resolve shared host visibility");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if owners.is_empty() {
+        return Ok(false);
+    }
+    for (team_id, set) in owners {
+        let entry = match authz.entry(team_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(crate::object_authz::ObjectAuthz::load(pool, team_id, user_id).await?)
+            }
+        };
+        if entry.as_ref().is_some_and(|a| a.can(set, crate::permissions::PERM_VIEW)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub async fn list_active_sessions(
@@ -990,9 +1009,10 @@ pub async fn get_my_session_key(
     Query(query): Query<GetKeyQuery>,
 ) -> Result<Json<SessionKeyResponse>, StatusCode> {
     // First try a wrapped key entry (vault sessions with per-user E2EE wrapping)
-    let wrapped = sqlx::query_as::<_, (String, String)>(
+    let wrapped = sqlx::query_as::<_, (String, String, Uuid, Option<String>, bool)>(
         r#"
-        SELECT tsk.wrapped_key, u.public_key
+        SELECT tsk.wrapped_key, u.public_key, ts.host_user_id, ts.connection_object_id,
+               EXISTS (SELECT 1 FROM terminal_session_invitees tsi WHERE tsi.session_id = ts.id AND tsi.user_id = $2)
         FROM terminal_session_keys tsk
         JOIN terminal_sessions ts ON ts.id = tsk.session_id
         JOIN users u ON u.id = ts.host_user_id
@@ -1009,7 +1029,11 @@ pub async fn get_my_session_key(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if let Some((wrapped_key, host_public_key)) = wrapped {
+    if let Some((wrapped_key, host_public_key, host_user_id, connection_object_id, invited)) = wrapped {
+        let object_id = connection_object_id.as_deref();
+        if host_hidden_from(&pool, auth.0, session_id, host_user_id, invited, object_id, &mut AuthzCache::new()).await? {
+            return Err(StatusCode::NOT_FOUND);
+        }
         return Ok(Json(SessionKeyResponse {
             wrapped_key: Some(wrapped_key),
             raw_key: None,
@@ -1374,8 +1398,8 @@ pub(crate) async fn is_authorized_participant(
         .await
         .unwrap_or(false)
     };
-    is_member
-        && crate::permissions::has_any_team_permission(
+    if !is_member
+        || !crate::permissions::has_any_team_permission(
             pool,
             vault_ids,
             user_id,
@@ -1383,6 +1407,20 @@ pub(crate) async fn is_authorized_participant(
         )
         .await
         .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(object_id) = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT connection_object_id FROM terminal_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    else {
+        return false;
+    };
+    let hidden = host_hidden_from(pool, user_id, session_id, host_user_id, false, object_id.as_deref(), &mut AuthzCache::new()).await;
+    hidden == Ok(false)
 }
 
 /// Stamps first admission. `accepted_at IS NULL` in the predicate makes a
@@ -3075,7 +3113,8 @@ mod tests {
         let owner = seed_user(pool).await;
         let team = seed_team(pool, owner).await;
         let host = crate::test_support::member_with_role(pool, team, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
-        let mate = crate::test_support::member_with_role(pool, team, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+        let mate_perms = crate::permissions::PERM_VIEW_TERMINAL_SESSIONS | crate::permissions::PERM_JOIN_TERMINAL_SESSION;
+        let mate = crate::test_support::member_with_role(pool, team, mate_perms).await;
         crate::test_support::seed_team_object(pool, team, owner, "h-1", "connection").await;
         let mut entries = vec![("everyone", None, 0, crate::permissions::PERM_VIEW), ("member", Some(host), crate::permissions::PERM_VIEW, 0)];
         if allow_mate {
@@ -3104,6 +3143,53 @@ mod tests {
         let pool = test_pool_or_skip!();
         let (_, mate, session_id) = vault_session_on_host(&pool, true).await;
         assert!(visible_sessions(&pool, mate).await.unwrap().iter().any(|r| r.id == session_id));
+    }
+
+    async fn fetch_wrapped_key(pool: &PgPool, session_id: Uuid, user: Uuid) -> Result<Json<SessionKeyResponse>, StatusCode> {
+        sqlx::query("INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) VALUES ($1, $2, 'wrapped')")
+            .bind(session_id).bind(user).execute(pool).await.unwrap();
+        get_my_session_key(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            axum::extract::Path(session_id),
+            axum::extract::Query(GetKeyQuery { invite_token: None }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_key_on_a_hidden_host_is_not_served_to_a_blocked_teammate() {
+        let pool = test_pool_or_skip!();
+        let (_, mate, session_id) = vault_session_on_host(&pool, false).await;
+        assert_eq!(fetch_wrapped_key(&pool, session_id, mate).await.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_key_on_a_visible_host_is_still_served() {
+        let pool = test_pool_or_skip!();
+        let (host, mate, session_id) = vault_session_on_host(&pool, true).await;
+        assert!(fetch_wrapped_key(&pool, session_id, mate).await.is_ok());
+        assert!(fetch_wrapped_key(&pool, session_id, host).await.is_ok());
+    }
+
+    async fn admits_to_vault_session(pool: &PgPool, session_id: Uuid, user: Uuid, host: Uuid) -> bool {
+        let vault_ids: Vec<Uuid> = sqlx::query_scalar("SELECT team_id FROM terminal_session_vaults WHERE session_id = $1")
+            .bind(session_id).fetch_all(pool).await.unwrap();
+        is_authorized_participant(pool, session_id, user, host, "vault", &vault_ids, &[], None, &Default::default()).await
+    }
+
+    #[tokio::test]
+    async fn a_blocked_teammate_cannot_join_a_vault_session_on_a_hidden_host() {
+        let pool = test_pool_or_skip!();
+        let (host, mate, session_id) = vault_session_on_host(&pool, false).await;
+        assert!(!admits_to_vault_session(&pool, session_id, mate, host).await);
+    }
+
+    #[tokio::test]
+    async fn a_teammate_with_view_still_joins_a_vault_session() {
+        let pool = test_pool_or_skip!();
+        let (host, mate, session_id) = vault_session_on_host(&pool, true).await;
+        assert!(admits_to_vault_session(&pool, session_id, mate, host).await);
     }
 
     #[tokio::test]
