@@ -81,18 +81,23 @@ impl TerminalManager {
     }
 }
 
-/// Any successful write under `/v1/teams/:team_id/` may have cost someone View or Join.
-pub async fn recheck_sessions_after_team_write(
+/// `Some(None)` rechecks every session: a team write can cost View or Join, an account write the account.
+fn recheck_scope(path: &str) -> Option<Option<Uuid>> {
+    if let Some(rest) = path.strip_prefix("/v1/teams/") {
+        return rest.split('/').next()?.parse().ok().map(Some);
+    }
+    (path.starts_with("/v1/admin/users/") || path == "/v1/auth/account").then_some(None)
+}
+
+pub async fn recheck_sessions_after_access_write(
     Extension(manager): Extension<TerminalManager>,
     req: Request,
     next: Next,
 ) -> Response {
-    let team = (!req.method().is_safe())
-        .then(|| req.uri().path().strip_prefix("/v1/teams/")?.split('/').next()?.parse::<Uuid>().ok())
-        .flatten();
+    let scope = (!req.method().is_safe()).then(|| recheck_scope(req.uri().path())).flatten();
     let res = next.run(req).await;
-    if let Some(team) = team.filter(|_| res.status().is_success()) {
-        manager.recheck_sessions(Some(team)).await;
+    if let Some(team) = scope.filter(|_| res.status().is_success()) {
+        manager.recheck_sessions(team).await;
     }
     res
 }
@@ -131,7 +136,6 @@ mod tests {
         body::Body,
         http::{Method, Request, StatusCode},
         middleware::from_fn,
-        routing::patch,
         Extension, Router,
     };
     use tower::ServiceExt;
@@ -148,9 +152,8 @@ mod tests {
 
     async fn send(manager: &TerminalManager, method: Method, path: &str, status: StatusCode) {
         let app = Router::new()
-            .route("/v1/teams/:team_id/roles/:role_id", patch(move || async move { status }).get(move || async move { status }))
-            .route("/v1/teams", patch(move || async move { status }))
-            .layer(from_fn(recheck_sessions_after_team_write))
+            .fallback(move || async move { status })
+            .layer(from_fn(recheck_sessions_after_access_write))
             .layer(Extension(manager.clone()));
         let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
         app.oneshot(req).await.unwrap();
@@ -179,8 +182,28 @@ mod tests {
         send(&manager, Method::GET, &role_path, StatusCode::OK).await;
         send(&manager, Method::PATCH, &role_path, StatusCode::FORBIDDEN).await;
         send(&manager, Method::PATCH, "/v1/teams", StatusCode::OK).await;
+        send(&manager, Method::GET, &format!("/v1/admin/users/{}", Uuid::new_v4()), StatusCode::OK).await;
+        send(&manager, Method::PUT, "/v1/auth/email", StatusCode::OK).await;
 
         assert!(!rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn account_writes_recheck_every_session() {
+        let manager = TerminalManager::new();
+        let user = Uuid::new_v4();
+        for (method, path) in [
+            (Method::POST, format!("/v1/admin/users/{user}/ban")),
+            (Method::DELETE, format!("/v1/admin/users/{user}")),
+            (Method::DELETE, "/v1/auth/account".to_string()),
+        ] {
+            let a = vault_session(&manager, Uuid::new_v4()).await;
+            let b = vault_session(&manager, Uuid::new_v4()).await;
+
+            send(&manager, method.clone(), &path, StatusCode::NO_CONTENT).await;
+
+            assert!(a.has_changed().unwrap() && b.has_changed().unwrap(), "{method} {path}");
+        }
     }
 
     #[tokio::test]

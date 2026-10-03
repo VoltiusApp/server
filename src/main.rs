@@ -657,7 +657,7 @@ async fn main() {
             "/v1/billing/subscription/resume",
             post(routes::billing::resume_subscription),
         )
-        .layer(middleware::from_fn(terminal_manager::recheck_sessions_after_team_write))
+        .layer(middleware::from_fn(terminal_manager::recheck_sessions_after_access_write))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter))
         .layer(Extension(search_limiter))
@@ -716,7 +716,9 @@ async fn main() {
         .route("/v1/admin/audit-log", get(routes::admin::list_audit_log))
         .route("/v1/admin/churn", get(routes::admin::list_churn))
         .route("/v1/admin/presence", get(routes::admin::get_presence))
+        .layer(middleware::from_fn(terminal_manager::recheck_sessions_after_access_write))
         .layer(middleware::from_fn(auth::require_admin_key))
+        .layer(Extension(terminal_manager.clone()))
         .layer(Extension(notifier.clone()))
         .layer(Extension(presence_map.clone()))
         .layer(Extension(ls_cache.clone()));
