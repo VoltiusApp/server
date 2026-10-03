@@ -498,3 +498,18 @@ pub async fn rotation_request_count(pool: &PgPool, team: Uuid) -> i64 {
         .await
         .unwrap()
 }
+
+pub async fn seed_vault_key(pool: &PgPool, team: Uuid, user: Uuid, wrapped_by: Uuid, version: i32, fetched: bool) {
+    sqlx::query(
+        "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version, fetched_at) \
+         VALUES ($1, $2, 'wrapped', $3, $4, CASE WHEN $5 THEN now() END)",
+    )
+    .bind(team)
+    .bind(user)
+    .bind(wrapped_by)
+    .bind(version)
+    .bind(fetched)
+    .execute(pool)
+    .await
+    .expect("seed vault key");
+}

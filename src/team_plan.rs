@@ -4,10 +4,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::entitlement::{effective_tier_of, TierRow, OWNER_PLAN_COLUMNS};
-use crate::object_authz::{
-    holds_vault_key_gate, live_rule_set_ids, member_rows, rule_entries, MemberRow,
-};
-use crate::routes::teams::{notify_team_members_changed, request_team_rotation};
+use crate::object_authz::member_rows;
+use crate::routes::teams::notify_team_members_changed;
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
 
@@ -70,15 +68,6 @@ pub async fn reconcile_team_plan(
         return Ok(());
     }
     let members = member_rows(pool, team_id, None).await?;
-    if locked_now {
-        let entries = rule_entries(pool, team_id, None).await?;
-        let live = live_rule_set_ids(pool, team_id).await?;
-        let gate =
-            |m: &MemberRow, locked| holds_vault_key_gate(m.context(locked), entries.clone(), &live);
-        if members.iter().any(|m| gate(m, false) && !gate(m, true)) {
-            request_team_rotation(&mut tx, team_id).await?;
-        }
-    }
     sqlx::query("UPDATE teams SET granular_locked = $2 WHERE id = $1")
         .bind(team_id)
         .bind(locked_now)
@@ -194,7 +183,7 @@ mod db_tests {
     }
 
     #[tokio::test]
-    async fn downgrade_that_drops_a_key_gate_queues_one_rotation() {
+    async fn a_repeat_downgrade_reconcile_is_silent() {
         let _mode = BillingMode::hosted();
         let pool = crate::test_pool_or_skip!();
         let owner = seed_user(&pool).await;
@@ -207,22 +196,6 @@ mod db_tests {
         reconcile_team_plan(&pool, &notifier, team).await.unwrap();
         assert!(rx.try_recv().is_err());
         assert!(stored_lock(&pool, team).await);
-        assert_eq!(rotation_request_count(&pool, team).await, 1);
-    }
-
-    #[tokio::test]
-    async fn downgrade_without_a_gate_loss_does_not_rotate() {
-        let _mode = BillingMode::hosted();
-        let pool = crate::test_pool_or_skip!();
-        let owner = seed_user(&pool).await;
-        set_user_tier(&pool, owner, "teams").await;
-        let team = seed_team_with_roles(&pool, owner).await;
-        member_with_role(&pool, team, PERM_VIEW).await;
-        reconcile_team_plan(&pool, &SyncNotifier::new(), team)
-            .await
-            .unwrap();
-        assert!(stored_lock(&pool, team).await);
-        assert_eq!(rotation_request_count(&pool, team).await, 0);
     }
 
     #[tokio::test]

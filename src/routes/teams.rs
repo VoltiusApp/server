@@ -7,7 +7,6 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
-use crate::object_authz::{holds_vault_key_gate, live_rule_set_ids, rule_entries};
 use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
 use crate::PresenceMap;
@@ -1492,12 +1491,6 @@ pub async fn set_member_permissions(
     let previous = override_masks(&mut *tx, team_id, target_user_id).await?;
     crate::team_plan::require_granular(&pool, team_id, crate::team_plan::narrows_masks(previous, (allow, deny))).await?;
 
-    let target = crate::object_authz::member_rows(&pool, team_id, Some(target_user_id))
-        .await?
-        .pop()
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let locked = crate::team_plan::team_locked(&pool, team_id).await?;
-
     if allow == 0 && deny == 0 {
         sqlx::query("DELETE FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
             .bind(team_id)
@@ -1523,21 +1516,11 @@ pub async fn set_member_permissions(
         .map_err(|e| { error!(error = %e, "Failed to write member overrides"); StatusCode::INTERNAL_SERVER_ERROR })?;
     }
 
-    let entries = rule_entries(&pool, team_id, None).await?;
-    let live = live_rule_set_ids(&pool, team_id).await?;
-
-    let prev_ctx = target.with_overrides(previous.0, previous.1).context(locked);
-    let next_ctx = target.with_overrides(allow, deny).context(locked);
-    let held_before = holds_vault_key_gate(prev_ctx, entries.clone(), &live);
-    let held_after = holds_vault_key_gate(next_ctx, entries, &live);
-    if held_before && !held_after {
-        request_team_rotation(&mut tx, team_id).await?;
-    }
-
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit set_member_permissions transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    crate::vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, Some(team_id)).await;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -2584,15 +2567,9 @@ mod authz_tests {
         let member = seed_user(pool).await;
         crate::test_support::add_member(pool, team, member).await;
         crate::test_support::set_member_overrides(pool, team, member, crate::permissions::PERM_VIEW | crate::permissions::PERM_CONNECT, 0).await;
+        crate::test_support::seed_vault_key(pool, team, member, owner, 1, true).await;
         assert_eq!(put_member_overrides(pool, team, owner, member, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
         crate::test_support::rotation_request_count(pool, team).await
-    }
-
-    #[tokio::test]
-    async fn locked_team_removing_an_allow_never_queues_rotation() {
-        let _env = BillingMode::hosted();
-        let pool = test_pool_or_skip!();
-        assert_eq!(rotations_after_removing_an_allow(&pool, "teams").await, 0);
     }
 
     #[tokio::test]
@@ -2618,6 +2595,7 @@ mod authz_tests {
                 .unwrap()
         };
         crate::test_support::set_member_overrides(&pool, team, target, 0, PERM_VIEW_SECRETS).await;
+        crate::test_support::seed_vault_key(&pool, team, target, owner, 1, true).await;
         assert!(!locked_flag().await);
 
         assert_eq!(put_member_overrides(&pool, team, owner, target, 0, 0, crate::test_support::rule_set_client_headers()).await, Ok(StatusCode::NO_CONTENT));
@@ -3529,6 +3507,7 @@ mod override_response_tests {
         sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
+        crate::test_support::seed_vault_key(&pool, team, target, owner, 1, true).await;
 
         let rotations = || async {
             crate::test_support::rotation_request_count(&pool, team).await
@@ -3583,10 +3562,11 @@ mod override_response_tests {
         add_member(&pool, team, actor).await;
         assign_role(&pool, team, actor, actor_role).await;
 
-        let target_role = seed_role(&pool, team, "reader", PERM_VIEW_SECRETS | PERM_CONNECT).await;
+        let target_role = seed_role(&pool, team, "reader", PERM_VIEW_SECRETS | PERM_CONNECT | crate::permissions::PERM_VIEW).await;
         sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
+        crate::test_support::seed_vault_key(&pool, team, target, owner, 1, true).await;
 
         put_member_overrides(&pool, team, actor, target, 0, PERM_VIEW_SECRETS, axum::http::HeaderMap::new())
         .await
@@ -3636,6 +3616,7 @@ mod override_response_tests {
         let contractor = seed_user(&pool).await;
         add_member(&pool, team, contractor).await;
         crate::test_support::set_member_overrides(&pool, team, contractor, crate::permissions::PERM_CONNECT | PERM_VIEW_SECRETS | crate::permissions::PERM_VIEW, 0).await;
+        crate::test_support::seed_vault_key(&pool, team, contractor, owner, 1, true).await;
 
         put_member_overrides(&pool, team, owner, contractor, 0, 0, axum::http::HeaderMap::new())
         .await
@@ -3656,6 +3637,7 @@ mod override_response_tests {
         sqlx::query("UPDATE team_roles SET position = 2 WHERE id = $1").bind(target_role).execute(&pool).await.unwrap();
         add_member(&pool, team, target).await;
         assign_role(&pool, team, target, target_role).await;
+        crate::test_support::seed_vault_key(&pool, team, target, owner, 1, true).await;
         crate::test_support::seed_rule_set(&pool, team, owner, &[]).await;
 
         put_member_overrides(&pool, team, owner, target, 0, crate::permissions::PERM_VIEW, rule_set_client_headers())
@@ -3687,6 +3669,7 @@ mod override_response_tests {
         )
         .await;
         crate::test_support::point_object(&pool, team, "obj-1", Some(set)).await;
+        crate::test_support::seed_vault_key(&pool, team, target, owner, 1, true).await;
 
         put_member_overrides(&pool, team, owner, target, 0, PERM_CONNECT, axum::http::HeaderMap::new())
         .await
