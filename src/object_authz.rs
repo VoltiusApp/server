@@ -74,10 +74,6 @@ impl MemberRow {
         };
         MemberContext { user_id: self.user_id, base, team_deny: self.deny, role_ids: self.role_ids.clone(), locked }
     }
-
-    pub fn with_overrides(&self, allow: i64, deny: i64) -> MemberRow {
-        MemberRow { allow, deny, ..self.clone() }
-    }
 }
 
 pub(crate) fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
@@ -393,12 +389,6 @@ mod tests {
     fn locked_context_keeps_a_builtin_bit_a_redundant_allow_repeats() {
         let c = row(PERM_VIEW | PERM_CONNECT, 0, PERM_CONNECT, 0).context(true);
         assert_eq!(c.base, PERM_VIEW | PERM_CONNECT);
-    }
-
-    #[test]
-    fn with_overrides_replaces_only_the_masks() {
-        let r = row(PERM_VIEW, 0, 1, 2).with_overrides(PERM_CONNECT, 0);
-        assert_eq!((r.builtin, r.allow, r.deny), (PERM_VIEW, PERM_CONNECT, 0));
     }
 
     #[test]

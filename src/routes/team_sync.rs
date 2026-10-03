@@ -136,30 +136,43 @@ pub async fn get_my_vault_key(
     require_vault_key_access(&pool, team_id, auth.0, "get_vault_key").await?;
     require_rule_set_feature(&headers)?;
 
-    let row = sqlx::query_as::<_, (String, Uuid, i32)>(
-        "SELECT wrapped_key, wrapped_by, key_version FROM team_vault_keys \
-         WHERE team_id = $1 AND user_id = $2 \
-         ORDER BY key_version DESC LIMIT 1",
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, user_id = %auth.0, "Failed to fetch vault key");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
+    let key = deliver_key(&pool, team_id, auth.0, None).await?.ok_or_else(|| {
         warn!(team_id = %team_id, user_id = %auth.0, "Vault key not found for user");
         StatusCode::NOT_FOUND
     })?;
-
     info!(team_id = %team_id, user_id = %auth.0, "Vault key fetched");
-    Ok(Json(VaultKeyResponse {
-        wrapped_key: row.0,
-        wrapped_by_user_id: row.1,
-        key_version: row.2,
-    }))
+    Ok(Json(key))
+}
+
+/// `version: None` delivers the caller's newest wrap.
+async fn deliver_key(
+    pool: &PgPool,
+    team_id: Uuid,
+    user_id: Uuid,
+    version: Option<i32>,
+) -> Result<Option<VaultKeyResponse>, StatusCode> {
+    sqlx::query_as::<_, (String, Uuid, i32)>(
+        "UPDATE team_vault_keys SET fetched_at = now() \
+         WHERE team_id = $1 AND user_id = $2 AND key_version = COALESCE($3, \
+             (SELECT MAX(key_version) FROM team_vault_keys WHERE team_id = $1 AND user_id = $2)) \
+         RETURNING wrapped_key, wrapped_by, key_version",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .bind(version)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|(wrapped_key, wrapped_by_user_id, key_version)| VaultKeyResponse {
+            wrapped_key,
+            wrapped_by_user_id,
+            key_version,
+        })
+    })
+    .map_err(|e| {
+        error!(error = %e, team_id = %team_id, user_id = %user_id, ?version, "Failed to deliver vault key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 // ─── GET /v1/teams/:team_id/vault-key/:version ───────────────────────────────
@@ -177,25 +190,7 @@ pub async fn get_vault_key_at_version(
     require_vault_key_access(&pool, team_id, auth.0, "get_vault_key_at_version").await?;
     require_rule_set_feature(&headers)?;
 
-    let row = sqlx::query_as::<_, (String, Uuid)>(
-        "SELECT wrapped_key, wrapped_by FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = $3",
-    )
-    .bind(team_id)
-    .bind(auth.0)
-    .bind(version)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, team_id = %team_id, user_id = %auth.0, version, "Failed to fetch vault key at version");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok(Json(VaultKeyResponse {
-        wrapped_key: row.0,
-        wrapped_by_user_id: row.1,
-        key_version: version,
-    }))
+    deliver_key(&pool, team_id, auth.0, Some(version)).await?.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 // ─── GET /v1/teams/:team_id/vault-key/rotation-status ────────────────────────
@@ -741,7 +736,7 @@ mod tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_team,
-        seed_user,
+        seed_user, seed_vault_key,
     };
     use axum::extract::{Path, State};
     use axum::Extension;
@@ -770,19 +765,6 @@ mod tests {
         assign_role(pool, team, user, role).await;
     }
 
-    async fn insert_vault_key(pool: &PgPool, team: Uuid, user: Uuid, wrapped_by: Uuid) {
-        sqlx::query(
-            "INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by) \
-             VALUES ($1, $2, 'wrapped', $3)",
-        )
-        .bind(team)
-        .bind(user)
-        .bind(wrapped_by)
-        .execute(pool)
-        .await
-        .expect("insert vault key");
-    }
-
     #[tokio::test]
     async fn holders_lists_only_members_with_a_key() {
         let pool = test_pool_or_skip!();
@@ -796,7 +778,7 @@ mod tests {
         add_member(&pool, team, keyless).await;
 
         // Only the owner holds a key.
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
 
         let holders = get_vault_key_holders(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
             .await
@@ -936,7 +918,7 @@ mod tests {
         let connect_only = seed_user(&pool).await;
         add_member(&pool, team, connect_only).await;
         grant_connect_only(&pool, team, connect_only).await;
-        insert_vault_key(&pool, team, connect_only, owner).await;
+        seed_vault_key(&pool, team, connect_only, owner, 1, false).await;
 
         let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(connect_only)), rule_set_client_headers(), Path(team))
             .await
@@ -981,7 +963,7 @@ mod tests {
         // Member of the team but granted no roles → neither bit.
         let member = seed_user(&pool).await;
         add_member(&pool, team, member).await;
-        insert_vault_key(&pool, team, member, owner).await;
+        seed_vault_key(&pool, team, member, owner, 1, false).await;
 
         let res = get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), rule_set_client_headers(), Path(team)).await;
 
@@ -1015,7 +997,7 @@ mod tests {
         let connect_only = seed_user(&pool).await;
         add_member(&pool, team, connect_only).await;
         grant_connect_only(&pool, team, connect_only).await;
-        insert_vault_key(&pool, team, connect_only, owner).await;
+        seed_vault_key(&pool, team, connect_only, owner, 1, false).await;
 
         let res = get_team_blob(State(pool.clone()), Extension(AuthUser(connect_only)), rule_set_client_headers(), Path(team)).await;
 
@@ -1164,6 +1146,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetching_a_wrap_records_only_that_epoch_as_delivered() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
+        seed_vault_key(&pool, team, owner, owner, 2, false).await;
+        let delivered = || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT key_version FROM team_vault_keys WHERE team_id = $1 AND fetched_at IS NOT NULL ORDER BY 1",
+            )
+            .bind(team)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+
+        assert!(get_my_vault_key(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path(team)).await.is_ok());
+        assert_eq!(delivered().await, vec![2]);
+
+        assert!(get_vault_key_at_version(State(pool.clone()), Extension(AuthUser(owner)), rule_set_client_headers(), Path((team, 1))).await.is_ok());
+        assert_eq!(delivered().await, vec![1, 2]);
+    }
+
+    #[tokio::test]
     async fn vault_key_at_version_404_when_this_member_has_no_row_at_that_version() {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
@@ -1203,7 +1211,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await; // key_version defaults to 1
+        seed_vault_key(&pool, team, owner, owner, 1, false).await; // key_version defaults to 1
 
         let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team))
             .await
@@ -1221,7 +1229,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
 
         // A second member joined but has never been wrapped a key at all.
         let newcomer = seed_user(&pool).await;
@@ -1244,7 +1252,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await; // owner fully covered at epoch 1
+        seed_vault_key(&pool, team, owner, owner, 1, false).await; // owner fully covered at epoch 1
 
         // No under-covered member exists — this is the case that a plain
         // removal (member + their key row deleted, nothing else touched)
@@ -1267,7 +1275,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
 
         sqlx::query("INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, 1)")
             .bind(team).execute(&pool).await.expect("insert rotation request");
@@ -1293,7 +1301,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
 
         // A member with no public key on file can never receive a wrapped key,
         // so their absence from team_vault_keys must not force stale=true forever.
@@ -1399,7 +1407,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets_and_copy(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await; // epoch 1
+        seed_vault_key(&pool, team, owner, owner, 1, false).await; // epoch 1
 
         let res = rotate_vault_key(
             State(pool.clone()),
@@ -1475,7 +1483,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets_and_copy(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
 
         let other = seed_user(&pool).await;
         add_member(&pool, team, other).await;
@@ -1503,7 +1511,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets_and_copy(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
 
         let keyless = seed_user(&pool).await;
         add_member(&pool, team, keyless).await;
@@ -1618,7 +1626,7 @@ mod tests {
         let team = seed_team(&pool, owner).await;
         add_member(&pool, team, owner).await;
         grant_view_secrets_and_copy(&pool, team, owner).await;
-        insert_vault_key(&pool, team, owner, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
         let newcomer = member_with_role(
             &pool, team, PERM_CONNECT | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS,
         )
@@ -1664,7 +1672,7 @@ mod tests {
         crate::test_support::set_user_tier(&pool, owner, "teams").await;
         let team = seed_team(&pool, owner).await;
         let junior = member_with_role(&pool, team, 0).await;
-        insert_vault_key(&pool, team, junior, owner).await;
+        seed_vault_key(&pool, team, junior, owner, 1, false).await;
         crate::test_support::seed_team_object(&pool, team, owner, "h-1", "connection").await;
         let set = crate::test_support::seed_rule_set(&pool, team, owner, &[("member", Some(junior), PERM_CONNECT, 0)]).await;
 
@@ -1713,7 +1721,7 @@ mod tests {
         crate::test_support::set_user_tier(&pool, owner, "teams").await;
         let team = seed_team(&pool, owner).await;
         let member = member_with_role(&pool, team, PERM_CONNECT).await;
-        insert_vault_key(&pool, team, member, owner).await;
+        seed_vault_key(&pool, team, member, owner, 1, false).await;
         let res = get_my_vault_key(State(pool.clone()), axum::Extension(AuthUser(member)), axum::http::HeaderMap::new(), Path(team)).await;
         assert_eq!(res.err(), Some(StatusCode::UPGRADE_REQUIRED));
     }
@@ -1729,7 +1737,7 @@ mod tests {
         let member = seed_user(&pool).await;
         add_member(&pool, team, member).await;
         crate::test_support::set_member_overrides(&pool, team, member, crate::permissions::PERM_VIEW | PERM_CONNECT, 0).await;
-        insert_vault_key(&pool, team, member, owner).await;
+        seed_vault_key(&pool, team, member, owner, 1, false).await;
 
         let call = || get_my_vault_key(State(pool.clone()), Extension(AuthUser(member)), rule_set_client_headers(), Path(team));
         assert_eq!(call().await.err(), Some(StatusCode::FORBIDDEN));

@@ -17,6 +17,7 @@ mod single_instance;
 mod session_grants;
 mod team_join_grants;
 mod team_plan;
+mod vault_key_exposure;
 mod sync_notifier;
 mod terminal_manager;
 #[cfg(test)]
@@ -163,6 +164,7 @@ async fn main() {
             loop {
                 interval.tick().await;
                 team_plan::reconcile_all_teams(&pool, &notifier).await;
+                vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, None).await;
             }
         });
     }
