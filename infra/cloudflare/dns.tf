@@ -104,6 +104,15 @@ resource "cloudflare_dns_record" "txt_cf2024_1_domainkey" {
   ttl     = 1
 }
 
+# p=reject: only Resend and Cloudflare (both DKIM-aligned) may send as voltius.app.
+resource "cloudflare_dns_record" "txt_dmarc" {
+  zone_id = var.zone_id
+  name    = "_dmarc.voltius.app"
+  type    = "TXT"
+  content = "\"v=DMARC1; p=reject\""
+  ttl     = 1
+}
+
 resource "cloudflare_dns_record" "txt_gh_voltiusapp_o" {
   zone_id = var.zone_id
   name    = "_gh-voltiusapp-o.voltius.app"
