@@ -1669,6 +1669,15 @@ async fn handle_socket(
 
         match msg_type {
             "output" | "input" => {
+                let is_output = msg_type == "output";
+                // Held across the send so a revoke cannot land between the check and the relay.
+                let mut sessions = manager.sessions.lock().await;
+                let Some(state) = sessions.get_mut(&session_id) else { continue };
+                let allowed_sender = if is_output { state.host_user_id } else { state.control_holder };
+                if user_id != allowed_sender {
+                    continue;
+                }
+
                 let relay = serde_json::json!({
                     "type": msg_type,
                     "from": user_id,
@@ -1678,14 +1687,11 @@ async fn handle_socket(
 
                 // Keep a rolling history of output messages for late-join replay.
                 // Input messages are not replayed — only rendered output matters.
-                if msg_type == "output" {
-                    let mut sessions = manager.sessions.lock().await;
-                    if let Some(state) = sessions.get_mut(&session_id) {
-                        if state.output_history.len() >= crate::terminal_manager::OUTPUT_HISTORY_MAX {
-                            state.output_history.pop_front();
-                        }
-                        state.output_history.push_back(relay.clone());
+                if is_output {
+                    if state.output_history.len() >= crate::terminal_manager::OUTPUT_HISTORY_MAX {
+                        state.output_history.pop_front();
                     }
+                    state.output_history.push_back(relay.clone());
                 }
 
                 let _ = tx.send(relay);
@@ -3608,20 +3614,27 @@ mod live_revoke_tests {
         try_connect(addr, session_id, user).await.expect("admitted")
     }
 
-    /// Next frame of `kind`, skipping others; `None` once the server closes the socket.
-    async fn next_of_type(ws: &mut Client, kind: &str) -> Option<serde_json::Value> {
+    /// Every frame up to and including the next of `kind`; `None` once the server closes the socket.
+    async fn frames_through(ws: &mut Client, kind: &str) -> Option<Vec<serde_json::Value>> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut seen = Vec::new();
             while let Some(Ok(frame)) = ws.next().await {
                 let WsMessage::Text(text) = frame else { continue };
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                if value["type"] == kind {
-                    return Some(value);
+                let done = value["type"] == kind;
+                seen.push(value);
+                if done {
+                    return Some(seen);
                 }
             }
             None
         })
         .await
         .expect("timed out waiting for a frame")
+    }
+
+    async fn next_of_type(ws: &mut Client, kind: &str) -> Option<serde_json::Value> {
+        frames_through(ws, kind).await.and_then(|mut seen| seen.pop())
     }
 
     async fn assert_evicted(guest: &mut Client) {
@@ -3906,5 +3919,77 @@ mod live_revoke_tests {
         s.manager.recheck_sessions(Some(s.team)).await;
 
         assert_evicted(&mut s.mate_ws).await;
+    }
+
+    async fn send_json(ws: &mut Client, frame: serde_json::Value) {
+        ws.send(WsMessage::Text(frame.to_string())).await.unwrap();
+    }
+
+    async fn joined_mate(pool: &PgPool) -> (TerminalManager, Uuid, Uuid, Uuid, Client, Client) {
+        let host = seed_user(pool).await;
+        let mate = seed_user(pool).await;
+        let team = seed_team(pool, host).await;
+        let (manager, session_id, host_ws, mate_ws) = direct_session_with_joined_mate(pool, &[team], host, mate).await;
+        (manager, session_id, host, mate, host_ws, mate_ws)
+    }
+
+    async fn grant(host_ws: &mut Client, mate_ws: &mut Client, mate: Uuid) {
+        send_json(host_ws, serde_json::json!({"type": "grant_control", "target_user_id": mate})).await;
+        let update = next_of_type(mate_ws, "control_update").await.unwrap();
+        assert_eq!(update["holder"], mate.to_string());
+    }
+
+    // The guest's frames are handled in order, so the request_control echo proves the input was already dropped.
+    async fn assert_input_dropped(host_ws: &mut Client, mate_ws: &mut Client) {
+        send_json(mate_ws, serde_json::json!({"type": "input", "data": "rm -rf ~"})).await;
+        send_json(mate_ws, serde_json::json!({"type": "request_control"})).await;
+        let seen = frames_through(host_ws, "control_update").await.unwrap();
+        assert!(seen.iter().all(|f| f["type"] != "input"), "input from a guest without control was relayed: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_guest_without_control_cannot_type_into_the_host() {
+        let pool = test_pool_or_skip!();
+        let (_, _, _, _, mut host_ws, mut mate_ws) = joined_mate(&pool).await;
+
+        assert_input_dropped(&mut host_ws, &mut mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn a_granted_guest_can_type_until_control_is_revoked() {
+        let pool = test_pool_or_skip!();
+        let (_, _, _, mate, mut host_ws, mut mate_ws) = joined_mate(&pool).await;
+        grant(&mut host_ws, &mut mate_ws, mate).await;
+
+        send_json(&mut mate_ws, serde_json::json!({"type": "input", "data": "ls"})).await;
+        let input = next_of_type(&mut host_ws, "input").await.unwrap();
+        assert_eq!((input["from"].as_str(), input["data"].as_str()), (Some(mate.to_string().as_str()), Some("ls")));
+
+        send_json(&mut host_ws, serde_json::json!({"type": "revoke_control"})).await;
+        next_of_type(&mut mate_ws, "control_update").await.unwrap();
+        next_of_type(&mut host_ws, "control_update").await.unwrap();
+        assert_input_dropped(&mut host_ws, &mut mate_ws).await;
+    }
+
+    #[tokio::test]
+    async fn only_the_host_can_write_output_or_the_replay_history() {
+        let pool = test_pool_or_skip!();
+        let (manager, session_id, host, mate, mut host_ws, mut mate_ws) = joined_mate(&pool).await;
+        grant(&mut host_ws, &mut mate_ws, mate).await;
+
+        send_json(&mut mate_ws, serde_json::json!({"type": "output", "data": "fake prompt"})).await;
+        send_json(&mut mate_ws, serde_json::json!({"type": "input", "data": "barrier"})).await;
+        let seen = frames_through(&mut host_ws, "input").await.unwrap();
+        assert!(seen.iter().all(|f| f["type"] != "output"), "guest output was relayed: {seen:?}");
+
+        send_json(&mut host_ws, serde_json::json!({"type": "output", "data": "real"})).await;
+        assert_eq!(next_of_type(&mut mate_ws, "output").await.unwrap()["data"], "real");
+        let history: Vec<serde_json::Value> = manager.sessions.lock().await[&session_id]
+            .output_history
+            .iter()
+            .map(|m| serde_json::from_str(m).unwrap())
+            .collect();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0]["from"], host.to_string());
     }
 }
