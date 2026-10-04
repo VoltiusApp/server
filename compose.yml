@@ -30,6 +30,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # Optional knobs — see .env.example
       RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_WEBHOOK_SECRET: ${RESEND_WEBHOOK_SECRET:-}
       # The server treats an empty string as a value, so these carry its defaults.
       RESEND_FROM: ${RESEND_FROM:-Voltius <noreply@voltius.app>}
       RESEND_LOGO_URL: ${RESEND_LOGO_URL:-https://voltius.app/logo.png}

@@ -10,6 +10,7 @@ pub mod member_names;
 pub mod meta;
 pub mod metrics;
 pub mod presence;
+pub mod resend_webhook;
 pub mod session_codes;
 pub mod sync;
 pub mod team_grants;
@@ -33,9 +34,14 @@ use axum::{
 /// "verify your email" is a step the user can actually take. Shared by the
 /// checkout gate and the handle-claim gate so the two cannot drift.
 pub(crate) fn email_not_verified_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "error": "EMAIL_NOT_VERIFIED" })),
-    )
-        .into_response()
+    coded_error(StatusCode::FORBIDDEN, "EMAIL_NOT_VERIFIED")
+}
+
+/// Mail to the address bounced or is suppressed: resending cannot help, changing it can.
+pub(crate) fn email_undeliverable_response() -> Response {
+    coded_error(StatusCode::UNPROCESSABLE_ENTITY, "EMAIL_UNDELIVERABLE")
+}
+
+fn coded_error(status: StatusCode, code: &'static str) -> Response {
+    (status, Json(serde_json::json!({ "error": code }))).into_response()
 }

@@ -1707,10 +1707,7 @@ pub async fn invite_member(
     })
     .await?;
 
-    let app_url = std::env::var("VOLTIUS_APP_URL")
-        .unwrap_or_else(|_| "https://app.voltius.app".to_string());
-
-    if let Err(e) = crate::email::send_team_invitation(&email, &team_name, &inviter_email, &token, &app_url).await {
+    if let Err(e) = crate::email::send_team_invitation(&email, &team_name, &inviter_email, &token).await {
         error!(error = %e, "Failed to send invitation email");
     }
 

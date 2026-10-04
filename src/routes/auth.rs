@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -11,6 +16,7 @@ use crate::auth::{
     AuthUser,
 };
 use crate::email::send_verification_email;
+use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
@@ -302,20 +308,13 @@ async fn register_with(
         })?;
         true
     } else {
-        let token: String = sqlx::query_scalar(
-            "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
-        )
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %user_id, "Failed to create email verification token");
+        let mut conn = pool.acquire().await.map_err(|e| {
+            error!(error = %e, "Failed to acquire connection for verification token");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-        let app_url = std::env::var("VOLTIUS_APP_URL")
-            .unwrap_or_else(|_| "https://app.voltius.app".to_string());
-        if let Err(e) = send_verification_email(&email, &token, &app_url).await {
+        let token = issue_verification_token(&mut conn, user_id).await?;
+        drop(conn);
+        if let Err(e) = send_verification_email(&email, &token).await {
             error!(error = %e, user_id = %user_id, "Failed to send verification email");
         }
         false
@@ -586,17 +585,45 @@ pub async fn verify_email(
     }
 }
 
+async fn issue_verification_token(conn: &mut sqlx::PgConnection, user_id: Uuid) -> Result<String, StatusCode> {
+    let token: String = sqlx::query_scalar(
+        "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %user_id, "Failed to create email verification token");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    sqlx::query(
+        "UPDATE email_verification_tokens SET consumed_at = now()
+         WHERE user_id = $1 AND consumed_at IS NULL AND token <> $2",
+    )
+    .bind(user_id)
+    .bind(&token)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = %user_id, "Failed to consume prior email verification tokens");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(token)
+}
+
 pub async fn resend_verification_email(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Response, StatusCode> {
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin verification resend transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let row = sqlx::query_as::<_, (String, bool)>(
-        "SELECT email, email_verified FROM users WHERE id = $1 FOR UPDATE",
+    let (email, verified, undeliverable) = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT email, email_verified, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(auth.0)
     .fetch_one(&mut *tx)
@@ -606,50 +633,26 @@ pub async fn resend_verification_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if row.1 {
-        tx.commit().await.map_err(|e| {
-            error!(error = %e, "Failed to commit verified email resend no-op");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        return Ok(StatusCode::OK);
+    if verified {
+        return Ok(StatusCode::OK.into_response());
+    }
+    if undeliverable {
+        return Ok(email_undeliverable_response());
     }
 
-    let token: String = sqlx::query_scalar(
-        "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
-    )
-    .bind(auth.0)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to create email verification token");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    sqlx::query(
-        "UPDATE email_verification_tokens SET consumed_at = now()
-         WHERE user_id = $1 AND consumed_at IS NULL AND token <> $2",
-    )
-    .bind(auth.0)
-    .bind(&token)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to consume prior email verification tokens");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let token = issue_verification_token(&mut tx, auth.0).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit verification resend transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let app_url =
-        std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string());
-    if let Err(e) = send_verification_email(&row.0, &token, &app_url).await {
+    if let Err(e) = send_verification_email(&email, &token).await {
         error!(error = %e, user_id = %auth.0, "Failed to resend verification email");
+        return Err(StatusCode::BAD_GATEWAY);
     }
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::OK.into_response())
 }
 
 // ─── Me ─────────────────────────────────────────────────────────────────────
@@ -663,6 +666,7 @@ pub struct MeResponse {
     pub tier: String,
     pub trial_ends_at: Option<i64>,
     pub email_verified: bool,
+    pub email_undeliverable: bool,
     pub wrapped_user_secrets: Option<String>,
     pub handle: String,
     pub handle_is_custom: bool,
@@ -675,8 +679,8 @@ pub(crate) async fn fetch_me_inner(
     user_id: Uuid,
     handle_managed: bool,
 ) -> Result<MeResponse, StatusCode> {
-    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool)>(
-        "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool, bool)>(
+        "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -695,6 +699,7 @@ pub(crate) async fn fetch_me_inner(
         tier: tier.tier,
         trial_ends_at: tier.trial_ends_at,
         email_verified: tier.email_verified,
+        email_undeliverable: row.7,
         wrapped_user_secrets: row.3,
         handle: row.4,
         handle_is_custom: row.5,
@@ -749,7 +754,7 @@ pub async fn update_email(
     })?;
 
     sqlx::query(
-        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, updated_at = now() WHERE id = $2",
+        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, email_undeliverable_at = NULL, updated_at = now() WHERE id = $2",
     )
     .bind(&new_email)
     .bind(auth.0)
@@ -763,38 +768,14 @@ pub async fn update_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let token: String = sqlx::query_scalar(
-        "INSERT INTO email_verification_tokens (user_id) VALUES ($1) RETURNING token",
-    )
-    .bind(auth.0)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to create verification token for email update");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    sqlx::query(
-        "UPDATE email_verification_tokens SET consumed_at = now()
-         WHERE user_id = $1 AND consumed_at IS NULL AND token <> $2",
-    )
-    .bind(auth.0)
-    .bind(&token)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to consume prior tokens in update_email");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let token = issue_verification_token(&mut tx, auth.0).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit update_email transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let app_url =
-        std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string());
-    if let Err(e) = send_verification_email(&new_email, &token, &app_url).await {
+    if let Err(e) = send_verification_email(&new_email, &token).await {
         error!(error = %e, user_id = %auth.0, "Failed to send verification email after email update");
     }
 

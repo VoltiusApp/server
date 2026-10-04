@@ -38,6 +38,7 @@ services:
       LS_VARIANT_BUSINESS_YEARLY: ${LS_VARIANT_BUSINESS_YEARLY}
       LS_TEST_MODE: ${LS_TEST_MODE:-false}
       RESEND_API_KEY: ${RESEND_API_KEY}
+      RESEND_WEBHOOK_SECRET: ${RESEND_WEBHOOK_SECRET:-}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
       interval: 5s
