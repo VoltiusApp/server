@@ -113,23 +113,58 @@ fn branded_email_html(
     )
 }
 
-pub async fn send_team_invitation(
+fn app_url() -> String {
+    std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string())
+}
+
+async fn send_via_resend(
     to: &str,
-    team_name: &str,
-    inviter_email: &str,
-    token: &str,
-    app_url: &str,
+    subject: &str,
+    html: String,
+    text: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
     let from = std::env::var("RESEND_FROM")
         .unwrap_or_else(|_| "Voltius <noreply@voltius.app>".to_string());
 
     if api_key.is_empty() {
-        error!("RESEND_API_KEY not set; skipping invitation email to {to}");
+        error!("RESEND_API_KEY not set; skipping email to {to}");
         return Ok(());
     }
 
-    let accept_url = format!("{}/invite/{token}", app_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let res = client
+        .post("https://api.resend.com/emails")
+        .bearer_auth(&api_key)
+        .json(&serde_json::json!({
+            "from": from,
+            "to": [to],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }))
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        error!(status = %status, body = %body, "Resend API error");
+        return Err(format!("Resend returned {status}").into());
+    }
+
+    Ok(())
+}
+
+pub async fn send_team_invitation(
+    to: &str,
+    team_name: &str,
+    inviter_email: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let accept_url = format!("{}/invite/{token}", app_url().trim_end_matches('/'));
     let escaped_team_name = escape_html(team_name);
     let escaped_inviter_email = escape_html(inviter_email);
     let html = branded_email_html(
@@ -148,46 +183,20 @@ pub async fn send_team_invitation(
         "{inviter_email} invited you to join {team_name} on Voltius. Accept the invitation: {accept_url}\n\nThis invitation expires in 7 days."
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let res = client
-        .post("https://api.resend.com/emails")
-        .bearer_auth(&api_key)
-        .json(&serde_json::json!({
-            "from": from,
-            "to": [to],
-            "subject": format!("{inviter_email} invited you to {team_name} on Voltius"),
-            "html": html,
-            "text": text,
-        }))
-        .send()
-        .await?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        error!(status = %status, body = %body, "Resend API error");
-        return Err(format!("Resend returned {status}").into());
-    }
-
-    Ok(())
+    send_via_resend(
+        to,
+        &format!("{inviter_email} invited you to {team_name} on Voltius"),
+        html,
+        text,
+    )
+    .await
 }
 
 pub async fn send_verification_email(
     to: &str,
     token: &str,
-    app_url: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
-    let from = std::env::var("RESEND_FROM")
-        .unwrap_or_else(|_| "Voltius <noreply@voltius.app>".to_string());
-
-    if api_key.is_empty() {
-        return Ok(());
-    }
-
-    let verify_url = format!("{}/verify-email?token={token}", app_url.trim_end_matches('/'));
+    let verify_url = format!("{}/verify-email?token={token}", app_url().trim_end_matches('/'));
     let html = branded_email_html(
         "Confirm this email address to finish securing your Voltius account.",
         "Email verification",
@@ -202,28 +211,5 @@ pub async fn send_verification_email(
         "Verify your Voltius email: {verify_url}\n\nThis verification link expires in 24 hours."
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let res = client
-        .post("https://api.resend.com/emails")
-        .bearer_auth(&api_key)
-        .json(&serde_json::json!({
-            "from": from,
-            "to": [to],
-            "subject": "Verify your Voltius email",
-            "html": html,
-            "text": text,
-        }))
-        .send()
-        .await?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        error!(status = %status, body = %body, "Resend API error");
-        return Err(format!("Resend returned {status}").into());
-    }
-
-    Ok(())
+    send_via_resend(to, "Verify your Voltius email", html, text).await
 }

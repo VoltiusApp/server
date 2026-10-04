@@ -288,14 +288,16 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::waitlist_rate_limit))
         .layer(Extension(waitlist_limiter));
 
-    // Webhook — public, signature-verified internally. Disabled in self-hosted mode.
+    // Webhooks — public, signature-verified internally. Lemon Squeezy is disabled in self-hosted
+    // mode; Resend is routed after the layers so self-hosters keep bounce tracking.
     let webhooks = Router::new()
         .route(
             "/v1/webhooks/lemonsqueezy",
             post(routes::webhooks::lemonsqueezy_webhook),
         )
         .layer(middleware::from_fn(self_host::block_when_self_hosted))
-        .layer(Extension(notifier.clone()));
+        .layer(Extension(notifier.clone()))
+        .route("/v1/webhooks/resend", post(routes::resend_webhook::resend_webhook));
 
     // Invite — auth required + dedicated 20/hr limit (sends email)
     let invite_route = Router::new()
