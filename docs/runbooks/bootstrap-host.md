@@ -84,11 +84,10 @@ tree and `.env.dockhand` live inside the dockhand Docker volume (`deploy-server.
   from the bundle and the state watch all come back, so a rebuilt host can `apply` — but it will not
   do so on its own. The state is recoverable from `voltius-prod/tofu/` in the backup bucket, and is
   rebuildable from the import blocks even without that.
-- **The tunnel's ingress rules.** A rebuilt host reuses the existing tunnel token, so the hostname
-  follows the tunnel; the routes live in Cloudflare and are deliberately not described in OpenTofu —
-  that tunnel also serves hostnames unrelated to voltius.
-- **Anything that is not voltius** — vaultwarden, dockhand, the dev containers. The script starts
-  what production needs and nothing else.
+- **The API tunnel's connector.** `api.voltius.app` is served by whichever host runs the `voltius-api`
+  connector; `ansible/connector.yml` starts it once the server is healthy (see `ansible/README.md`).
+- **Anything that is not voltius** — other services on the host, dockhand, the dev containers. The
+  script starts what production needs and nothing else.
 
 ## Verify
 
