@@ -126,7 +126,6 @@ pub async fn lemonsqueezy_webhook(
         "subscription_updated" => handle_subscription_updated(&pool, &notifier, &payload).await,
         "subscription_cancelled" => handle_subscription_cancelled(&pool, &notifier, &payload).await,
         "subscription_expired" => handle_subscription_expired(&pool, &notifier, &payload).await,
-        "subscription_trial_expired" => handle_trial_expired(&pool, &notifier, &payload).await,
         _ => {
             info!(event = %event_name, "LemonSqueezy webhook: unhandled event");
             StatusCode::OK
@@ -421,55 +420,6 @@ async fn handle_subscription_expired(
         }
         Err(e) => {
             error!(error = %e, "subscription_expired DB error");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    }
-}
-
-async fn handle_trial_expired(
-    pool: &PgPool,
-    notifier: &SyncNotifier,
-    payload: &serde_json::Value,
-) -> StatusCode {
-    let customer_email = payload["data"]["attributes"]["user_email"]
-        .as_str()
-        .unwrap_or("");
-
-    let old_tier_row = sqlx::query_as::<_, (uuid::Uuid, String)>(
-        "SELECT id, subscription_tier FROM users WHERE email = $1",
-    )
-    .bind(customer_email)
-    .fetch_optional(pool)
-    .await;
-
-    let result = sqlx::query(
-        "UPDATE users SET subscription_tier = 'free', trial_used = TRUE, trial_ends_at = NULL WHERE email = $1",
-    )
-    .bind(customer_email)
-    .execute(pool)
-    .await;
-
-    match result {
-        Ok(r) if r.rows_affected() > 0 => {
-            if let Ok(Some((user_id, old_tier))) = old_tier_row {
-                let _ = sqlx::query(
-                    "INSERT INTO churn_events (user_id, from_tier, to_tier, reason) VALUES ($1, $2, 'free', 'trial_expired')",
-                )
-                .bind(user_id)
-                .bind(&old_tier)
-                .execute(pool)
-                .await;
-                notifier.notify(user_id, "token_invalidated".to_string());
-            }
-            info!(email = %customer_email, "Trial expired — downgraded to free");
-            StatusCode::OK
-        }
-        Ok(_) => {
-            info!(email = %customer_email, "trial_expired: no matching user");
-            StatusCode::OK
-        }
-        Err(e) => {
-            error!(error = %e, "subscription_trial_expired DB error");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

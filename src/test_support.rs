@@ -340,6 +340,15 @@ pub async fn set_user_trial(pool: &PgPool, user: Uuid, days: i64) {
         .expect("set user trial");
 }
 
+pub async fn set_user_ls_status(pool: &PgPool, user: Uuid, status: &str) {
+    sqlx::query("UPDATE users SET ls_subscription_status = $1 WHERE id = $2")
+        .bind(status)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("set user ls status");
+}
+
 /// Handles are unique and never recycled (that's the feature), so two test
 /// functions cannot both claim a literal base like "kevin-p" against the same
 /// real, persistent test database — whichever runs first wins it permanently
