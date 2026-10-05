@@ -1,7 +1,7 @@
 # infra
 
-OpenTofu for the things outside a host: DNS and the tunnel (`cloudflare/`), and the
-machine itself (`oci/`).
+OpenTofu for the things outside a host: DNS and the tunnels (`cloudflare/`), and the
+machines themselves (`oci/`, `hetzner/`).
 
 Only the machine is provider-specific, and only for creating it. `ansible/` never
 mentions a cloud: it takes any Ubuntu 24.04 host reachable over SSH and makes it a
@@ -24,6 +24,5 @@ everything else. What the host has to satisfy:
 Then `ansible-playbook site.yml -l <host>` and `migrate.yml` behave exactly as they do
 on OCI.
 
-No Hetzner configuration ships here because none has been run. Untested infrastructure
-code is worse than none: it reads as a supported path and fails in the middle of a
-rebuild.
+`hetzner/` is that equivalent for Hetzner Cloud, rehearsed on 2026-10-05. Prefer an arm64
+(CAX) type; x86 was proven to work for this database (`hetzner/README.md`).

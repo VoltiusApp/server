@@ -12,7 +12,12 @@ if [ -z "$ENV_FILE" ]; then
   echo "   or: TOFU_STATE_ENV_FILE=/path/to/.env.db $0 [state-file]" >&2
   exit 2
 fi
-[ -f "$STATE" ] || { echo "no state file at $STATE" >&2; exit 1; }
+# A configuration never applied has no state yet; one that lost its state still has the .backup.
+if [ ! -f "$STATE" ]; then
+  [ -f "$STATE.backup" ] && { echo "no state file at $STATE, but $STATE.backup exists" >&2; exit 1; }
+  echo "skip: no state at $STATE yet" >&2
+  exit 0
+fi
 [ -f "$ENV_FILE" ] || { echo "no env file at $ENV_FILE" >&2; exit 1; }
 
 dir=$(cd "$(dirname "$STATE")" && pwd)

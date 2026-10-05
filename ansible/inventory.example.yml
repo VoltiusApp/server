@@ -11,3 +11,7 @@ all:
           ansible_connection: local
         newhost:
           ansible_host: 10.0.0.42
+        # A host outside the VCN is reached over its public address; infra/hetzner
+        # admits SSH from the controller only.
+        hetzner:
+          ansible_host: 203.0.113.42

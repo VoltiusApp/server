@@ -11,6 +11,7 @@ voltius_env_line_re: '(?m)^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
 voltius_tofu_states:
   - "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
   - "{{ voltius_root }}/voltius-tofu/infra/oci/terraform.tfstate"
+  - "{{ voltius_root }}/voltius-tofu/infra/hetzner/terraform.tfstate"
 voltius_pg_version: "17"
 voltius_walg_version: 3.0.8
 voltius_pg_base: postgres:17-trixie
