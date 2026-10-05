@@ -46,4 +46,4 @@ jobs:
 
       - name: Lint the playbooks
         working-directory: ansible
-        run: ansible-lint site.yml rehearse.yml migrate.yml
+        run: ansible-lint site.yml rehearse.yml migrate.yml connector.yml

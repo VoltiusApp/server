@@ -1,0 +1,24 @@
+---
+# Start the voltius-api tunnel connector on the host that serves production.
+#
+#   ansible-playbook connector.yml -e voltius_target=oracle
+#
+# migrate.yml moves it as part of a move; this is for adopting it, or restarting it.
+
+- name: Run the API tunnel connector
+  hosts: "{{ voltius_target }}"
+  gather_facts: false
+  tasks:
+    - name: Read the server's health
+      ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' voltius-server
+      register: voltius_connector_server
+      changed_when: false
+      failed_when: false
+
+    - name: Only a host that serves may take the API's traffic
+      ansible.builtin.assert:
+        that: voltius_connector_server.stdout | trim == "healthy"
+        fail_msg: "voltius-server on {{ inventory_hostname }} is not healthy: {{ voltius_connector_server.stdout | default('') }}{{ voltius_connector_server.stderr | default('') }}"
+
+    - name: Start the connector
+      ansible.builtin.include_tasks: tasks/api-connector.yml

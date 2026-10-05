@@ -4,7 +4,7 @@
 #
 #   ansible-playbook migrate.yml -e voltius_source=oracle -e voltius_target=newhost
 #
-# Downtime starts at phase 4 and ends at phase 7.
+# Downtime starts at phase 4 and ends when phase 6 starts the connector.
 
 - name: Phase 1 — preflight
   hosts: "{{ voltius_source }}:{{ voltius_target }}"
@@ -47,6 +47,11 @@
         - name: Show it
           ansible.builtin.debug:
             var: voltius_backup_list.stdout_lines
+
+        - name: Read the image the source runs
+          ansible.builtin.command: docker inspect -f '{{ "{{" }}.Config.Image{{ "}}" }}' voltius-server
+          register: voltius_src_image
+          changed_when: false
 
         - name: Read the source's .env.db
           ansible.builtin.include_tasks: tasks/read-db-env.yml
@@ -176,6 +181,27 @@
         - voltius-db/.env.db
       failed_when: not voltius_restored.stat.exists
 
+    - name: Read the target's server tag
+      ansible.builtin.slurp:
+        src: "{{ voltius_root }}/voltius-server/.env.dockhand"
+      register: voltius_tgt_dockhand_env
+      no_log: true
+
+    # The bundle is packed by hand and can predate the last deploy. An older binary
+    # refuses a schema migrated past it, and that would surface after the freeze.
+    - name: The bundle must carry the tag the source runs
+      ansible.builtin.assert:
+        that: voltius_tgt_server_tag == voltius_src_server_tag
+        fail_msg: >-
+          the secrets bundle has SERVER_TAG={{ voltius_tgt_server_tag }} but {{ voltius_source }} runs
+          {{ voltius_src_server_tag }}. Re-pack the bundle (docs/runbooks/deploy-server.md), delete
+          voltius-server/.env.dockhand and voltius-db/.env.db on {{ inventory_hostname }}, and run again.
+      vars:
+        voltius_src_server_tag: "{{ hostvars[voltius_source].voltius_src_image.stdout | trim | split(':') | last }}"
+        voltius_tgt_server_tag: >-
+          {{ voltius_tgt_dockhand_env.content | b64decode
+             | regex_findall('(?m)^SERVER_TAG=(.*)$') | last | default('unset') | trim }}
+
     - name: Read the target's copy of .env.db
       ansible.builtin.include_tasks: tasks/read-db-env.yml
 
@@ -243,6 +269,14 @@
     - name: Stop the server
       ansible.builtin.command: docker stop voltius-server
       changed_when: true
+
+    # Stopped here, not at cutover: the target's connector refuses to start while
+    # this one still holds the tunnel. -t 35 outlasts cloudflared's 30 s drain.
+    - name: Stop the API tunnel connector
+      ansible.builtin.command: docker stop -t 35 {{ voltius_api_connector }}
+      register: voltius_src_connector
+      changed_when: voltius_src_connector.rc == 0
+      failed_when: voltius_src_connector.rc != 0 and 'No such container' not in voltius_src_connector.stderr
 
     - name: Close the current WAL segment
       ansible.builtin.shell:
@@ -327,82 +361,19 @@
         url: http://127.0.0.1:14372/health
         status_code: 200
 
-    # The connector's token is minted by Cloudflare and exists nowhere until it
-    # is asked for. Fetched here rather than kept in OpenTofu state, which holds
-    # no secret. A drill skips it: without the DNS change it would serve nobody.
-    - name: Read the Cloudflare credentials from the controller
-      ansible.builtin.slurp:
-        src: "{{ voltius_root }}/voltius-tofu/.env.tofu"
-      register: voltius_tofu_env_raw
-      delegate_to: localhost
-      when: voltius_cutover | default(true) | bool
-      no_log: true
-
-    - name: Parse them
-      ansible.builtin.set_fact:
-        voltius_tofu_env: >-
-          {{ dict(voltius_tofu_env_raw.content | b64decode
-                  | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')) }}
-      when: voltius_cutover | default(true) | bool
-      no_log: true
-
-    - name: Find the voltius-api tunnel
-      ansible.builtin.uri:
-        url: >-
-          https://api.cloudflare.com/client/v4/accounts/{{ voltius_tofu_env.TF_VAR_account_id }}/cfd_tunnel?name=voltius-api&is_deleted=false
-        headers:
-          Authorization: "Bearer {{ voltius_tofu_env.CLOUDFLARE_API_TOKEN }}"
-      register: voltius_tunnel_lookup
-      delegate_to: localhost
-      when: voltius_cutover | default(true) | bool
-      no_log: true
-
-    - name: Fetch its connector token
-      ansible.builtin.uri:
-        url: >-
-          https://api.cloudflare.com/client/v4/accounts/{{ voltius_tofu_env.TF_VAR_account_id }}/cfd_tunnel/{{ voltius_tunnel_lookup.json.result[0].id }}/token
-        headers:
-          Authorization: "Bearer {{ voltius_tofu_env.CLOUDFLARE_API_TOKEN }}"
-      register: voltius_tunnel_token
-      delegate_to: localhost
-      when: voltius_cutover | default(true) | bool
-      no_log: true
-
-    - name: Write it beside the connector's compose file
-      ansible.builtin.copy:
-        content: "TUNNEL_TOKEN={{ voltius_tunnel_token.json.result }}\n"
-        dest: "{{ voltius_root }}/cloudflared-api/.env"
-        mode: "0600"
-      when: voltius_cutover | default(true) | bool
-      no_log: true
-
-    - name: Start the tunnel connector
-      ansible.builtin.command:
-        cmd: docker compose up -d
-        chdir: "{{ voltius_root }}/cloudflared-api"
-      changed_when: true
+    # A drill skips it: the tunnel is production's, and would send users here.
+    - name: Start the API tunnel connector (downtime ends)
+      ansible.builtin.include_tasks: tasks/api-connector.yml
       when: voltius_cutover | default(true) | bool
 
-- name: Phase 7 — cut traffic over (downtime ends)
-  hosts: "{{ voltius_source }}"
+- name: Phase 7 — check users reach the target
+  hosts: "{{ voltius_target }}"
   gather_facts: false
   tasks:
-    # A drill migrates two throwaway hosts and must not touch the record that
-    # serves users: -e voltius_cutover=false stops here.
     - name: Say that the cutover is being skipped
       ansible.builtin.debug:
         msg: "voltius_cutover is false: api.voltius.app is untouched, {{ voltius_target }} serves nobody"
       when: not (voltius_cutover | default(true) | bool)
-
-    - name: Point api.voltius.app at the new tunnel
-      when: voltius_cutover | default(true) | bool
-      ansible.builtin.shell:
-        cmd: |
-          set -eu
-          set -a; . {{ voltius_root }}/voltius-tofu/.env.tofu; set +a
-          tofu apply -auto-approve -var api_tunnel=voltius-api
-        chdir: "{{ voltius_root }}/voltius-tofu/infra/cloudflare"
-      changed_when: true
 
     - name: Check through the tunnel
       ansible.builtin.uri:

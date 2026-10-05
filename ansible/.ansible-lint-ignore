@@ -1,3 +1,4 @@
 migrate.yml syntax-check[specific]
 rehearse.yml syntax-check[specific]
 drill-seed.yml syntax-check[specific]
+connector.yml syntax-check[specific]

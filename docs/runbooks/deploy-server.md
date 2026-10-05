@@ -79,6 +79,10 @@ Deploy `sha-<short>`, never `latest`. `latest` is mutable and overlapping pushes
    starts the server with empty secrets, which fails at the first authenticated request rather than
    at startup.
 
+6. Once the checks under Verify pass, re-pack the secrets bundle (`bootstrap-host.md`, "The secrets
+   bundle"). It carries `.env.dockhand`, so until then it names the tag you just left, and
+   `ansible/migrate.yml` refuses to move a host whose bundle disagrees with the image it runs.
+
 ## Verify
 
 ```sh

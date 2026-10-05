@@ -83,8 +83,8 @@ prefixes is named any more. The isolation is by prefix rather than by bucket bec
 R2 credentials are scoped to one bucket and cannot write to another. The watchdog
 heartbeat is cleared, so a drill cannot report production healthy.
 
-`-e voltius_cutover=false` leaves `api.voltius.app` alone, which means phase 7 is the one
-step a drill cannot prove. Destroy both hosts and empty the drill bucket afterwards.
+`-e voltius_cutover=false` never starts the API tunnel's connector on drill-b, which means
+handing the tunnel over is the one step a drill cannot prove. Destroy both hosts and empty the drill bucket afterwards.
 
 ## Move production
 
@@ -92,27 +92,48 @@ step a drill cannot prove. Destroy both hosts and empty the drill bucket afterwa
 ansible-playbook migrate.yml -e voltius_source=oracle -e voltius_target=newhost
 ```
 
-Eight phases; downtime runs from 4 to 7 and is about five minutes.
+Eight phases; downtime runs from 4 into 6 and is about five minutes.
 
 1. Preflight: source healthy, backups listed, target prepared, idle and roomy.
 2. Secrets: prompts for the age key, unpacks the bundle on the target, deletes the key.
-   The key is written to `/dev/shm` and nowhere else.
+   The key is written to `/dev/shm` and nowhere else. Stops here if the bundle's
+   `SERVER_TAG` is not the image the source runs: the bundle is stale, re-pack it.
 3. Copies `backups/` to the target, before anything can sync an empty directory.
-4. **Downtime starts.** Stops the server, closes the WAL segment, waits for the
-   archiver to catch up, then stops the source database stack **for good**.
+4. **Downtime starts.** Stops the server and the API tunnel connector, closes the WAL
+   segment, waits for the archiver to catch up, then stops the source database stack
+   **for good**.
 5. Restores the newest base plus WAL onto the target and promotes it.
-6. Starts the server and the connector there.
-7. `tofu apply -var api_tunnel=voltius-api` points `api.voltius.app` at the new host's
-   tunnel. **Downtime ends.**
+6. Starts the server, then the connector. **Downtime ends** when it registers.
+7. Checks `https://api.voltius.app/health/deep` from the controller.
 8. Waits for the backup watchdog's first heartbeat.
 
 The source database stack must stay stopped. Once the target promotes, both would
 archive to the same R2 prefix, on diverging timelines.
 
+## The API tunnel
+
+`api.voltius.app` always points at the `voltius-api` tunnel; DNS never changes in a move.
+The host that serves it is the one running that tunnel's connector, and there must only
+ever be one — two connectors split the traffic between their hosts. `tasks/api-connector.yml`
+refuses to start one while Cloudflare lists a connection from anywhere else.
+
+To start it outside a move — the first time, or after removing it:
+
+```sh
+ansible-playbook connector.yml -e voltius_target=oracle
+```
+
+Adopting it on a host the API still reaches through the shared `oracle` tunnel is two
+steps, in this order: `connector.yml` against that host, then `tofu apply` in
+`voltius-tofu/infra/cloudflare` to point the CNAME at `voltius-api`. Both tunnels reach the
+same `voltius-server` container, so the switch drops nothing.
+
 ## Rollback
 
-Before phase 7: start `voltius-server` on the source again. Nothing has moved.
+Before the target promotes in phase 5: remove its `voltius-restore` container, then start
+the source's database stack, `voltius-server` and `cloudflared-voltius-api`. Nothing has
+moved.
 
-After phase 7: `tofu apply -var api_tunnel=oracle` and start the source stack — but
-every write made on the target since the cutover is lost. Past a few minutes, roll
+After it: stop the target's connector and database stack, then start the source's —
+but every write made on the target since the cutover is lost. Past a few minutes, roll
 forward instead.
