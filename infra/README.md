@@ -24,6 +24,5 @@ everything else. What the host has to satisfy:
 Then `ansible-playbook site.yml -l <host>` and `migrate.yml` behave exactly as they do
 on OCI.
 
-`hetzner/` is that equivalent for Hetzner Cloud. Use an arm64 (CAX) type: the database
-moves as a physical base backup, which Postgres does not support restoring across
-architectures.
+`hetzner/` is that equivalent for Hetzner Cloud, rehearsed on 2026-10-05. Prefer an arm64
+(CAX) type; x86 was proven to work for this database (`hetzner/README.md`).
