@@ -20,7 +20,7 @@
   ansible.builtin.set_fact:
     voltius_tofu_env: >-
       {{ dict(voltius_tofu_env_raw.content | b64decode
-              | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')) }}
+              | regex_findall(voltius_env_line_re)) }}
   no_log: true
 
 # A connector stopped a moment ago can stay listed for a few seconds.

@@ -6,6 +6,8 @@ voltius_ref: main
 voltius_cloudflare_subnet: 172.22.0.0/16
 voltius_db_volume: voltius-db_db-data
 voltius_api_connector: cloudflared-voltius-api
+# One KEY=value per line; .env.tofu is sourced by a shell, so its lines may start with export.
+voltius_env_line_re: '(?m)^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
 voltius_tofu_states:
   - "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
   - "{{ voltius_root }}/voltius-tofu/infra/oci/terraform.tfstate"

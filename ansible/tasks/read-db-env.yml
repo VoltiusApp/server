@@ -9,7 +9,7 @@
   ansible.builtin.set_fact:
     voltius_db_env: >-
       {{ dict(voltius_db_env_raw.content | b64decode
-              | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')) }}
+              | regex_findall(voltius_env_line_re)) }}
   no_log: true
 
 - name: Check the keys the playbooks rely on are there
