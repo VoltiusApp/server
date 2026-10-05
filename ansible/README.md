@@ -55,7 +55,15 @@ It took five attempts, and each failure was a fault worth finding — see PR #53
 Phase 7 is still unproven and cannot be drilled: pointing `api.voltius.app` somewhere is
 the one step with no throwaway equivalent.
 
-### Last rehearsal: 2026-09-22
+### Last rehearsal: 2026-10-05, Hetzner
+
+Passed on a throwaway `cpx22` (x86_64, `fsn1`) created by `infra/hetzner`, from bare Ubuntu
+24.04: `site.yml`, then a restore of production's aarch64 archive out of R2 — 36 tables,
+migration 52, 0 failed, recovery point seconds behind production. A second restore ran
+`amcheck` (`heapallindexed`) over all 276 b-tree indexes, clean. Production was untouched
+and the host, firewall and key were destroyed afterwards.
+
+### Rehearsal before that: 2026-09-22
 
 Passed on a throwaway 1 OCPU / 6 GB A1 instance created by `var.hosts`, from bare Ubuntu 24.04:
 `site.yml`, then a restore of production out of R2 — 32 tables, migration 42, 0 failed, matching

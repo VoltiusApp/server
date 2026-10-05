@@ -17,13 +17,27 @@ production onto it. Neither knows which provider made it.
 replacement, which on the production host would mean a new, empty machine. Rotate keys
 over SSH instead.
 
-## Pick an arm64 type
+## Pick a type
 
-Use a **CAX** server type (Ampere, aarch64), the same architecture as the Oracle host.
-The database moves as a physical WAL-G base backup, and Postgres does not support
-restoring a physical backup on a different architecture. An x86 type (CX, CPX, CCX)
-may work, but only `ansible/rehearse.yml` on that machine can tell you. CAX types are
-offered in `fsn1`, `nbg1` and `hel1`.
+Prefer a **CAX** type (Ampere, aarch64), the same architecture as the Oracle host. The
+database moves as a physical WAL-G base backup, and Postgres does not promise that one
+restores on another architecture.
+
+x86 works for this database, proven on 2026-10-05: production's aarch64 base backup
+restored on a `cpx22` (x86_64) to 36 tables and migration 52, matching production row for
+row, and `amcheck` with `heapallindexed` passed on all 276 b-tree indexes. Both ends run
+glibc 2.41 from `postgres:17-trixie`, so collation matched (2.41 recorded, 2.41 actual).
+Re-run `ansible/rehearse.yml` on x86 before a move if the Postgres or glibc version has
+changed since.
+
+CAX types are offered in `fsn1`, `nbg1` and `hel1`, but often sold out in all three: on
+2026-10-05 every CAX type was unavailable everywhere. Check before planning a move; the
+price list shows a type even where it cannot be created.
+
+```sh
+curl -s -H "Authorization: Bearer $HCLOUD_TOKEN" 'https://api.hetzner.cloud/v1/server_types?per_page=50' \
+  | jq -r '.server_types[] | "\(.name) " + ([.locations[] | select(.available) | .name] | join(","))'
+```
 
 ## Credentials
 
@@ -35,8 +49,11 @@ Add these to `$ROOT/voltius-tofu/.env.tofu`, beside the Cloudflare and OCI entri
 
 ```sh
 HCLOUD_TOKEN=…
-TF_VAR_ssh_source_ips=["<controller public IPv4>/32"]
+TF_VAR_ssh_source_ips='["<controller public IPv4>/32"]'
 ```
+
+The single quotes matter: the file is sourced by a shell, which strips double quotes and
+leaves OpenTofu an invalid list.
 
 `TF_VAR_host_ssh_authorized_keys` is already there for `infra/oci` and is read here too.
 Re-pack the secrets bundle afterwards (`docs/runbooks/bootstrap-host.md`).
