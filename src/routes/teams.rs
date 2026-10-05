@@ -25,11 +25,13 @@ pub(crate) async fn team_owner(pool: &PgPool, team_id: Uuid) -> Result<Uuid, Sta
         .map_err(|e| { error!(error = %e, "Failed to fetch team owner"); StatusCode::INTERNAL_SERVER_ERROR })
 }
 
-/// The owner's effective seat cap, or `None` when uncapped. An active trial
-/// clamps the cap to 10 however many seats were purchased.
+/// The owner's effective seat cap, or `None` when uncapped. A trial clamps it to 10;
+/// LemonSqueezy trials clear `trial_ends_at` and show only as `on_trial` status.
 pub(crate) async fn owner_seat_cap(pool: &PgPool, owner_id: Uuid) -> Result<Option<i64>, StatusCode> {
-    let (seat_count, trial_ends_at) = sqlx::query_as::<_, (Option<i32>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT seat_count, trial_ends_at FROM users WHERE id = $1",
+    let (seat_count, on_trial) = sqlx::query_as::<_, (Option<i32>, bool)>(
+        "SELECT seat_count,
+                trial_ends_at IS NOT NULL OR ls_subscription_status IS NOT DISTINCT FROM 'on_trial'
+         FROM users WHERE id = $1",
     )
     .bind(owner_id)
     .fetch_one(pool)
@@ -37,7 +39,7 @@ pub(crate) async fn owner_seat_cap(pool: &PgPool, owner_id: Uuid) -> Result<Opti
     .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     Ok(seat_count.map(|seats| {
-        let effective = if trial_ends_at.is_some() { seats.min(10) } else { seats };
+        let effective = if on_trial { seats.min(10) } else { seats };
         effective as i64
     }))
 }
@@ -1841,7 +1843,7 @@ mod authz_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
-        seed_team_with_roles, seed_user, set_user_seats, set_user_tier, set_user_trial,
+        seed_team_with_roles, seed_user, set_user_ls_status, set_user_seats, set_user_tier, set_user_trial,
         unique_handle, BillingMode, EnvLockGuard,
     };
     use axum::extract::{Path, State};
@@ -2980,6 +2982,17 @@ mod authz_tests {
         match res {
             Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
             Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lemonsqueezy_trial_clamps_seat_cap_without_trial_ends_at() {
+        let pool = test_pool_or_skip!();
+        for (status, expected) in [("on_trial", 10), ("active", 50)] {
+            let owner = seed_user(&pool).await;
+            set_user_seats(&pool, owner, 50).await;
+            set_user_ls_status(&pool, owner, status).await;
+            assert_eq!(owner_seat_cap(&pool, owner).await.unwrap(), Some(expected), "{status}");
         }
     }
 
