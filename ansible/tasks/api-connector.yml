@@ -1,0 +1,96 @@
+---
+# Whichever host runs this connector serves api.voltius.app. Two connectors would
+# split its traffic, so this refuses while one runs anywhere else.
+- name: See whether this host already runs the connector
+  ansible.builtin.command: >-
+    docker ps -q --filter name=^{{ voltius_api_connector }}$ --filter status=running
+  register: voltius_connector_local
+  changed_when: false
+
+# The token is minted by Cloudflare and exists nowhere until asked for. It is
+# fetched here rather than kept in OpenTofu state, which holds no secret.
+- name: Read the Cloudflare credentials from the controller
+  ansible.builtin.slurp:
+    src: "{{ voltius_root }}/voltius-tofu/.env.tofu"
+  register: voltius_tofu_env_raw
+  delegate_to: localhost
+  no_log: true
+
+- name: Parse them
+  ansible.builtin.set_fact:
+    voltius_tofu_env: >-
+      {{ dict(voltius_tofu_env_raw.content | b64decode
+              | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')) }}
+  no_log: true
+
+# A connector stopped a moment ago can stay listed for a few seconds.
+- name: Wait until no other host holds the tunnel
+  ansible.builtin.uri:
+    url: >-
+      https://api.cloudflare.com/client/v4/accounts/{{ voltius_tofu_env.TF_VAR_account_id }}/cfd_tunnel?name=voltius-api&is_deleted=false
+    headers:
+      Authorization: "Bearer {{ voltius_tofu_env.CLOUDFLARE_API_TOKEN }}"
+  register: voltius_tunnel_lookup
+  until: >-
+    voltius_connector_local.stdout != ""
+    or (voltius_tunnel_lookup.json.result | default([{}]) | first | default({})).connections | default([1]) | length == 0
+  retries: 12
+  delay: 5
+  failed_when: false
+  delegate_to: localhost
+  no_log: true
+
+- name: Stop if the tunnel is missing or held elsewhere
+  ansible.builtin.assert:
+    that:
+      - voltius_tunnel_lookup.json.result | default([]) | length == 1
+      - >-
+        voltius_connector_local.stdout != ""
+        or voltius_tunnel_lookup.json.result[0].connections | length == 0
+    fail_msg: >-
+      the voltius-api tunnel is missing, or a connector on another host still holds it
+      ({{ (voltius_tunnel_lookup.json.result | default([{}]) | first | default({})).connections | default([]) | map(attribute='origin_ip') | list }}).
+      Stop that one first: two connectors split api.voltius.app between their hosts.
+
+- name: Fetch its connector token
+  ansible.builtin.uri:
+    url: >-
+      https://api.cloudflare.com/client/v4/accounts/{{ voltius_tofu_env.TF_VAR_account_id }}/cfd_tunnel/{{ voltius_tunnel_lookup.json.result[0].id }}/token
+    headers:
+      Authorization: "Bearer {{ voltius_tofu_env.CLOUDFLARE_API_TOKEN }}"
+  register: voltius_tunnel_token
+  delegate_to: localhost
+  no_log: true
+
+- name: Create the connector's directory
+  ansible.builtin.file:
+    path: "{{ voltius_root }}/cloudflared-api"
+    state: directory
+    mode: "0755"
+
+- name: Install its compose file
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/files/cloudflared-api-compose.yml"
+    dest: "{{ voltius_root }}/cloudflared-api/compose.yml"
+    mode: "0644"
+
+- name: Write the token beside it
+  ansible.builtin.copy:
+    content: "TUNNEL_TOKEN={{ voltius_tunnel_token.json.result }}\n"
+    dest: "{{ voltius_root }}/cloudflared-api/.env"
+    mode: "0600"
+  no_log: true
+
+- name: Start the connector
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ voltius_root }}/cloudflared-api"
+  changed_when: true
+
+- name: Wait for it to register with Cloudflare
+  ansible.builtin.command: docker logs {{ voltius_api_connector }}
+  register: voltius_connector_logs
+  until: "'Registered tunnel connection' in (voltius_connector_logs.stdout ~ voltius_connector_logs.stderr)"
+  retries: 24
+  delay: 5
+  changed_when: false

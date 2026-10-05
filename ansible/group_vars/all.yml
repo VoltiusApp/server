@@ -5,6 +5,7 @@ voltius_ref: main
 # puts every client in one rate-limit bucket.
 voltius_cloudflare_subnet: 172.22.0.0/16
 voltius_db_volume: voltius-db_db-data
+voltius_api_connector: cloudflared-voltius-api
 voltius_tofu_states:
   - "{{ voltius_root }}/voltius-tofu/infra/cloudflare/terraform.tfstate"
   - "{{ voltius_root }}/voltius-tofu/infra/oci/terraform.tfstate"

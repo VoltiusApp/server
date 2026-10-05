@@ -20,7 +20,6 @@
   loop:
     - voltius-db
     - voltius-server
-    - cloudflared-api
 
 - name: Lay out the sparse checkouts
   ansible.builtin.include_tasks: checkout.yml
@@ -31,12 +30,6 @@
       paths: /compose.prod.yml /.env.example /scripts/
   loop_control:
     loop_var: checkout
-
-- name: Install the tunnel connector compose file
-  ansible.builtin.copy:
-    src: cloudflared-compose.yml
-    dest: "{{ voltius_root }}/cloudflared-api/compose.yml"
-    mode: "0644"
 
 # Built with docker directly: compose would interpolate the whole file first and
 # the R2 variables only exist in the real .env.db, which is not here yet.
@@ -82,7 +75,6 @@
   loop:
     - voltius-server/.env.dockhand
     - voltius-db/.env.db
-    - cloudflared-api/.env
 
 - name: Say so
   ansible.builtin.debug:
