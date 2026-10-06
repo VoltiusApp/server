@@ -11,10 +11,20 @@ customers on an active **Voltius Business** subscription.
 
 ---
 
+## What this Exception covers
+
+This Exception covers only the source code in the
+[VoltiusApp/server](https://github.com/VoltiusApp/server) repository. It does
+not cover the Voltius desktop or mobile applications, their installers, their
+plugins, or code in any other Voltius repository. Those are available only
+under their own open-source licenses.
+
+---
+
 ## What the AGPLv3 normally requires
 
-The Voltius server and related components are licensed under the
-[GNU Affero General Public License v3.0](./server/LICENSE) (AGPLv3). Under the
+The Voltius server is licensed under the
+[GNU Affero General Public License v3.0](./LICENSE) (AGPLv3). Under the
 AGPLv3, any organisation that:
 
 - modifies the software, **and**
