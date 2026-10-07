@@ -66,7 +66,8 @@ fn secret_owner_type(secret_type: &str) -> Option<&'static str> {
         "connection_password"
         | "connection_key"
         | "connection_passphrase"
-        | "connection_proxy_password" => Some("connection"),
+        | "connection_proxy_password"
+        | "connection_knock_sequence" => Some("connection"),
         "identity_password" => Some("identity"),
         "key_private" | "key_public" | "key_passphrase" => Some("key"),
         _ => None,
@@ -80,6 +81,7 @@ fn canonical_secret_id(object_id: &str, secret_type: &str) -> Option<String> {
         "connection_key" if !object_id.contains(':') => format!("key:{object_id}"),
         "connection_passphrase" => format!("passphrase:{object_id}"),
         "connection_proxy_password" if object_id != "__global__" => format!("proxy_password:{object_id}"),
+        "connection_knock_sequence" => format!("knock_sequence:{object_id}"),
         "identity_password" => format!("identity:{object_id}:password"),
         "key_private" => format!("key:{object_id}:private"),
         "key_public" => format!("key:{object_id}:public"),
@@ -1217,6 +1219,7 @@ mod authz_tests {
             ("connection_key", "key:o"),
             ("connection_passphrase", "passphrase:o"),
             ("connection_proxy_password", "proxy_password:o"),
+            ("connection_knock_sequence", "knock_sequence:o"),
             ("identity_password", "identity:o:password"),
             ("key_private", "key:o:private"),
             ("key_public", "key:o:public"),
@@ -1469,6 +1472,41 @@ mod authz_tests {
             edit_permission_for_secret_type("connection_proxy_password"),
             Some(PERM_EDIT_CONNECTIONS)
         );
+    }
+
+    #[test]
+    fn knock_sequence_needs_edit_connections() {
+        assert_eq!(
+            edit_permission_for_secret_type("connection_knock_sequence"),
+            Some(PERM_EDIT_CONNECTIONS)
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_secret_accepts_connection_knock_sequence() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let object_id = seed_connection_object(&pool, team).await;
+        let caller = member_with_role(&pool, team, PERM_EDIT_CONNECTIONS).await;
+        let body = UpsertSecretRequest {
+            secret_id: format!("knock_sequence:{object_id}"),
+            object_id: object_id.clone(),
+            secret_type: "connection_knock_sequence".to_string(),
+            ciphertext: "cipher".to_string(),
+            key_version: 1,
+        };
+        let res = upsert_secret(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Extension(MinClientVersion(None)),
+            rule_set_client_headers(),
+            Path(team),
+            Json(body),
+        )
+        .await;
+        assert_eq!(res.unwrap(), axum::http::StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
