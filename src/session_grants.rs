@@ -91,22 +91,64 @@ where
 /// counts against its own limiter. Letting a spoken code resolve here would
 /// let a guest skip both.
 pub async fn resolve_join_grant(pool: &PgPool, session_id: Uuid, presented: &str) -> bool {
-    sqlx::query_scalar::<_, bool>(
+    sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS( \
            SELECT 1 FROM terminal_session_grants g \
            JOIN terminal_sessions ts ON ts.id = g.session_id \
            WHERE g.session_id = $1 AND g.secret_hash = $2 \
-             AND g.kind <> 'short_code' \
-             AND g.revoked_at IS NULL \
-             AND (g.expires_at IS NULL OR g.expires_at > now()) \
-             AND ts.ended_at IS NULL \
-         )",
-    )
+             AND g.kind <> 'short_code' AND {LIVE_GRANT} \
+         )"
+    ))
     .bind(session_id)
     .bind(hash_secret(presented))
     .fetch_one(pool)
     .await
     .unwrap_or(false)
+}
+
+/// Over `terminal_session_grants g` joined to `terminal_sessions ts`.
+const LIVE_GRANT: &str = "g.revoked_at IS NULL \
+     AND (g.expires_at IS NULL OR g.expires_at > now()) \
+     AND ts.ended_at IS NULL";
+
+/// Records that `user_id` was admitted by the grant `presented` resolves to.
+/// False when it resolves to no live join grant.
+pub async fn record_link_guest(
+    pool: &PgPool,
+    session_id: Uuid,
+    user_id: Uuid,
+    presented: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query(&format!(
+        "INSERT INTO terminal_session_link_guests (session_id, user_id, grant_id) \
+         SELECT g.session_id, $3, g.id FROM terminal_session_grants g \
+         JOIN terminal_sessions ts ON ts.id = g.session_id \
+         WHERE g.session_id = $1 AND g.secret_hash = $2 \
+           AND g.kind <> 'short_code' AND {LIVE_GRANT} \
+         ON CONFLICT (session_id, user_id) DO UPDATE SET grant_id = EXCLUDED.grant_id"
+    ))
+    .bind(session_id)
+    .bind(hash_secret(presented))
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected() > 0)
+}
+
+pub async fn holds_link_grant(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS( \
+           SELECT 1 FROM terminal_session_link_guests lg \
+           JOIN terminal_session_grants g ON g.id = lg.grant_id \
+           JOIN terminal_sessions ts ON ts.id = lg.session_id \
+           WHERE lg.session_id = $1 AND lg.user_id = $2 \
+             AND ts.visibility = 'invite_link' AND {LIVE_GRANT} \
+         )"
+    ))
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
 }
 
 pub struct ShortCodeGrant {

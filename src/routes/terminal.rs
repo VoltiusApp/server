@@ -31,7 +31,8 @@ pub struct CreateSessionRequest {
     /// Per-user wrapped session keys (E2EE) — used for vault sessions.
     #[serde(default)]
     pub participant_keys: Vec<ParticipantKeyEntry>,
-    /// Raw session key bytes (base64) — used for invite_link sessions (no per-user E2EE).
+    /// Raw session key bytes (base64). Sent only by older invite_link hosts;
+    /// newer ones wrap the key per admitted guest through `/invitees`.
     pub session_key_bytes: Option<String>,
     /// Role filter — if non-empty, only members with one of these roles can join.
     /// Values: "owner" | "manager" | "editor" | "member". Empty = all roles.
@@ -89,9 +90,24 @@ pub struct ActiveSession {
 pub struct SessionKeyResponse {
     /// Set for vault sessions: wrapped with recipient's X25519 key.
     pub wrapped_key: Option<String>,
-    /// Set for invite_link sessions: raw key bytes (base64), no E2EE.
+    /// Set only for an invite_link session whose host stored `session_key_bytes`.
     pub raw_key: Option<String>,
     pub host_public_key: String,
+}
+
+pub enum MyKey {
+    Ready(SessionKeyResponse),
+    /// The guest is admitted but the host has not wrapped the key for them yet.
+    Pending,
+}
+
+impl IntoResponse for MyKey {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            MyKey::Ready(key) => Json(key).into_response(),
+            MyKey::Pending => (StatusCode::ACCEPTED, Json(serde_json::json!({ "pending": true }))).into_response(),
+        }
+    }
 }
 
 /// True when the two users are members of at least one team in common. Shares
@@ -186,6 +202,22 @@ pub(crate) async fn grant_invitee(
     user_id: Uuid,
     wrapped_key: &str,
 ) -> Result<GrantOutcome, StatusCode> {
+    // The guest asked to join through the link, so this is no knock: no consent
+    // checks, no invitee row (that would outlive a revoked grant), no push.
+    let link_guest = crate::session_grants::holds_link_grant(pool, session_id, user_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, session_id = %session_id, "Failed to check link guest");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if link_guest {
+        store_session_key(pool, session_id, user_id, wrapped_key).await?;
+        if let Some(state) = manager.sessions.lock().await.get(&session_id) {
+            state.send_to(user_id, KEY_READY_FRAME.to_string());
+        }
+        return Ok(GrantOutcome::Granted);
+    }
+
     let is_teammate = user_id == host_user_id || shares_a_team(pool, host_user_id, user_id).await?;
 
     // A stranger knock is allowed, but on the recipient's terms: their opt-out,
@@ -234,23 +266,7 @@ pub(crate) async fn grant_invitee(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Refreshed rather than skipped: a recipient whose X25519 keypair changed
-    // after an earlier grant can no longer open the stored wrapping, and with
-    // DO NOTHING every later invite was a silent no-op that left them stuck.
-    sqlx::query(
-        "INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (session_id, user_id) DO UPDATE SET wrapped_key = EXCLUDED.wrapped_key",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .bind(wrapped_key)
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, session_id = %session_id, "Failed to store invitee session key");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    store_session_key(pool, session_id, user_id, wrapped_key).await?;
 
     if let Some(state) = manager.sessions.lock().await.get_mut(&session_id) {
         state.invitees.insert(user_id);
@@ -262,6 +278,28 @@ pub(crate) async fn grant_invitee(
         notifier.notify_session_shared(user_id, session_id, host_user_id);
     }
     Ok(GrantOutcome::Granted)
+}
+
+const KEY_READY_FRAME: &str = r#"{"type":"key_ready"}"#;
+
+/// Refreshed rather than skipped: a recipient whose X25519 keypair changed
+/// after an earlier grant can no longer open the stored wrapping.
+async fn store_session_key(pool: &PgPool, session_id: Uuid, user_id: Uuid, wrapped_key: &str) -> Result<(), StatusCode> {
+    sqlx::query(
+        "INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (session_id, user_id) DO UPDATE SET wrapped_key = EXCLUDED.wrapped_key",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(wrapped_key)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        error!(error = %e, session_id = %session_id, "Failed to store invitee session key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 /// Tables keyed by `(session_id, user_id)` that ride along whenever
@@ -694,6 +732,7 @@ pub async fn create_session(
                 tx,
                 output_history: std::collections::VecDeque::new(),
                 access_changed: tokio::sync::watch::channel(()).0,
+                direct: std::collections::HashMap::new(),
             },
         );
     }
@@ -719,7 +758,7 @@ pub async fn create_session(
             // client never learned its id to end it itself. Only drop the
             // in-memory entry once the row is confirmed ended — otherwise the
             // session would be both still-counted AND unreachable.
-            match sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+            match sqlx::query("UPDATE terminal_sessions SET ended_at = now(), session_key_bytes = NULL WHERE id = $1")
                 .bind(session_id)
                 .execute(&pool)
                 .await
@@ -1007,7 +1046,7 @@ pub async fn get_my_session_key(
     Extension(auth): Extension<AuthUser>,
     Path(session_id): Path<Uuid>,
     Query(query): Query<GetKeyQuery>,
-) -> Result<Json<SessionKeyResponse>, StatusCode> {
+) -> Result<MyKey, StatusCode> {
     // First try a wrapped key entry (vault sessions with per-user E2EE wrapping)
     let wrapped = sqlx::query_as::<_, (String, String, Uuid, Option<String>, bool)>(
         r#"
@@ -1034,7 +1073,7 @@ pub async fn get_my_session_key(
         if host_hidden_from(&pool, auth.0, session_id, host_user_id, invited, object_id, &mut AuthzCache::new()).await? {
             return Err(StatusCode::NOT_FOUND);
         }
-        return Ok(Json(SessionKeyResponse {
+        return Ok(MyKey::Ready(SessionKeyResponse {
             wrapped_key: Some(wrapped_key),
             raw_key: None,
             host_public_key,
@@ -1067,12 +1106,14 @@ pub async fn get_my_session_key(
         }
 
         let (session_key_bytes, host_public_key) = row;
-        let raw_key = session_key_bytes.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        return Ok(Json(SessionKeyResponse {
-            wrapped_key: None,
-            raw_key: Some(raw_key),
-            host_public_key,
-        }));
+        return Ok(match session_key_bytes {
+            Some(raw_key) => MyKey::Ready(SessionKeyResponse {
+                wrapped_key: None,
+                raw_key: Some(raw_key),
+                host_public_key,
+            }),
+            None => MyKey::Pending,
+        });
     }
 
     Err(StatusCode::NOT_FOUND)
@@ -1170,7 +1211,7 @@ async fn fan_out_session_ended(
     // second hardcoded list — that is the whole point of the constant, and a
     // stale `suppressed_invites` row is exactly the social-graph record D9
     // refused to create.
-    for table in std::iter::once(&"terminal_session_invitees").chain(GRANT_SIDE_TABLES) {
+    for table in ["terminal_session_invitees", "terminal_session_link_guests"].iter().chain(GRANT_SIDE_TABLES) {
         if let Err(e) = sqlx::query(&format!("DELETE FROM {table} WHERE session_id = $1"))
             .bind(session_id)
             .execute(pool)
@@ -1194,7 +1235,7 @@ pub async fn end_session(
 ) -> Result<StatusCode, StatusCode> {
     require_active_session_host(&pool, session_id, auth.0).await?;
 
-    sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+    sqlx::query("UPDATE terminal_sessions SET ended_at = now(), session_key_bytes = NULL WHERE id = $1")
         .bind(session_id)
         .execute(&pool)
         .await
@@ -1552,6 +1593,7 @@ async fn handle_socket(
         }
     }
 
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel();
     let (tx, participant_list_json) = {
         let mut sessions = manager.sessions.lock().await;
         let state = match sessions.get_mut(&session_id) {
@@ -1560,6 +1602,7 @@ async fn handle_socket(
         };
 
         state.participants.insert(user_id, Participant::new(user_id, handle.clone()));
+        state.direct.insert(user_id, direct_tx);
 
         let participant_list: Vec<&Participant> = state.participants.values().collect();
         let list_json = serde_json::json!({
@@ -1611,6 +1654,10 @@ async fn handle_socket(
     .to_string();
     let _ = tx.send(joined_msg);
 
+    if let Some(token) = invite_token.as_deref().filter(|_| user_id != host_user_id) {
+        request_key_for_link_guest(&pool, &manager, session_id, user_id, host_user_id, token).await;
+    }
+
     info!(session_id = %session_id, user_id = %user_id, "WS participant joined");
 
     let mut send_task = {
@@ -1626,6 +1673,11 @@ async fn handle_socket(
                             info!(session_id = %session_id, user_id = %user_id, "WS participant lost access");
                             let _ = ws_sender.send(Message::Text(ACCESS_REVOKED_FRAME.to_string())).await;
                             let _ = ws_sender.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    Some(frame) = direct_rx.recv() => {
+                        if ws_sender.send(Message::Text(frame)).await.is_err() {
                             break;
                         }
                     }
@@ -1762,6 +1814,27 @@ async fn handle_socket(
     info!(session_id = %session_id, user_id = %user_id, "WS participant left");
 }
 
+/// Asks the host's client to wrap the session key for a guest the link admitted.
+async fn request_key_for_link_guest(
+    pool: &PgPool,
+    manager: &TerminalManager,
+    session_id: Uuid,
+    user_id: Uuid,
+    host_user_id: Uuid,
+    token: &str,
+) {
+    match crate::session_grants::record_link_guest(pool, session_id, user_id, token).await {
+        Ok(true) => {
+            let frame = serde_json::json!({ "type": "key_request", "user_id": user_id }).to_string();
+            if let Some(state) = manager.sessions.lock().await.get(&session_id) {
+                state.send_to(host_user_id, frame);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => error!(error = %e, session_id = %session_id, "Failed to record link guest"),
+    }
+}
+
 async fn cleanup_participant(
     manager: &TerminalManager,
     session_id: Uuid,
@@ -1776,6 +1849,7 @@ async fn cleanup_participant(
             let host = state.host_user_id == user_id;
             if !host {
                 state.participants.remove(&user_id);
+                state.direct.remove(&user_id);
                 if state.control_holder == user_id {
                     state.control_holder = state.host_user_id;
                     let update = serde_json::json!({
@@ -1796,7 +1870,8 @@ async fn cleanup_participant(
     if is_host {
         // Host disconnected: end the session entirely
         if let Err(e) = sqlx::query(
-            "UPDATE terminal_sessions SET ended_at = now() WHERE id = $1 AND ended_at IS NULL",
+            "UPDATE terminal_sessions SET ended_at = now(), session_key_bytes = NULL \
+             WHERE id = $1 AND ended_at IS NULL",
         )
         .bind(session_id)
         .execute(pool)
@@ -3165,7 +3240,7 @@ mod tests {
         assert!(visible_sessions(&pool, mate).await.unwrap().iter().any(|r| r.id == session_id));
     }
 
-    async fn fetch_wrapped_key(pool: &PgPool, session_id: Uuid, user: Uuid) -> Result<Json<SessionKeyResponse>, StatusCode> {
+    async fn fetch_wrapped_key(pool: &PgPool, session_id: Uuid, user: Uuid) -> Result<MyKey, StatusCode> {
         sqlx::query("INSERT INTO terminal_session_keys (session_id, user_id, wrapped_key) VALUES ($1, $2, 'wrapped')")
             .bind(session_id).bind(user).execute(pool).await.unwrap();
         get_my_session_key(
@@ -3391,7 +3466,7 @@ mod tests {
         )
         .await
         .expect("a guest grant unlocks the raw key");
-        assert!(key.0.raw_key.is_some());
+        assert!(matches!(key, MyKey::Ready(SessionKeyResponse { raw_key: Some(_), .. })));
 
         assert!(
             is_authorized_participant(
@@ -3518,7 +3593,7 @@ mod tests {
         )
         .await
         .expect("the redeemed secret must unlock the key endpoint");
-        assert!(key.0.raw_key.is_some());
+        assert!(matches!(key, MyKey::Ready(SessionKeyResponse { raw_key: Some(_), .. })));
 
         assert!(
             is_authorized_participant(
@@ -3577,6 +3652,170 @@ mod tests {
         .await;
         assert!(matches!(res, Err(StatusCode::FORBIDDEN)));
     }
+
+    async fn link_session_with_grant(pool: &PgPool, host: Uuid) -> (Uuid, String) {
+        let session = seed_session(pool, host, "invite_link").await;
+        let token = format!("fake-link-token-{}", Uuid::new_v4());
+        crate::session_grants::insert_grant(pool, session, "legacy_token", &token, None, host, None)
+            .await
+            .unwrap();
+        (session, token)
+    }
+
+    async fn my_key(pool: &PgPool, session: Uuid, user: Uuid, token: &str) -> Result<MyKey, StatusCode> {
+        get_my_session_key(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            axum::extract::Path(session),
+            axum::extract::Query(GetKeyQuery { invite_token: Some(token.to_string()) }),
+        )
+        .await
+    }
+
+    async fn invitee_row_exists(pool: &PgPool, session: Uuid, user: Uuid) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM terminal_session_invitees WHERE session_id = $1 AND user_id = $2)",
+        )
+        .bind(session)
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn stored_key_bytes(pool: &PgPool, session: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT session_key_bytes FROM terminal_sessions WHERE id = $1")
+            .bind(session)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_link_session_without_stored_bytes_answers_pending_not_a_raw_key() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        let (session, token) = link_session_with_grant(&pool, host).await;
+
+        let key = my_key(&pool, session, guest, &token).await.expect("a valid grant is not refused");
+
+        assert!(matches!(key, MyKey::Pending));
+        assert_eq!(key.into_response().status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn the_hosts_wrapping_for_an_admitted_link_guest_is_served_to_that_guest() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        let (session, token) = link_session_with_grant(&pool, host).await;
+        manager.insert_test_session(session, host).await;
+        sqlx::query("UPDATE users SET allow_stranger_invites = FALSE WHERE id = $1")
+            .bind(guest)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(crate::session_grants::record_link_guest(&pool, session, guest, &token).await.unwrap());
+        let outcome = grant_invitee(&pool, &notifier, &manager, &knocks(), session, host, guest, "wrapped-for-guest")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GrantOutcome::Granted, "the guest asked to join, so stranger opt-out does not apply");
+        assert!(!invitee_row_exists(&pool, session, guest).await, "a link guest is admitted by the grant alone");
+        let MyKey::Ready(key) = my_key(&pool, session, guest, &token).await.unwrap() else {
+            panic!("the wrapped key is ready");
+        };
+        assert_eq!(key.wrapped_key.as_deref(), Some("wrapped-for-guest"));
+        assert!(key.raw_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn inviting_someone_without_a_live_link_grant_stays_an_ordinary_invite() {
+        let pool = test_pool_or_skip!();
+        let (notifier, manager) = harness();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let revoked_guest = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        add_member(&pool, team, host).await;
+        add_member(&pool, team, mate).await;
+        add_member(&pool, team, revoked_guest).await;
+        let (session, token) = link_session_with_grant(&pool, host).await;
+        manager.insert_test_session(session, host).await;
+
+        crate::session_grants::record_link_guest(&pool, session, revoked_guest, &token).await.unwrap();
+        sqlx::query("UPDATE terminal_session_grants SET revoked_at = now() WHERE session_id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for user in [mate, revoked_guest] {
+            grant_invitee(&pool, &notifier, &manager, &knocks(), session, host, user, "wrapped").await.unwrap();
+            assert!(invitee_row_exists(&pool, session, user).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_either_way_drops_its_stored_key() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let ended = seed_session(&pool, host, "invite_link").await;
+        let disconnected = seed_session(&pool, host, "invite_link").await;
+        for session in [ended, disconnected] {
+            sqlx::query("UPDATE terminal_sessions SET session_key_bytes = 'fake-key-bytes' WHERE id = $1")
+                .bind(session)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let (notifier, manager) = harness();
+
+        end_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(manager.clone()),
+            Extension(notifier.clone()),
+            axum::extract::Path(ended),
+        )
+        .await
+        .unwrap();
+        manager.insert_test_session(disconnected, host).await;
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+        cleanup_participant(&manager, disconnected, host, &tx, &pool, &notifier).await;
+
+        assert_eq!(stored_key_bytes(&pool, ended).await, None);
+        assert_eq!(stored_key_bytes(&pool, disconnected).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_backfill_clears_ended_sessions_and_spares_live_ones() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let ended = seed_session(&pool, host, "invite_link").await;
+        let live = seed_session(&pool, host, "invite_link").await;
+        sqlx::query("UPDATE terminal_sessions SET session_key_bytes = 'fake-key-bytes' WHERE id = ANY($1)")
+            .bind(vec![ended, live])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE terminal_sessions SET ended_at = now() WHERE id = $1")
+            .bind(ended)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!("../../migrations/054_clear_ended_session_keys.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(stored_key_bytes(&pool, ended).await, None);
+        assert_eq!(stored_key_bytes(&pool, live).await.as_deref(), Some("fake-key-bytes"));
+    }
 }
 
 #[cfg(test)]
@@ -3604,8 +3843,12 @@ mod live_revoke_tests {
     }
 
     async fn try_connect(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid) -> Option<Client> {
+        try_connect_with(addr, session_id, user, "").await
+    }
+
+    async fn try_connect_with(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid, query: &str) -> Option<Client> {
         let token = crate::auth::jwt::create_access_token(user, "business", None, false, false, false, true).unwrap();
-        let url = format!("ws://{addr}/v1/terminal-sessions/{session_id}/ws?token={token}");
+        let url = format!("ws://{addr}/v1/terminal-sessions/{session_id}/ws?token={token}{query}");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         next_of_type(&mut ws, "participant_list").await.map(|_| ws)
     }
@@ -3991,5 +4234,37 @@ mod live_revoke_tests {
             .collect();
         assert_eq!(history.len(), 1, "{history:?}");
         assert_eq!(history[0]["from"], host.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_link_guest_admission_asks_the_host_for_a_key_and_the_grant_answers_the_guest() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let guest = seed_user(&pool).await;
+        set_user_tier(&pool, host, "teams").await;
+        let session_id = seed_session(&pool, host, "invite_link").await;
+        let token = format!("fake-link-token-{}", Uuid::new_v4());
+        crate::session_grants::insert_grant(&pool, session_id, "legacy_token", &token, None, host, None)
+            .await
+            .unwrap();
+        let manager = TerminalManager::new();
+        manager.insert_test_session(session_id, host).await;
+        manager.sessions.lock().await.get_mut(&session_id).unwrap().visibility = "invite_link".to_string();
+        let addr = serve(pool.clone(), manager.clone()).await;
+
+        let mut host_ws = connect(addr, session_id, host).await;
+        let mut guest_ws = try_connect_with(addr, session_id, guest, &format!("&invite_token={token}"))
+            .await
+            .expect("the link admits the guest");
+
+        let request = next_of_type(&mut host_ws, "key_request").await.expect("the host is asked to wrap");
+        assert_eq!(request["user_id"], guest.to_string());
+
+        grant_invitee(&pool, &SyncNotifier::new(), &manager, &crate::test_support::default_knock_limiter(), session_id, host, guest, "wrapped")
+            .await
+            .unwrap();
+
+        let seen = frames_through(&mut guest_ws, "key_ready").await.expect("the guest is told the key is ready");
+        assert!(seen.iter().all(|f| f["type"] != "key_request"), "only the host sees key requests");
     }
 }
