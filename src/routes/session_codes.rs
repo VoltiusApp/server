@@ -37,8 +37,8 @@ pub async fn create_code(
     check_user_budget(&limiter, auth.0, "session_code_mint").await?;
     crate::routes::terminal::require_active_session_host(&pool, session_id, auth.0).await?;
 
-    // Only invite_link sessions serve raw keys through the short-code/grant
-    // path (get_my_session_key, is_authorized_participant); minting for a
+    // Only invite_link sessions admit through the short-code/grant path
+    // (get_my_session_key, is_authorized_participant); minting for a
     // vault or direct session would hand out a grant nothing can redeem it into.
     let visibility: Option<String> =
         sqlx::query_scalar("SELECT visibility FROM terminal_sessions WHERE id = $1")

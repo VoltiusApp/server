@@ -1,6 +1,6 @@
 use axum::{extract::Request, middleware::Next, response::Response, Extension};
 use std::{collections::{HashMap, VecDeque}, sync::Arc};
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use uuid::Uuid;
 use serde::Serialize;
 
@@ -51,11 +51,19 @@ pub struct SessionState {
     pub output_history: VecDeque<String>,
     /// Bumped when someone may have lost access; each attached socket re-runs admission.
     pub access_changed: watch::Sender<()>,
+    /// Frames for one participant's socket only.
+    pub direct: HashMap<Uuid, mpsc::UnboundedSender<String>>,
 }
 
 impl SessionState {
     pub fn recheck_access(&self) {
         self.access_changed.send_replace(());
+    }
+
+    pub fn send_to(&self, user_id: Uuid, frame: String) {
+        if let Some(tx) = self.direct.get(&user_id) {
+            let _ = tx.send(frame);
+        }
     }
 }
 
@@ -124,6 +132,7 @@ impl TerminalManager {
                 tx,
                 output_history: VecDeque::new(),
                 access_changed: watch::channel(()).0,
+                direct: HashMap::new(),
             },
         );
     }
