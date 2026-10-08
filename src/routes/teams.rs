@@ -173,6 +173,7 @@ pub struct TeamWithRole {
     pub role_ids: Vec<Uuid>,
     pub permission_allow: i64,
     pub permission_deny: i64,
+    pub lock_policy: Option<crate::routes::team_lock_policy::LockPolicy>,
 }
 
 pub async fn list_teams(
@@ -203,6 +204,8 @@ async fn teams_for_user(
         Option<Uuid>,
         i64,
         i64,
+        Option<i32>,
+        bool,
         String,
         Option<chrono::DateTime<chrono::Utc>>,
         bool,
@@ -212,6 +215,7 @@ async fn teams_for_user(
         r#"
         SELECT t.id, t.name, t.owner_id, t.created_at, tmr.role_id,
                COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
+               t.lock_max_minutes, t.lock_force_vault,
                {}
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
@@ -237,6 +241,8 @@ async fn teams_for_user(
         role_id,
         permission_allow,
         permission_deny,
+        lock_max_minutes,
+        lock_force_vault,
         tier,
         trial_ends_at,
         admin_override,
@@ -261,6 +267,7 @@ async fn teams_for_user(
                     role_ids: role_id.into_iter().collect(),
                     permission_allow,
                     permission_deny,
+                    lock_policy: crate::routes::team_lock_policy::LockPolicy::from_columns(lock_max_minutes, lock_force_vault),
                 });
             }
         }

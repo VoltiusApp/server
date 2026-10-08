@@ -1,0 +1,3 @@
+ALTER TABLE teams
+  ADD COLUMN lock_max_minutes INTEGER NULL,
+  ADD COLUMN lock_force_vault BOOLEAN NOT NULL DEFAULT FALSE;
