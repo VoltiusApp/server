@@ -660,6 +660,14 @@ pub struct RenameTeamRequest {
     pub name: String,
 }
 
+pub(crate) async fn require_vault_manager(pool: &PgPool, team_id: Uuid, user: Uuid) -> Result<(), StatusCode> {
+    let effective = crate::permissions::effective_permissions(pool, team_id, user).await?;
+    if effective & (crate::permissions::PERM_MANAGE_VAULT | crate::permissions::PERM_ADMINISTRATOR) == 0 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
 pub async fn rename_team(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
@@ -667,10 +675,7 @@ pub async fn rename_team(
     Path(team_id): Path<Uuid>,
     Json(body): Json<RenameTeamRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let effective = crate::permissions::effective_permissions(&pool, team_id, auth.0).await?;
-    if effective & (crate::permissions::PERM_MANAGE_VAULT | crate::permissions::PERM_ADMINISTRATOR) == 0 {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_vault_manager(&pool, team_id, auth.0).await?;
     let name = body.name.trim();
     if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
         return Err(StatusCode::BAD_REQUEST);
