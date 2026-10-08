@@ -20,6 +20,7 @@ mod team_plan;
 mod vault_key_exposure;
 mod sync_notifier;
 mod terminal_manager;
+mod user_purge;
 #[cfg(test)]
 mod test_support;
 
@@ -56,6 +57,13 @@ use tracing_subscriber::EnvFilter;
 /// passed, with no paid subscription and no admin override, has consumed its
 /// trial and reverts. Paid accounts carry `trial_ends_at = NULL` and are never
 /// matched. Keeps `subscription_tier` (and thus admin metrics) truthful.
+async fn purge_soft_deleted_users(pool: &sqlx::PgPool, grace_days: i64) {
+    match user_purge::purge_expired(pool, grace_days).await {
+        Ok(c) => tracing::info!(deleted = c.deleted, released = c.released, grace_days, "Soft-deleted user purge completed"),
+        Err(e) => tracing::error!(error = %e, "Soft-deleted user purge failed"),
+    }
+}
+
 async fn expire_lapsed_trials(pool: &sqlx::PgPool) {
     match sqlx::query(
         r#"UPDATE users SET
@@ -99,6 +107,11 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
+    let user_purge_grace_days: i64 = std::env::var("USER_PURGE_GRACE_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|d| *d >= 0)
+        .unwrap_or(30);
     // Opt-in floor for clients WRITING team vault objects. Unset by default so
     // self-hosted deployments keep working until their operator opts in. See
     // routes::client_version for why this is not a security control.
@@ -110,12 +123,14 @@ async fn main() {
     // Expire lapsed trials immediately on boot so the DB and admin metrics are
     // truthful right after deploy, then keep them so via the daily sweep below.
     expire_lapsed_trials(&retention_pool).await;
+    purge_soft_deleted_users(&retention_pool, user_purge_grace_days).await;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(86_400));
         interval.tick().await; // skip first immediate tick
         loop {
             interval.tick().await;
             expire_lapsed_trials(&retention_pool).await;
+            purge_soft_deleted_users(&retention_pool, user_purge_grace_days).await;
             match sqlx::query(
                 r#"DELETE FROM audit_logs
                    USING teams

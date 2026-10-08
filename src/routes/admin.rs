@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::auth::AdminEmail;
 use crate::lemonsqueezy::{LsCache, LsSummaryResponse};
 use crate::sync_notifier::SyncNotifier;
+use crate::user_purge::RELEASED_EMAIL;
 use crate::PresenceMap;
 
 // ─── Audit helper ─────────────────────────────────────────────────────────────
@@ -1041,15 +1042,16 @@ pub async fn delete_user(
 }
 
 /// POST /v1/admin/users/:id/restore — clear deleted_at within grace period.
+/// 409 once the purge released the email, since the address may belong to someone else.
 pub async fn restore_user(
     State(pool): State<PgPool>,
     Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
     Path(user_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let result = sqlx::query(
+    let result = sqlx::query(&format!(
         "UPDATE users SET deleted_at = NULL, deletion_reason = NULL, deleted_by = NULL
-         WHERE id = $1 AND deleted_at IS NOT NULL",
-    )
+         WHERE id = $1 AND deleted_at IS NOT NULL AND email <> {RELEASED_EMAIL}"
+    ))
     .bind(user_id)
     .execute(&pool)
     .await
@@ -1059,7 +1061,17 @@ pub async fn restore_user(
     })?;
 
     if result.rows_affected() == 0 {
-        return Err(StatusCode::NOT_FOUND);
+        let released: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND email = {RELEASED_EMAIL})"
+        ))
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to check restore target");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        return Err(if released { StatusCode::CONFLICT } else { StatusCode::NOT_FOUND });
     }
 
     write_audit(&pool, &admin_email, Some(user_id), "restore_user", json!({})).await;
@@ -1927,6 +1939,44 @@ mod admin_handler_tests {
 
         assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
         assert!(deleted_at_of(&pool, user).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_user_conflict_once_purge_released_the_email() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        seed_team(&pool, owner).await;
+        sqlx::query("UPDATE users SET deleted_at = now() - INTERVAL '31 days' WHERE id = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .expect("soft-delete past grace");
+        crate::user_purge::purge_expired(&pool, 30).await.expect("purge");
+
+        let res = restore_user(State(pool.clone()), admin(), Path(owner)).await;
+
+        assert_eq!(res.unwrap_err(), StatusCode::CONFLICT);
+        assert!(deleted_at_of(&pool, owner).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_user_force_succeeds_after_soft_delete() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        for force in [None, Some(true)] {
+            let _ = delete_user(
+                State(pool.clone()),
+                admin(),
+                notifier(),
+                Path(user),
+                Query(DeleteQuery { force }),
+                Json(DeleteBody { reason: None }),
+            )
+            .await
+            .expect("delete ok");
+        }
+
+        assert!(!user_exists(&pool, user).await);
     }
 
     #[tokio::test]
