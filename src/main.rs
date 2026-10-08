@@ -405,6 +405,10 @@ async fn main() {
         )
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route(
+            "/v1/teams/:team_id/lock-policy",
+            put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),
+        )
+        .route(
             "/v1/teams/:team_id/members/:user_id",
             delete(routes::teams::remove_member),
         )
