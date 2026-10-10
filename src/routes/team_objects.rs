@@ -61,17 +61,25 @@ fn edit_permission_for_secret_type(secret_type: &str) -> Option<i64> {
     secret_owner_type(secret_type).and_then(edit_permission_for_str)
 }
 
+/// Each accepted secret type with the object type that owns it; `/v1/meta` advertises the first column.
+const SECRET_TYPES: &[(&str, &str)] = &[
+    ("connection_password", "connection"),
+    ("connection_key", "connection"),
+    ("connection_passphrase", "connection"),
+    ("connection_proxy_password", "connection"),
+    ("connection_knock_sequence", "connection"),
+    ("identity_password", "identity"),
+    ("key_private", "key"),
+    ("key_public", "key"),
+    ("key_passphrase", "key"),
+];
+
+pub fn secret_types() -> Vec<&'static str> {
+    SECRET_TYPES.iter().map(|(secret_type, _)| *secret_type).collect()
+}
+
 fn secret_owner_type(secret_type: &str) -> Option<&'static str> {
-    match secret_type {
-        "connection_password"
-        | "connection_key"
-        | "connection_passphrase"
-        | "connection_proxy_password"
-        | "connection_knock_sequence" => Some("connection"),
-        "identity_password" => Some("identity"),
-        "key_private" | "key_public" | "key_passphrase" => Some("key"),
-        _ => None,
-    }
+    SECRET_TYPES.iter().find(|(known, _)| *known == secret_type).map(|(_, owner)| *owner)
 }
 
 /// Inverse of the client's `teamSecretFromLocalKey`; a colon in a connection key id would alias `key:<id>:<part>`.
@@ -1227,8 +1235,8 @@ mod authz_tests {
         ];
         for (secret_type, id) in cases {
             assert_eq!(canonical_secret_id("o", secret_type).as_deref(), Some(id));
-            assert!(secret_owner_type(secret_type).is_some());
         }
+        assert_eq!(secret_types(), cases.map(|(secret_type, _)| secret_type));
         assert_eq!(canonical_secret_id("o", "bogus"), None);
         assert_eq!(canonical_secret_id("k:passphrase", "connection_key"), None);
         assert_eq!(canonical_secret_id("__global__", "connection_proxy_password"), None);
