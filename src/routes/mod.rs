@@ -21,6 +21,7 @@ pub mod team_object_prefs;
 pub mod team_rule_sets;
 pub mod teams;
 pub mod terminal;
+pub mod two_factor;
 pub mod users;
 pub mod waitlist;
 pub mod webhooks;
@@ -43,6 +44,6 @@ pub(crate) fn email_undeliverable_response() -> Response {
     coded_error(StatusCode::UNPROCESSABLE_ENTITY, "EMAIL_UNDELIVERABLE")
 }
 
-fn coded_error(status: StatusCode, code: &'static str) -> Response {
+pub(crate) fn coded_error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(serde_json::json!({ "error": code }))).into_response()
 }

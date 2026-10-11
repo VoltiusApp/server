@@ -66,17 +66,21 @@ pub fn create_access_token(
     )
 }
 
-pub fn create_refresh_token(
+pub const PENDING_SECOND_FACTOR: &str = "2fa_pending";
+
+// Refresh and pending tokens carry no tier: it is re-read from the database when they are used.
+fn bare_token(
     user_id: Uuid,
+    kind: &str,
+    lifetime: Duration,
     token_version: i32,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
-    // Refresh tokens carry no tier — tier is re-read from DB on each refresh.
     let claims = Claims {
         sub: user_id,
         iat: now.timestamp(),
-        exp: (now + Duration::days(90)).timestamp(),
-        kind: "refresh".to_string(),
+        exp: (now + lifetime).timestamp(),
+        kind: kind.to_string(),
         tier: "free".to_string(),
         trial_ends_at: None,
         trial_used: false,
@@ -90,6 +94,20 @@ pub fn create_refresh_token(
         &claims,
         &EncodingKey::from_secret(&secret()),
     )
+}
+
+pub fn create_refresh_token(
+    user_id: Uuid,
+    token_version: i32,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    bare_token(user_id, "refresh", Duration::days(90), token_version)
+}
+
+pub fn create_pending_token(
+    user_id: Uuid,
+    token_version: i32,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    bare_token(user_id, PENDING_SECOND_FACTOR, Duration::minutes(5), token_version)
 }
 
 pub fn validate_token(
@@ -173,6 +191,18 @@ pub(crate) mod tests {
         assert!(!claims.email_verified);
         assert_eq!(claims.ver, 0);
         assert_eq!(claims.sub, user_id);
+    }
+
+    #[test]
+    fn a_pending_token_passes_for_nothing_else() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        let token = create_pending_token(Uuid::new_v4(), 3).unwrap();
+
+        assert_eq!(validate_token(&token, PENDING_SECOND_FACTOR).unwrap().ver, 3);
+        assert!(validate_token(&token, "access").is_err());
+        assert!(validate_token(&token, "refresh").is_err());
     }
 
     #[test]

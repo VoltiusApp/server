@@ -20,6 +20,7 @@ mod team_plan;
 mod vault_key_exposure;
 mod sync_notifier;
 mod terminal_manager;
+mod two_factor;
 mod user_purge;
 #[cfg(test)]
 mod test_support;
@@ -271,6 +272,8 @@ async fn main() {
         handles_from_email = features.handles_from_email,
         "Configured features"
     );
+    let seed_cipher = two_factor::SeedCipher::from_env();
+    tracing::info!(available = seed_cipher.available(), "Configured two-factor authentication");
 
     // Register — stricter limit: 5/day per IP on top of the general auth 10/min
     let register_route = Router::new()
@@ -286,6 +289,7 @@ async fn main() {
     let public = Router::new()
         .route("/v1/auth/challenge", get(routes::auth::challenge))
         .route("/v1/auth/login", post(routes::auth::login))
+        .route("/v1/auth/login/2fa", post(routes::auth::login_second_factor))
         .route("/v1/auth/verify-email", post(routes::auth::verify_email))
         .route(
             "/v1/invitations/:token",
@@ -369,6 +373,13 @@ async fn main() {
         .route("/v1/auth/email", put(routes::auth::update_email))
         .route("/v1/auth/password", put(routes::auth::update_password))
         .route("/v1/auth/logout-all", post(routes::auth::logout_all))
+        .route("/v1/auth/2fa/setup", post(routes::two_factor::setup))
+        .route("/v1/auth/2fa/enable", post(routes::two_factor::enable))
+        .route("/v1/auth/2fa/disable", post(routes::two_factor::disable))
+        .route(
+            "/v1/auth/2fa/recovery-codes",
+            post(routes::two_factor::regenerate_recovery_codes),
+        )
         .route(
             "/v1/auth/wrapped-user-secrets",
             put(routes::auth::upload_wrapped_user_secrets),
@@ -727,6 +738,10 @@ async fn main() {
         .route("/v1/admin/handles/derive", post(routes::admin::derive_handles))
         .route("/v1/admin/users/:id/unban", post(routes::admin::unban_user))
         .route(
+            "/v1/admin/users/:id/2fa/clear",
+            post(routes::admin::clear_two_factor),
+        )
+        .route(
             "/v1/admin/users/:id/extend-trial",
             post(routes::admin::extend_trial),
         )
@@ -810,6 +825,7 @@ async fn main() {
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
         .layer(middleware::from_fn(observability::track_requests))
+        .layer(Extension(seed_cipher))
         .with_state(pool);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
