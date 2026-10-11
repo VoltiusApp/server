@@ -113,7 +113,7 @@ fn branded_email_html(
     )
 }
 
-fn app_url() -> String {
+pub(crate) fn app_url() -> String {
     std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string())
 }
 

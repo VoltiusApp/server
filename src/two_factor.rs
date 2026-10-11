@@ -1,4 +1,4 @@
-//! Optional TOTP second factor: seed encryption, code checks, recovery codes.
+//! Optional second factor: TOTP seeds and codes, recovery codes, and the checks every factor goes through.
 
 use axum::{
     http::StatusCode,
@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use crate::passkeys::{self, Passkeys};
 use crate::routes::coded_error;
 
 const STEP_SECONDS: i64 = 30;
@@ -29,6 +30,10 @@ const MAX_FAILED_ATTEMPTS: i32 = 5;
 const LOCK_MINUTES: i32 = 15;
 pub const RECOVERY_CODE_COUNT: usize = 10;
 const RECOVERY_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+
+/// Whether a `users` row has any second factor. Splice into a query that reads `users` unaliased.
+pub const ENABLED_SQL: &str =
+    "(totp_enabled_at IS NOT NULL OR EXISTS (SELECT 1 FROM user_passkeys WHERE user_passkeys.user_id = users.id))";
 
 /// Seals TOTP seeds with `TOTP_ENC_KEY`. Without the key the server offers no enrolment.
 #[derive(Clone)]
@@ -156,6 +161,23 @@ pub struct SecondFactorProof {
     pub code: Option<String>,
     #[serde(default)]
     pub recovery_code: Option<String>,
+    /// What a finished passkey ceremony handed back to the client.
+    #[serde(default)]
+    pub passkey_code: Option<String>,
+}
+
+impl SecondFactorProof {
+    fn is_empty(&self) -> bool {
+        self.code.is_none() && self.recovery_code.is_none() && self.passkey_code.is_none()
+    }
+}
+
+/// What a proof is checked for. Enrolment confirms a seed that is not enabled yet.
+#[derive(Clone, Copy)]
+pub enum Context<'a> {
+    SignIn { pending_token: &'a str },
+    StepUp,
+    Enrolment,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -166,6 +188,7 @@ pub enum Refusal {
     Unavailable,
     AlreadyEnabled,
     NotEnabled,
+    PasskeyLimit,
     Status(StatusCode),
 }
 
@@ -184,6 +207,7 @@ impl IntoResponse for Refusal {
             Refusal::Unavailable => coded_error(StatusCode::SERVICE_UNAVAILABLE, "TWO_FACTOR_UNAVAILABLE"),
             Refusal::AlreadyEnabled => coded_error(StatusCode::CONFLICT, "TWO_FACTOR_ALREADY_ENABLED"),
             Refusal::NotEnabled => coded_error(StatusCode::CONFLICT, "TWO_FACTOR_NOT_ENABLED"),
+            Refusal::PasskeyLimit => coded_error(StatusCode::CONFLICT, "PASSKEY_LIMIT"),
             Refusal::Status(status) => status.into_response(),
         }
     }
@@ -194,21 +218,41 @@ pub fn db_failure(err: sqlx::Error) -> Refusal {
     Refusal::Status(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// What a sign-in challenge may offer: a code needs the seed key, a recovery code never does.
-pub fn methods(cipher: &SeedCipher) -> Vec<&'static str> {
-    if cipher.available() {
-        vec!["totp", "recovery"]
-    } else {
-        vec!["recovery"]
-    }
+/// What a sign-in challenge may offer this account. A recovery code needs neither key nor relying party.
+pub async fn methods(
+    pool: &PgPool,
+    cipher: &SeedCipher,
+    passkeys: &Passkeys,
+    user_id: Uuid,
+) -> Result<Vec<&'static str>, Refusal> {
+    let (totp, passkey): (bool, bool) = sqlx::query_as(
+        "SELECT totp_enabled_at IS NOT NULL, EXISTS (SELECT 1 FROM user_passkeys WHERE user_id = users.id)
+         FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_failure)?;
+    let offered = [("totp", totp && cipher.available()), ("passkey", passkey && passkeys.available())];
+    Ok(offered.into_iter().filter_map(|(method, on)| on.then_some(method)).chain(["recovery"]).collect())
 }
 
 pub async fn is_enabled(pool: &PgPool, user_id: Uuid) -> Result<bool, Refusal> {
-    sqlx::query_scalar("SELECT totp_enabled_at IS NOT NULL FROM users WHERE id = $1")
+    sqlx::query_scalar(&format!("SELECT {ENABLED_SQL} FROM users WHERE id = $1"))
         .bind(user_id)
         .fetch_one(pool)
         .await
         .map_err(db_failure)
+}
+
+/// Reads whether the account has a factor while holding its row, so adding or removing one cannot race.
+pub async fn lock_enabled(tx: &mut sqlx::PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let enabled: Option<bool> =
+        sqlx::query_scalar(&format!("SELECT {ENABLED_SQL} FROM users WHERE id = $1 FOR UPDATE"))
+            .bind(user_id)
+            .fetch_optional(tx)
+            .await?;
+    Ok(enabled.unwrap_or(false))
 }
 
 /// The step every sensitive change takes once the account has a second factor.
@@ -230,24 +274,34 @@ pub async fn verify(
     user_id: Uuid,
     proof: &SecondFactorProof,
 ) -> Result<(), Refusal> {
-    verify_at(pool, cipher, user_id, proof, current_step()).await
+    verify_in(pool, cipher, user_id, proof, Context::StepUp).await
 }
 
-/// Checks the stored seed whether or not it is enabled yet, so enrolment confirms through the same path.
+pub async fn verify_in(
+    pool: &PgPool,
+    cipher: &SeedCipher,
+    user_id: Uuid,
+    proof: &SecondFactorProof,
+    context: Context<'_>,
+) -> Result<(), Refusal> {
+    verify_at(pool, cipher, user_id, proof, context, current_step()).await
+}
+
 pub async fn verify_at(
     pool: &PgPool,
     cipher: &SeedCipher,
     user_id: Uuid,
     proof: &SecondFactorProof,
+    context: Context<'_>,
     now_step: i64,
 ) -> Result<(), Refusal> {
     // A client that predates the feature sends nothing: that is not a wrong guess.
-    if proof.code.is_none() && proof.recovery_code.is_none() {
+    if proof.is_empty() {
         return Err(Refusal::Required);
     }
     let mut tx = pool.begin().await.map_err(db_failure)?;
-    let (sealed, last_step, locked): (Option<String>, Option<i64>, bool) = sqlx::query_as(
-        "SELECT totp_secret, totp_last_step, COALESCE(totp_locked_until > now(), FALSE)
+    let (sealed, last_step, locked, totp_enabled): (Option<String>, Option<i64>, bool, bool) = sqlx::query_as(
+        "SELECT totp_secret, totp_last_step, COALESCE(totp_locked_until > now(), FALSE), totp_enabled_at IS NOT NULL
          FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(user_id)
@@ -272,14 +326,23 @@ pub async fn verify_at(
         (spent.rows_affected() == 1).then_some(last_step)
     } else if let Some(code) = &proof.code {
         match sealed {
-            Some(sealed) => {
+            Some(sealed) if totp_enabled || matches!(context, Context::Enrolment) => {
                 let seed = cipher.open(&sealed).ok_or(Refusal::Unavailable)?;
                 matching_step(&seed, code, now_step)
                     .filter(|step| last_step.is_none_or(|last| *step > last))
                     .map(Some)
             }
-            None => None,
+            _ => None,
         }
+    } else if let Some(passkey_code) = &proof.passkey_code {
+        let pending_token = match context {
+            Context::SignIn { pending_token } => Some(pending_token),
+            Context::StepUp | Context::Enrolment => None,
+        };
+        passkeys::spend_code(&mut tx, user_id, passkey_code, pending_token)
+            .await
+            .map_err(db_failure)?
+            .then_some(last_step)
     } else {
         None
     };
@@ -335,20 +398,66 @@ pub async fn replace_recovery_codes(
     Ok(codes)
 }
 
-pub async fn clear(tx: &mut sqlx::PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    let cleared = sqlx::query(
-        "UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL, totp_last_step = NULL,
-                totp_failed_attempts = 0, totp_locked_until = NULL, token_version = token_version + 1
+/// Recovery codes for an account gaining its first factor, which also ends its earlier sessions.
+pub async fn first_factor_added(
+    tx: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    was_enabled: bool,
+) -> Result<Vec<String>, sqlx::Error> {
+    if was_enabled {
+        return Ok(Vec::new());
+    }
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    replace_recovery_codes(tx, user_id).await
+}
+
+pub async fn remove_totp(tx: &mut sqlx::PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let removed = sqlx::query(
+        "UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL, totp_last_step = NULL
          WHERE id = $1 AND totp_enabled_at IS NOT NULL",
+    )
+    .bind(user_id)
+    .execute(tx)
+    .await?;
+    Ok(removed.rows_affected() == 1)
+}
+
+/// Turns two-factor off once the last factor is gone. Returns whether the account still has one.
+pub async fn settle_after_removal(tx: &mut sqlx::PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    if lock_enabled(&mut *tx, user_id).await? {
+        return Ok(true);
+    }
+    sqlx::query(
+        "UPDATE users SET totp_secret = NULL, totp_last_step = NULL, totp_failed_attempts = 0,
+                totp_locked_until = NULL, token_version = token_version + 1
+         WHERE id = $1",
     )
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = $1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-    Ok(cleared.rows_affected() == 1)
+    for table in ["user_recovery_codes", "passkey_ceremonies"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1")).bind(user_id).execute(&mut *tx).await?;
+    }
+    Ok(false)
+}
+
+pub async fn remove_all(tx: &mut sqlx::PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    remove_totp(&mut *tx, user_id).await?;
+    sqlx::query("DELETE FROM user_passkeys WHERE user_id = $1").bind(user_id).execute(tx).await?;
+    Ok(true)
+}
+
+/// Removes every factor without proof of one. Returns whether the account had any.
+pub async fn clear(tx: &mut sqlx::PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    if !lock_enabled(&mut *tx, user_id).await? {
+        return Ok(false);
+    }
+    remove_all(&mut *tx, user_id).await?;
+    settle_after_removal(tx, user_id).await?;
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ services:
       WAITLIST_RATE_LIMIT: ${WAITLIST_RATE_LIMIT:-10}
       ADMIN_SECRET: ${ADMIN_SECRET}
       TOTP_ENC_KEY: ${TOTP_ENC_KEY:-}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://voltius.app,https://www.voltius.app,https://app.voltius.app,tauri://localhost,https://tauri.localhost,http://localhost:1420,http://localhost:1421}
       LEMONSQUEEZY_SIGNING_SECRET: ${LEMONSQUEEZY_SIGNING_SECRET}
       LEMONSQUEEZY_STORE_ID: ${LEMONSQUEEZY_STORE_ID}

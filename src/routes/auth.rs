@@ -20,6 +20,7 @@ use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
+use crate::passkeys::Passkeys;
 use crate::two_factor::{self, Refusal, SecondFactorProof, SeedCipher};
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
@@ -488,11 +489,13 @@ impl IntoResponse for LoginOutcome {
 pub async fn login(
     State(pool): State<PgPool>,
     axum::Extension(cipher): axum::Extension<SeedCipher>,
+    axum::Extension(passkeys): axum::Extension<Passkeys>,
     Json(body): Json<LoginRequest>,
 ) -> Result<LoginOutcome, StatusCode> {
-    let user = sqlx::query_as::<_, (Uuid, String, bool, Option<String>, bool)>(
-        "SELECT id, auth_hash, is_banned, wrapped_user_secrets, totp_enabled_at IS NOT NULL FROM users WHERE account_id = $1",
-    )
+    let user = sqlx::query_as::<_, (Uuid, String, bool, Option<String>, bool)>(&format!(
+        "SELECT id, auth_hash, is_banned, wrapped_user_secrets, {} FROM users WHERE account_id = $1",
+        two_factor::ENABLED_SQL
+    ))
     .bind(body.account_id)
     .fetch_optional(&pool)
     .await
@@ -532,7 +535,9 @@ pub async fn login(
         return Ok(LoginOutcome::SecondFactorRequired(SecondFactorChallenge {
             error: "TWO_FACTOR_REQUIRED",
             pending_token,
-            methods: two_factor::methods(&cipher),
+            methods: two_factor::methods(&pool, &cipher, &passkeys, user_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         }));
     }
 
@@ -548,25 +553,30 @@ pub struct SecondFactorLoginRequest {
     pub proof: SecondFactorProof,
 }
 
-pub async fn login_second_factor(
-    State(pool): State<PgPool>,
-    axum::Extension(cipher): axum::Extension<SeedCipher>,
-    Json(body): Json<SecondFactorLoginRequest>,
-) -> Result<Json<AuthResponse>, Refusal> {
-    let claims = validate_token(&body.pending_token, PENDING_SECOND_FACTOR).map_err(|_| {
+pub struct PendingSignIn {
+    pub user_id: Uuid,
+    tier: TierInfo,
+    wrapped_user_secrets: Option<String>,
+}
+
+/// The account a pending token still stands for: password accepted, second factor owed.
+pub async fn pending_sign_in(pool: &PgPool, pending_token: &str) -> Result<PendingSignIn, Refusal> {
+    let claims = validate_token(pending_token, PENDING_SECOND_FACTOR).map_err(|_| {
         warn!("Second factor login failed: invalid pending token");
         StatusCode::UNAUTHORIZED
     })?;
     let user_id = claims.sub;
 
-    let (two_factor_enabled, wrapped_user_secrets): (bool, Option<String>) =
-        sqlx::query_as("SELECT totp_enabled_at IS NOT NULL, wrapped_user_secrets FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(two_factor::db_failure)?
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-    let tier = fetch_tier(&pool, user_id).await?;
+    let (two_factor_enabled, wrapped_user_secrets): (bool, Option<String>) = sqlx::query_as(&format!(
+        "SELECT {}, wrapped_user_secrets FROM users WHERE id = $1",
+        two_factor::ENABLED_SQL
+    ))
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(two_factor::db_failure)?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+    let tier = fetch_tier(pool, user_id).await?;
 
     if tier.is_banned {
         return Err(StatusCode::FORBIDDEN.into());
@@ -574,7 +584,17 @@ pub async fn login_second_factor(
     if !two_factor_enabled || claims.ver != tier.token_version {
         return Err(StatusCode::UNAUTHORIZED.into());
     }
-    two_factor::verify(&pool, &cipher, user_id, &body.proof).await?;
+    Ok(PendingSignIn { user_id, tier, wrapped_user_secrets })
+}
+
+pub async fn login_second_factor(
+    State(pool): State<PgPool>,
+    axum::Extension(cipher): axum::Extension<SeedCipher>,
+    Json(body): Json<SecondFactorLoginRequest>,
+) -> Result<Json<AuthResponse>, Refusal> {
+    let PendingSignIn { user_id, tier, wrapped_user_secrets } = pending_sign_in(&pool, &body.pending_token).await?;
+    let context = two_factor::Context::SignIn { pending_token: &body.pending_token };
+    two_factor::verify_in(&pool, &cipher, user_id, &body.proof, context).await?;
 
     info!(user_id = %user_id, tier = %tier.tier, "User logged in with second factor");
 
@@ -801,7 +821,7 @@ pub(crate) async fn fetch_me_inner(
     handle_managed: bool,
 ) -> Result<MeResponse, StatusCode> {
     let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool, bool, bool)>(
-        "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites, email_undeliverable_at IS NOT NULL, totp_enabled_at IS NOT NULL FROM users WHERE id = $1",
+        &format!("SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites, email_undeliverable_at IS NOT NULL, {} FROM users WHERE id = $1", two_factor::ENABLED_SQL),
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -1302,6 +1322,7 @@ mod handler_tests {
         let outcome = login(
             State(pool.clone()),
             Extension(SeedCipher::for_tests()),
+            Extension(Passkeys::for_tests()),
             Json(LoginRequest {
                 account_id,
                 auth_key: auth_key.to_string(),

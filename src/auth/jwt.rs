@@ -18,6 +18,9 @@ pub struct Claims {
     pub email_verified: bool,
     #[serde(default)]
     pub ver: i32,
+    /// Tells apart two pending sign-ins issued to one account within the same second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<Uuid>,
 }
 
 impl Claims {
@@ -58,6 +61,7 @@ pub fn create_access_token(
         is_banned,
         email_verified,
         ver: 0,
+        jti: None,
     };
     encode(
         &Header::default(),
@@ -74,6 +78,7 @@ fn bare_token(
     kind: &str,
     lifetime: Duration,
     token_version: i32,
+    jti: Option<Uuid>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
@@ -88,6 +93,7 @@ fn bare_token(
         is_banned: false,
         email_verified: false,
         ver: token_version,
+        jti,
     };
     encode(
         &Header::default(),
@@ -100,14 +106,14 @@ pub fn create_refresh_token(
     user_id: Uuid,
     token_version: i32,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    bare_token(user_id, "refresh", Duration::days(90), token_version)
+    bare_token(user_id, "refresh", Duration::days(90), token_version, None)
 }
 
 pub fn create_pending_token(
     user_id: Uuid,
     token_version: i32,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    bare_token(user_id, PENDING_SECOND_FACTOR, Duration::minutes(5), token_version)
+    bare_token(user_id, PENDING_SECOND_FACTOR, Duration::minutes(5), token_version, Some(Uuid::new_v4()))
 }
 
 pub fn validate_token(
@@ -203,6 +209,15 @@ pub(crate) mod tests {
         assert_eq!(validate_token(&token, PENDING_SECOND_FACTOR).unwrap().ver, 3);
         assert!(validate_token(&token, "access").is_err());
         assert!(validate_token(&token, "refresh").is_err());
+    }
+
+    #[test]
+    fn two_pending_tokens_for_one_account_never_match() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let user = Uuid::new_v4();
+
+        assert_ne!(create_pending_token(user, 3).unwrap(), create_pending_token(user, 3).unwrap());
     }
 
     #[test]
