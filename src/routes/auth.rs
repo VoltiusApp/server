@@ -30,11 +30,48 @@ struct TierInfo {
     is_admin: bool,
     is_banned: bool,
     email_verified: bool,
+    token_version: i32,
+}
+
+fn access_token_for(user_id: Uuid, tier: &TierInfo) -> Result<String, StatusCode> {
+    create_access_token(
+        user_id,
+        &tier.tier,
+        tier.trial_ends_at,
+        tier.trial_used,
+        tier.is_admin,
+        tier.is_banned,
+        tier.email_verified,
+    )
+    .map_err(|err| {
+        error!(error = %err, user_id = %user_id, "Failed to create access token");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+fn issue_session(user_id: Uuid, tier: &TierInfo) -> Result<(String, String), StatusCode> {
+    let refresh_token = create_refresh_token(user_id, tier.token_version).map_err(|err| {
+        error!(error = %err, user_id = %user_id, "Failed to create refresh token");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((access_token_for(user_id, tier)?, refresh_token))
+}
+
+async fn bump_token_version(pool: &PgPool, user_id: Uuid) -> Result<(), StatusCode> {
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %user_id, "Failed to bump token version");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(())
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>, Option<DateTime<Utc>>)>(
-        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool, bool, bool, bool, bool, Option<String>, Option<DateTime<Utc>>, i32)>(
+        "SELECT subscription_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at, token_version FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -44,7 +81,7 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at) =
+    let (stored_tier, trial_ends_at, trial_used, is_admin, is_banned, email_verified, admin_override, ls_subscription_id, deleted_at, token_version) =
         row;
 
     // Soft-deleted accounts are locked: no session may be issued or renewed from one.
@@ -71,6 +108,7 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
         is_admin,
         is_banned,
         email_verified,
+        token_version,
     })
 }
 
@@ -338,23 +376,18 @@ async fn register_with(
     }
 
     let trial_ends_ts = trial_ends_at.map(|t| t.timestamp());
-    let jwt_token = create_access_token(
+    let (jwt_token, refresh_token) = issue_session(
         user_id,
-        initial_tier,
-        trial_ends_ts,
-        false,
-        false,
-        false,
-        email_verified,
-    )
-    .map_err(|err| {
-        error!(error = %err, user_id = %user_id, "Failed to create access token during registration");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let refresh_token = create_refresh_token(user_id).map_err(|err| {
-        error!(error = %err, user_id = %user_id, "Failed to create refresh token during registration");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        &TierInfo {
+            tier: initial_tier.to_string(),
+            trial_ends_at: trial_ends_ts,
+            trial_used: false,
+            is_admin: false,
+            is_banned: false,
+            email_verified,
+            token_version: 0,
+        },
+    )?;
 
     // `account_id` is deliberately absent: despite the name it is the KDF salt
     // passed to derive_keys, so a log line carrying it hands anyone who can read
@@ -423,23 +456,7 @@ pub async fn login(
     }
 
     let tier = fetch_tier(&pool, user_id).await?;
-    let jwt_token = create_access_token(
-        user_id,
-        &tier.tier,
-        tier.trial_ends_at,
-        tier.trial_used,
-        tier.is_admin,
-        tier.is_banned,
-        tier.email_verified,
-    )
-    .map_err(|err| {
-        error!(error = %err, user_id = %user_id, "Failed to create access token during login");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let refresh_token = create_refresh_token(user_id).map_err(|err| {
-        error!(error = %err, user_id = %user_id, "Failed to create refresh token during login");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let (jwt_token, refresh_token) = issue_session(user_id, &tier)?;
 
     info!(user_id = %user_id, tier = %tier.tier, "User logged in");
 
@@ -475,19 +492,11 @@ pub async fn refresh(
     })?;
 
     let tier = fetch_tier(&pool, claims.sub).await?;
-    let jwt_token = create_access_token(
-        claims.sub,
-        &tier.tier,
-        tier.trial_ends_at,
-        tier.trial_used,
-        tier.is_admin,
-        tier.is_banned,
-        tier.email_verified,
-    )
-    .map_err(|err| {
-        error!(error = %err, user_id = %claims.sub, "Failed to create access token during refresh");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    if claims.ver != tier.token_version {
+        warn!(user_id = %claims.sub, "Refresh failed: session revoked");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let jwt_token = access_token_for(claims.sub, &tier)?;
 
     // A refreshed session means the account is still live. Fire-and-forget.
     crate::last_seen::touch(&pool, claims.sub);
@@ -796,6 +805,7 @@ pub struct UpdatePasswordRequest {
 pub async fn update_password(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     Json(body): Json<UpdatePasswordRequest>,
 ) -> Result<Json<AuthResponse>, StatusCode> {
     let auth_hash = sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = $1")
@@ -821,7 +831,7 @@ pub async fn update_password(
     })?;
 
     sqlx::query(
-        "UPDATE users SET auth_hash = $1, wrapped_user_secrets = $2, updated_at = now() WHERE id = $3",
+        "UPDATE users SET auth_hash = $1, wrapped_user_secrets = $2, token_version = token_version + 1, updated_at = now() WHERE id = $3",
     )
     .bind(&new_auth_hash)
     .bind(&body.new_wrapped_user_secrets)
@@ -834,23 +844,8 @@ pub async fn update_password(
     })?;
 
     let tier = fetch_tier(&pool, auth.0).await?;
-    let jwt_token = create_access_token(
-        auth.0,
-        &tier.tier,
-        tier.trial_ends_at,
-        tier.trial_used,
-        tier.is_admin,
-        tier.is_banned,
-        tier.email_verified,
-    )
-    .map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to create access token after password update");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let refresh_token = create_refresh_token(auth.0).map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to create refresh token after password update");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let (jwt_token, refresh_token) = issue_session(auth.0, &tier)?;
+    notifier.notify(auth.0, "token_invalidated".to_string());
 
     info!(user_id = %auth.0, "User password updated");
 
@@ -862,6 +857,29 @@ pub async fn update_password(
         trial_ends_at: tier.trial_ends_at,
         wrapped_user_secrets: Some(body.new_wrapped_user_secrets),
     }))
+}
+
+// ─── Log out everywhere ───────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct SessionTokens {
+    pub jwt_token: String,
+    pub refresh_token: String,
+}
+
+pub async fn logout_all(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+) -> Result<Json<SessionTokens>, StatusCode> {
+    bump_token_version(&pool, auth.0).await?;
+    let tier = fetch_tier(&pool, auth.0).await?;
+    let (jwt_token, refresh_token) = issue_session(auth.0, &tier)?;
+    notifier.notify(auth.0, "token_invalidated".to_string());
+
+    info!(user_id = %auth.0, "User signed out every other session");
+
+    Ok(Json(SessionTokens { jwt_token, refresh_token }))
 }
 
 // ─── Upload wrapped user secrets (migration) ──────────────────────────────────
@@ -1452,6 +1470,89 @@ mod handler_tests {
             Err(s) => assert_eq!(s, StatusCode::CONFLICT),
             Ok(_) => panic!("expected CONFLICT for the same mailbox in a different case"),
         }
+    }
+
+    // ── revocation: a refresh token dies when token_version moves ────────────
+
+    async fn refresh_with(pool: &PgPool, refresh_token: &str) -> Result<String, StatusCode> {
+        refresh(
+            State(pool.clone()),
+            Json(RefreshRequest {
+                refresh_token: refresh_token.to_string(),
+            }),
+        )
+        .await
+        .map(|Json(r)| r.jwt_token)
+    }
+
+    async fn signed_in_twice(pool: &PgPool) -> (Uuid, AuthResponse, AuthResponse) {
+        let account_id = Uuid::new_v4();
+        let uid = seed_user_with_credentials(pool, account_id, "auth-key-secret").await;
+        let here = login_of(pool, account_id).await.expect("login ok");
+        let elsewhere = login_of(pool, account_id).await.expect("login ok");
+        (uid, here, elsewhere)
+    }
+
+    #[tokio::test]
+    async fn password_change_revokes_earlier_refresh_tokens() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, _, elsewhere) = signed_in_twice(&pool).await;
+
+        let Json(changed) = update_password(
+            State(pool.clone()),
+            Extension(AuthUser(uid)),
+            Extension(SyncNotifier::new()),
+            Json(UpdatePasswordRequest {
+                old_auth_key: "auth-key-secret".to_string(),
+                new_auth_key: "new-auth-key".to_string(),
+                new_wrapped_user_secrets: "wrapped".to_string(),
+            }),
+        )
+        .await
+        .expect("password change ok");
+
+        assert_eq!(
+            refresh_with(&pool, &elsewhere.refresh_token).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert!(refresh_with(&pool, &changed.refresh_token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn logout_all_revokes_other_sessions_and_keeps_the_caller() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        use crate::sync_notifier::SyncEvent;
+        let (uid, here, elsewhere) = signed_in_twice(&pool).await;
+        let notifier = SyncNotifier::new();
+        let mut events = notifier.subscribe();
+
+        let Json(fresh) = logout_all(State(pool.clone()), Extension(AuthUser(uid)), Extension(notifier))
+            .await
+            .expect("logout-all ok");
+
+        for revoked in [&here.refresh_token, &elsewhere.refresh_token] {
+            assert_eq!(refresh_with(&pool, revoked).await, Err(StatusCode::UNAUTHORIZED));
+        }
+        assert!(refresh_with(&pool, &fresh.refresh_token).await.is_ok());
+        assert!(validate_token(&fresh.jwt_token, "access").is_ok());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SyncEvent::BlobPushed { user_id, device_id }) if user_id == uid && device_id == "token_invalidated"
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_token_from_before_the_version_claim_works_until_a_bump() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let uid = seed_user_with_credentials(&pool, Uuid::new_v4(), "auth-key-secret").await;
+        let legacy = crate::auth::jwt::tests::legacy_token(uid, "refresh", "ci-test-secret");
+
+        assert!(refresh_with(&pool, &legacy).await.is_ok());
+        bump_token_version(&pool, uid).await.expect("bump");
+        assert_eq!(refresh_with(&pool, &legacy).await, Err(StatusCode::UNAUTHORIZED));
     }
 
     // ── soft delete: a deleted account is locked out of every auth path ───────

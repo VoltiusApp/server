@@ -16,6 +16,8 @@ pub struct Claims {
     pub is_banned: bool,
     #[serde(default)]
     pub email_verified: bool,
+    #[serde(default)]
+    pub ver: i32,
 }
 
 impl Claims {
@@ -55,6 +57,7 @@ pub fn create_access_token(
         is_admin,
         is_banned,
         email_verified,
+        ver: 0,
     };
     encode(
         &Header::default(),
@@ -63,7 +66,10 @@ pub fn create_access_token(
     )
 }
 
-pub fn create_refresh_token(user_id: Uuid) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_refresh_token(
+    user_id: Uuid,
+    token_version: i32,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     // Refresh tokens carry no tier — tier is re-read from DB on each refresh.
     let claims = Claims {
@@ -77,6 +83,7 @@ pub fn create_refresh_token(user_id: Uuid) -> Result<String, jsonwebtoken::error
         is_admin: false,
         is_banned: false,
         email_verified: false,
+        ver: token_version,
     };
     encode(
         &Header::default(),
@@ -103,7 +110,7 @@ pub fn validate_token(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
 
@@ -118,6 +125,26 @@ mod tests {
         trial_used: bool,
         is_admin: bool,
         is_banned: bool,
+    }
+
+    pub(crate) fn legacy_token(user_id: Uuid, kind: &str, secret: &str) -> String {
+        let now = Utc::now();
+        encode(
+            &Header::default(),
+            &LegacyClaims {
+                sub: user_id,
+                iat: now.timestamp(),
+                exp: (now + Duration::hours(1)).timestamp(),
+                kind: kind.to_string(),
+                tier: "pro".to_string(),
+                trial_ends_at: None,
+                trial_used: false,
+                is_admin: false,
+                is_banned: false,
+            },
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -136,31 +163,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_token_without_email_verified_decodes_as_unverified() {
+    fn legacy_token_decodes_with_defaults_for_later_claims() {
         let _guard = crate::test_support::env_lock();
         std::env::set_var("JWT_SECRET", "test-secret");
-        let now = Utc::now();
         let user_id = Uuid::new_v4();
-        let token = encode(
-            &Header::default(),
-            &LegacyClaims {
-                sub: user_id,
-                iat: now.timestamp(),
-                exp: (now + Duration::hours(1)).timestamp(),
-                kind: "access".to_string(),
-                tier: "pro".to_string(),
-                trial_ends_at: None,
-                trial_used: false,
-                is_admin: false,
-                is_banned: false,
-            },
-            &EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap();
 
-        let claims = validate_token(&token, "access").unwrap();
+        let claims = validate_token(&legacy_token(user_id, "access", "test-secret"), "access").unwrap();
 
         assert!(!claims.email_verified);
+        assert_eq!(claims.ver, 0);
         assert_eq!(claims.sub, user_id);
+    }
+
+    #[test]
+    fn refresh_token_carries_the_token_version() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        let token = create_refresh_token(Uuid::new_v4(), 7).unwrap();
+
+        assert_eq!(validate_token(&token, "refresh").unwrap().ver, 7);
     }
 }
