@@ -1,16 +1,21 @@
-use axum::{extract::State, Extension, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use tracing::info;
+use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::passkeys::{self, PasskeyInfo};
 use crate::routes::auth::{fresh_session, require_auth_key, SessionTokens};
 use crate::sync_notifier::SyncNotifier;
-use crate::two_factor::{self, db_failure, Refusal, SecondFactorProof, SeedCipher};
+use crate::two_factor::{self, db_failure, Context, Refusal, SecondFactorProof, SeedCipher};
 
+/// The master password plus, once the account has a factor, proof of one.
 #[derive(Deserialize)]
-pub struct SetupRequest {
+pub struct StepUpRequest {
     pub auth_key: String,
+    #[serde(flatten)]
+    pub proof: SecondFactorProof,
 }
 
 #[derive(Serialize)]
@@ -19,15 +24,27 @@ pub struct SetupResponse {
     pub otpauth_uri: String,
 }
 
+async fn totp_enabled(pool: &PgPool, user_id: Uuid) -> Result<bool, Refusal> {
+    sqlx::query_scalar("SELECT totp_enabled_at IS NOT NULL FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(db_failure)
+}
+
 pub async fn setup(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Extension(cipher): Extension<SeedCipher>,
-    Json(body): Json<SetupRequest>,
+    Json(body): Json<StepUpRequest>,
 ) -> Result<Json<SetupResponse>, Refusal> {
     let seed = two_factor::generate_seed();
     let sealed = cipher.seal(&seed).ok_or(Refusal::Unavailable)?;
     require_auth_key(&pool, auth.0, &body.auth_key).await?;
+    if totp_enabled(&pool, auth.0).await? {
+        return Err(Refusal::AlreadyEnabled);
+    }
+    two_factor::verify_if_enabled(&pool, &cipher, auth.0, &body.proof).await?;
 
     let email: Option<String> = sqlx::query_scalar(
         "UPDATE users SET totp_secret = $1, totp_last_step = NULL
@@ -46,11 +63,31 @@ pub async fn setup(
     }))
 }
 
+/// Recovery codes are only issued with the account's first factor; later ones leave the list empty.
 #[derive(Serialize)]
-pub struct EnableResponse {
+pub struct FactorAdded {
     pub recovery_codes: Vec<String>,
     #[serde(flatten)]
     pub session: SessionTokens,
+}
+
+pub async fn conclude_addition(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    mut tx: Transaction<'_, Postgres>,
+    user_id: Uuid,
+    was_enabled: bool,
+) -> Result<FactorAdded, Refusal> {
+    let recovery_codes =
+        two_factor::first_factor_added(&mut tx, user_id, was_enabled).await.map_err(db_failure)?;
+    tx.commit().await.map_err(db_failure)?;
+
+    let session = fresh_session(pool, user_id).await?;
+    if !was_enabled {
+        notifier.notify(user_id, "token_invalidated".to_string());
+        info!(user_id = %user_id, "Two-factor authentication enabled");
+    }
+    Ok(FactorAdded { recovery_codes, session })
 }
 
 pub async fn enable(
@@ -59,16 +96,17 @@ pub async fn enable(
     Extension(cipher): Extension<SeedCipher>,
     Extension(notifier): Extension<SyncNotifier>,
     Json(proof): Json<SecondFactorProof>,
-) -> Result<Json<EnableResponse>, Refusal> {
-    if two_factor::is_enabled(&pool, auth.0).await? {
+) -> Result<Json<FactorAdded>, Refusal> {
+    if totp_enabled(&pool, auth.0).await? {
         return Err(Refusal::AlreadyEnabled);
     }
-    let code_only = SecondFactorProof { code: proof.code, recovery_code: None };
-    two_factor::verify(&pool, &cipher, auth.0, &code_only).await?;
+    let code_only = SecondFactorProof { code: proof.code, ..Default::default() };
+    two_factor::verify_in(&pool, &cipher, auth.0, &code_only, Context::Enrolment).await?;
 
     let mut tx = pool.begin().await.map_err(db_failure)?;
+    let was_enabled = two_factor::lock_enabled(&mut tx, auth.0).await.map_err(db_failure)?;
     let enabled = sqlx::query(
-        "UPDATE users SET totp_enabled_at = now(), token_version = token_version + 1
+        "UPDATE users SET totp_enabled_at = now()
          WHERE id = $1 AND totp_enabled_at IS NULL AND totp_secret IS NOT NULL",
     )
     .bind(auth.0)
@@ -78,21 +116,56 @@ pub async fn enable(
     if enabled.rows_affected() == 0 {
         return Err(Refusal::AlreadyEnabled);
     }
-    let recovery_codes = two_factor::replace_recovery_codes(&mut tx, auth.0).await.map_err(db_failure)?;
-    tx.commit().await.map_err(db_failure)?;
-
-    let session = fresh_session(&pool, auth.0).await?;
-    notifier.notify(auth.0, "token_invalidated".to_string());
-    info!(user_id = %auth.0, "Two-factor authentication enabled");
-
-    Ok(Json(EnableResponse { recovery_codes, session }))
+    conclude_addition(&pool, &notifier, tx, auth.0, was_enabled).await.map(Json)
 }
 
-#[derive(Deserialize)]
-pub struct DisableRequest {
-    pub auth_key: String,
+pub enum Factor {
+    All,
+    Totp,
+    Passkey(Uuid),
+}
+
+#[derive(Serialize)]
+pub struct Removal {
+    pub two_factor_enabled: bool,
     #[serde(flatten)]
-    pub proof: SecondFactorProof,
+    pub session: SessionTokens,
+}
+
+/// Removing the last factor turns two-factor off, which ends every other session.
+pub async fn remove(
+    pool: &PgPool,
+    cipher: &SeedCipher,
+    notifier: &SyncNotifier,
+    user_id: Uuid,
+    body: &StepUpRequest,
+    factor: Factor,
+) -> Result<Json<Removal>, Refusal> {
+    if !two_factor::is_enabled(pool, user_id).await? {
+        return Err(Refusal::NotEnabled);
+    }
+    require_auth_key(pool, user_id, &body.auth_key).await?;
+    two_factor::verify(pool, cipher, user_id, &body.proof).await?;
+
+    let mut tx = pool.begin().await.map_err(db_failure)?;
+    let removed = match factor {
+        Factor::All => two_factor::remove_all(&mut tx, user_id).await,
+        Factor::Totp => two_factor::remove_totp(&mut tx, user_id).await,
+        Factor::Passkey(id) => passkeys::remove(&mut tx, user_id, id).await,
+    }
+    .map_err(db_failure)?;
+    if !removed {
+        return Err(StatusCode::NOT_FOUND.into());
+    }
+    let two_factor_enabled = two_factor::settle_after_removal(&mut tx, user_id).await.map_err(db_failure)?;
+    tx.commit().await.map_err(db_failure)?;
+
+    let session = fresh_session(pool, user_id).await?;
+    if !two_factor_enabled {
+        notifier.notify(user_id, "token_invalidated".to_string());
+        info!(user_id = %user_id, "Two-factor authentication disabled");
+    }
+    Ok(Json(Removal { two_factor_enabled, session }))
 }
 
 pub async fn disable(
@@ -100,23 +173,43 @@ pub async fn disable(
     Extension(auth): Extension<AuthUser>,
     Extension(cipher): Extension<SeedCipher>,
     Extension(notifier): Extension<SyncNotifier>,
-    Json(body): Json<DisableRequest>,
-) -> Result<Json<SessionTokens>, Refusal> {
-    if !two_factor::is_enabled(&pool, auth.0).await? {
-        return Err(Refusal::NotEnabled);
-    }
-    require_auth_key(&pool, auth.0, &body.auth_key).await?;
-    two_factor::verify(&pool, &cipher, auth.0, &body.proof).await?;
+    Json(body): Json<StepUpRequest>,
+) -> Result<Json<Removal>, Refusal> {
+    remove(&pool, &cipher, &notifier, auth.0, &body, Factor::All).await
+}
 
-    let mut tx = pool.begin().await.map_err(db_failure)?;
-    two_factor::clear(&mut tx, auth.0).await.map_err(db_failure)?;
-    tx.commit().await.map_err(db_failure)?;
+pub async fn remove_totp(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(cipher): Extension<SeedCipher>,
+    Extension(notifier): Extension<SyncNotifier>,
+    Json(body): Json<StepUpRequest>,
+) -> Result<Json<Removal>, Refusal> {
+    remove(&pool, &cipher, &notifier, auth.0, &body, Factor::Totp).await
+}
 
-    let session = fresh_session(&pool, auth.0).await?;
-    notifier.notify(auth.0, "token_invalidated".to_string());
-    info!(user_id = %auth.0, "Two-factor authentication disabled");
+#[derive(Serialize)]
+pub struct Factors {
+    pub totp: bool,
+    pub passkeys: Vec<PasskeyInfo>,
+    pub recovery_codes_left: i64,
+}
 
-    Ok(Json(session))
+pub async fn factors(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+) -> Result<Json<Factors>, Refusal> {
+    let recovery_codes_left =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_recovery_codes WHERE user_id = $1 AND used_at IS NULL")
+            .bind(auth.0)
+            .fetch_one(&pool)
+            .await
+            .map_err(db_failure)?;
+    Ok(Json(Factors {
+        totp: totp_enabled(&pool, auth.0).await?,
+        passkeys: passkeys::list(&pool, auth.0).await.map_err(db_failure)?,
+        recovery_codes_left,
+    }))
 }
 
 #[derive(Serialize)]
@@ -144,44 +237,49 @@ pub async fn regenerate_recovery_codes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::auth::jwt::{create_refresh_token, validate_token};
     use crate::routes::auth::{
         login, login_second_factor, refresh, update_password, LoginOutcome, LoginRequest, RefreshRequest,
         SecondFactorChallenge, SecondFactorLoginRequest, UpdatePasswordRequest,
     };
+    use crate::passkeys::Passkeys;
     use crate::test_pool_or_skip;
     use crate::test_support::{env_lock, seed_user_with_credentials, EnvLockGuard};
     use axum::http::StatusCode;
     use uuid::Uuid;
 
-    const AUTH_KEY: &str = "auth-key-secret";
+    pub(crate) const AUTH_KEY: &str = "auth-key-secret";
 
-    struct Enrolled {
-        uid: Uuid,
-        account_id: Uuid,
-        seed: Vec<u8>,
-        recovery_codes: Vec<String>,
-        session: SessionTokens,
+    pub(crate) struct Enrolled {
+        pub uid: Uuid,
+        pub account_id: Uuid,
+        pub seed: Vec<u8>,
+        pub recovery_codes: Vec<String>,
+        pub session: SessionTokens,
     }
 
-    fn jwt_env() -> EnvLockGuard {
+    pub(crate) fn jwt_env() -> EnvLockGuard {
         let guard = env_lock();
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         EnvLockGuard(guard)
     }
 
-    fn code(value: &str) -> SecondFactorProof {
-        SecondFactorProof { code: Some(value.to_string()), recovery_code: None }
+    pub(crate) fn code(value: &str) -> SecondFactorProof {
+        SecondFactorProof { code: Some(value.to_string()), ..Default::default() }
     }
 
-    fn recovery(value: &str) -> SecondFactorProof {
-        SecondFactorProof { code: None, recovery_code: Some(value.to_string()) }
+    pub(crate) fn recovery(value: &str) -> SecondFactorProof {
+        SecondFactorProof { recovery_code: Some(value.to_string()), ..Default::default() }
+    }
+
+    pub(crate) fn step_up_request(auth_key: &str, proof: SecondFactorProof) -> StepUpRequest {
+        StepUpRequest { auth_key: auth_key.to_string(), proof }
     }
 
     /// A code the server has not seen yet: replay protection would refuse the one used a moment ago.
-    async fn unused_code(pool: &PgPool, user: &Enrolled) -> String {
+    pub(crate) async fn unused_code(pool: &PgPool, user: &Enrolled) -> String {
         sqlx::query("UPDATE users SET totp_last_step = NULL WHERE id = $1")
             .bind(user.uid)
             .execute(pool)
@@ -190,19 +288,28 @@ mod tests {
         two_factor::totp_at(&user.seed, two_factor::current_step())
     }
 
-    async fn begin_setup(pool: &PgPool, cipher: &SeedCipher, uid: Uuid) -> Result<Vec<u8>, Refusal> {
+    pub(crate) async fn begin_setup_with(
+        pool: &PgPool,
+        cipher: &SeedCipher,
+        uid: Uuid,
+        proof: SecondFactorProof,
+    ) -> Result<Vec<u8>, Refusal> {
         let Json(pending) = setup(
             State(pool.clone()),
             Extension(AuthUser(uid)),
             Extension(cipher.clone()),
-            Json(SetupRequest { auth_key: AUTH_KEY.to_string() }),
+            Json(step_up_request(AUTH_KEY, proof)),
         )
         .await?;
         assert!(pending.otpauth_uri.contains(&pending.secret));
         Ok(data_encoding::BASE32_NOPAD.decode(pending.secret.as_bytes()).unwrap())
     }
 
-    async fn confirm(pool: &PgPool, uid: Uuid, proof: SecondFactorProof) -> Result<EnableResponse, Refusal> {
+    async fn begin_setup(pool: &PgPool, cipher: &SeedCipher, uid: Uuid) -> Result<Vec<u8>, Refusal> {
+        begin_setup_with(pool, cipher, uid, SecondFactorProof::default()).await
+    }
+
+    pub(crate) async fn confirm(pool: &PgPool, uid: Uuid, proof: SecondFactorProof) -> Result<FactorAdded, Refusal> {
         enable(
             State(pool.clone()),
             Extension(AuthUser(uid)),
@@ -214,7 +321,7 @@ mod tests {
         .map(|Json(r)| r)
     }
 
-    async fn enrol(pool: &PgPool) -> Enrolled {
+    pub(crate) async fn enrol(pool: &PgPool) -> Enrolled {
         let account_id = Uuid::new_v4();
         let uid = seed_user_with_credentials(pool, account_id, AUTH_KEY).await;
         let seed = begin_setup(pool, &SeedCipher::for_tests(), uid).await.expect("setup ok");
@@ -224,10 +331,11 @@ mod tests {
         Enrolled { uid, account_id, seed, recovery_codes: enabled.recovery_codes, session: enabled.session }
     }
 
-    async fn challenge_with(pool: &PgPool, cipher: SeedCipher, account_id: Uuid) -> SecondFactorChallenge {
+    pub(crate) async fn challenge_with(pool: &PgPool, cipher: SeedCipher, account_id: Uuid) -> SecondFactorChallenge {
         let outcome = login(
             State(pool.clone()),
             Extension(cipher),
+            Extension(Passkeys::for_tests()),
             Json(LoginRequest { account_id, auth_key: AUTH_KEY.to_string() }),
         )
         .await
@@ -253,7 +361,7 @@ mod tests {
         .map(|Json(r)| r)
     }
 
-    async fn finish(
+    pub(crate) async fn finish(
         pool: &PgPool,
         pending_token: &str,
         proof: SecondFactorProof,
@@ -261,7 +369,7 @@ mod tests {
         finish_with(pool, SeedCipher::for_tests(), pending_token, proof).await
     }
 
-    async fn refreshes(pool: &PgPool, refresh_token: &str) -> bool {
+    pub(crate) async fn refreshes(pool: &PgPool, refresh_token: &str) -> bool {
         refresh(State(pool.clone()), Json(RefreshRequest { refresh_token: refresh_token.to_string() }))
             .await
             .is_ok()
@@ -397,7 +505,7 @@ mod tests {
                 Extension(AuthUser(user.uid)),
                 Extension(SeedCipher::for_tests()),
                 Extension(SyncNotifier::new()),
-                Json(DisableRequest { auth_key: auth_key.to_string(), proof }),
+                Json(step_up_request(auth_key, proof)),
             )
         };
 
@@ -408,14 +516,16 @@ mod tests {
         );
         assert_eq!(turn_off(AUTH_KEY, code("000000")).await.err(), Some(Refusal::Invalid));
 
-        let Json(session) = turn_off(AUTH_KEY, code(&good)).await.expect("disable ok");
+        let Json(off) = turn_off(AUTH_KEY, code(&good)).await.expect("disable ok");
+        assert!(!off.two_factor_enabled);
         assert!(!refreshes(&pool, &user.session.refresh_token).await);
-        assert!(refreshes(&pool, &session.refresh_token).await);
+        assert!(refreshes(&pool, &off.session.refresh_token).await);
         assert_eq!(turn_off(AUTH_KEY, code(&good)).await.err(), Some(Refusal::NotEnabled));
 
         let outcome = login(
             State(pool.clone()),
             Extension(SeedCipher::for_tests()),
+            Extension(Passkeys::for_tests()),
             Json(LoginRequest { account_id: user.account_id, auth_key: AUTH_KEY.to_string() }),
         )
         .await
@@ -551,6 +661,7 @@ mod tests {
         let outcome = login(
             State(pool.clone()),
             Extension(SeedCipher::for_tests()),
+            Extension(Passkeys::for_tests()),
             Json(LoginRequest { account_id: user.account_id, auth_key: AUTH_KEY.to_string() }),
         )
         .await

@@ -561,16 +561,17 @@ pub async fn get_user(
     State(pool): State<PgPool>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserDetail>, StatusCode> {
-    let user = sqlx::query_as::<_, UserDetail>(
+    let user = sqlx::query_as::<_, UserDetail>(&format!(
         r#"
         SELECT id, email, handle, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
                ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
                last_seen_on, deleted_at, deletion_reason, deleted_by,
-               totp_enabled_at IS NOT NULL AS two_factor_enabled
+               {} AS two_factor_enabled
         FROM users WHERE id = $1
         "#,
-    )
+        crate::two_factor::ENABLED_SQL
+    ))
     .bind(user_id)
     .fetch_optional(&pool)
     .await

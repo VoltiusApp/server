@@ -20,6 +20,7 @@ mod team_plan;
 mod vault_key_exposure;
 mod sync_notifier;
 mod terminal_manager;
+mod passkeys;
 mod two_factor;
 mod user_purge;
 #[cfg(test)]
@@ -273,7 +274,12 @@ async fn main() {
         "Configured features"
     );
     let seed_cipher = two_factor::SeedCipher::from_env();
-    tracing::info!(available = seed_cipher.available(), "Configured two-factor authentication");
+    let passkeys = passkeys::Passkeys::from_env();
+    tracing::info!(
+        totp = seed_cipher.available(),
+        passkeys = passkeys.available(),
+        "Configured two-factor authentication"
+    );
 
     // Register — stricter limit: 5/day per IP on top of the general auth 10/min
     let register_route = Router::new()
@@ -290,6 +296,7 @@ async fn main() {
         .route("/v1/auth/challenge", get(routes::auth::challenge))
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/login/2fa", post(routes::auth::login_second_factor))
+        .route("/v1/auth/login/2fa/passkey", post(routes::passkeys::sign_in))
         .route("/v1/auth/verify-email", post(routes::auth::verify_email))
         .route(
             "/v1/invitations/:token",
@@ -298,14 +305,20 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
         .layer(Extension(auth_limiter));
 
-    // A revoked session retries refresh every few seconds; it must not spend the sign-in budget.
+    // A revoked session retries refresh every few seconds, and a passkey ceremony runs in the
+    // browser beside the sign-in it completes; neither may spend the sign-in budget.
+    let beside_sign_in = || {
+        RateLimiter::<std::net::IpAddr>::new(auth_per_minute * 3, Duration::from_secs(60))
+    };
     let refresh_route = Router::new()
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
-        .layer(Extension(RateLimiter::<std::net::IpAddr>::new(
-            auth_per_minute * 3,
-            Duration::from_secs(60),
-        )));
+        .layer(Extension(beside_sign_in()));
+    let passkey_ceremony = Router::new()
+        .route("/v1/auth/passkey/begin", post(routes::passkeys::begin))
+        .route("/v1/auth/passkey/finish", post(routes::passkeys::finish))
+        .layer(middleware::from_fn(rate_limit::auth_rate_limit))
+        .layer(Extension(beside_sign_in()));
 
     let waitlist = Router::new()
         .route(
@@ -376,6 +389,12 @@ async fn main() {
         .route("/v1/auth/2fa/setup", post(routes::two_factor::setup))
         .route("/v1/auth/2fa/enable", post(routes::two_factor::enable))
         .route("/v1/auth/2fa/disable", post(routes::two_factor::disable))
+        .route("/v1/auth/2fa", get(routes::two_factor::factors))
+        .route("/v1/auth/2fa/totp/remove", post(routes::two_factor::remove_totp))
+        .route("/v1/auth/2fa/passkeys/step-up", post(routes::passkeys::step_up))
+        .route("/v1/auth/2fa/passkeys/register", post(routes::passkeys::register))
+        .route("/v1/auth/2fa/passkeys/activate", post(routes::passkeys::activate))
+        .route("/v1/auth/2fa/passkeys/:id/remove", post(routes::passkeys::remove_passkey))
         .route(
             "/v1/auth/2fa/recovery-codes",
             post(routes::two_factor::regenerate_recovery_codes),
@@ -785,6 +804,7 @@ async fn main() {
     let app = Router::new()
         .merge(public)
         .merge(refresh_route)
+        .merge(passkey_ceremony)
         .merge(waitlist)
         .merge(register_route)
         .merge(webhooks)
@@ -826,6 +846,7 @@ async fn main() {
         )
         .layer(middleware::from_fn(observability::track_requests))
         .layer(Extension(seed_cipher))
+        .layer(Extension(passkeys))
         .with_state(pool);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());

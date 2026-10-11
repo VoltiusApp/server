@@ -166,6 +166,7 @@ mod authz_tests {
             is_banned,
             email_verified: true,
             ver: 0,
+            jti: None,
         }
     }
 

@@ -21,6 +21,7 @@ pub mod team_object_prefs;
 pub mod team_rule_sets;
 pub mod teams;
 pub mod terminal;
+pub mod passkeys;
 pub mod two_factor;
 pub mod users;
 pub mod waitlist;

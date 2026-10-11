@@ -1927,6 +1927,7 @@ mod authz_tests {
             is_banned: false,
             email_verified: true,
             ver: 0,
+            jti: None,
         })
     }
 
