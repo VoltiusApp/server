@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{
-    jwt::{create_access_token, create_refresh_token, validate_token},
+    jwt::{create_access_token, create_pending_token, create_refresh_token, validate_token, PENDING_SECOND_FACTOR},
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
@@ -20,6 +20,7 @@ use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
 use crate::sync_notifier::SyncNotifier;
+use crate::two_factor::{self, Refusal, SecondFactorProof, SeedCipher};
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
 
@@ -67,6 +68,55 @@ async fn bump_token_version(pool: &PgPool, user_id: Uuid) -> Result<(), StatusCo
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(())
+}
+
+fn auth_response(
+    user_id: Uuid,
+    tier: TierInfo,
+    wrapped_user_secrets: Option<String>,
+) -> Result<AuthResponse, StatusCode> {
+    let (jwt_token, refresh_token) = issue_session(user_id, &tier)?;
+    Ok(AuthResponse {
+        user_id,
+        jwt_token,
+        refresh_token,
+        tier: tier.tier,
+        trial_ends_at: tier.trial_ends_at,
+        wrapped_user_secrets,
+    })
+}
+
+#[derive(Serialize)]
+pub struct SessionTokens {
+    pub jwt_token: String,
+    pub refresh_token: String,
+}
+
+/// A pair at the user's current token version, for the device that just moved it.
+pub(crate) async fn fresh_session(pool: &PgPool, user_id: Uuid) -> Result<SessionTokens, StatusCode> {
+    let tier = fetch_tier(pool, user_id).await?;
+    let (jwt_token, refresh_token) = issue_session(user_id, &tier)?;
+    Ok(SessionTokens { jwt_token, refresh_token })
+}
+
+pub(crate) async fn require_auth_key(pool: &PgPool, user_id: Uuid, auth_key: &str) -> Result<(), StatusCode> {
+    let auth_hash = sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, user_id = %user_id, "Failed to fetch auth_hash");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let valid = verify_auth_key(auth_key, &auth_hash).map_err(|e| {
+        error!(error = %e, user_id = %user_id, "Failed to verify auth key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if valid {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode> {
@@ -376,9 +426,9 @@ async fn register_with(
     }
 
     let trial_ends_ts = trial_ends_at.map(|t| t.timestamp());
-    let (jwt_token, refresh_token) = issue_session(
+    let session = auth_response(
         user_id,
-        &TierInfo {
+        TierInfo {
             tier: initial_tier.to_string(),
             trial_ends_at: trial_ends_ts,
             trial_used: false,
@@ -387,6 +437,7 @@ async fn register_with(
             email_verified,
             token_version: 0,
         },
+        body.wrapped_user_secrets,
     )?;
 
     // `account_id` is deliberately absent: despite the name it is the KDF salt
@@ -399,17 +450,7 @@ async fn register_with(
         info!(user_id = %user_id, "User registered with 14-day trial");
     }
 
-    Ok((
-        StatusCode::CREATED,
-        Json(AuthResponse {
-            user_id,
-            jwt_token,
-            refresh_token,
-            tier: initial_tier.to_string(),
-            trial_ends_at: trial_ends_ts,
-            wrapped_user_secrets: body.wrapped_user_secrets,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(session)))
 }
 
 // ─── Login ───────────────────────────────────────────────────────────────────
@@ -420,12 +461,37 @@ pub struct LoginRequest {
     pub auth_key: String,
 }
 
+#[derive(Serialize)]
+pub struct SecondFactorChallenge {
+    pub error: &'static str,
+    pub pending_token: String,
+    pub methods: Vec<&'static str>,
+}
+
+pub enum LoginOutcome {
+    Session(AuthResponse),
+    SecondFactorRequired(SecondFactorChallenge),
+}
+
+impl IntoResponse for LoginOutcome {
+    fn into_response(self) -> Response {
+        match self {
+            LoginOutcome::Session(session) => Json(session).into_response(),
+            // A status released clients report as a server error, never as a wrong password.
+            LoginOutcome::SecondFactorRequired(challenge) => {
+                (StatusCode::PRECONDITION_REQUIRED, Json(challenge)).into_response()
+            }
+        }
+    }
+}
+
 pub async fn login(
     State(pool): State<PgPool>,
+    axum::Extension(cipher): axum::Extension<SeedCipher>,
     Json(body): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    let user = sqlx::query_as::<_, (Uuid, String, bool, Option<String>)>(
-        "SELECT id, auth_hash, is_banned, wrapped_user_secrets FROM users WHERE account_id = $1",
+) -> Result<LoginOutcome, StatusCode> {
+    let user = sqlx::query_as::<_, (Uuid, String, bool, Option<String>, bool)>(
+        "SELECT id, auth_hash, is_banned, wrapped_user_secrets, totp_enabled_at IS NOT NULL FROM users WHERE account_id = $1",
     )
     .bind(body.account_id)
     .fetch_optional(&pool)
@@ -439,7 +505,7 @@ pub async fn login(
         StatusCode::UNAUTHORIZED
     })?;
 
-    let (user_id, auth_hash, is_banned, wrapped_user_secrets) = user;
+    let (user_id, auth_hash, is_banned, wrapped_user_secrets, two_factor_enabled) = user;
 
     if is_banned {
         warn!(user_id = %user_id, "Login attempt by banned user");
@@ -456,18 +522,63 @@ pub async fn login(
     }
 
     let tier = fetch_tier(&pool, user_id).await?;
-    let (jwt_token, refresh_token) = issue_session(user_id, &tier)?;
+
+    if two_factor_enabled {
+        let pending_token = create_pending_token(user_id, tier.token_version).map_err(|err| {
+            error!(error = %err, user_id = %user_id, "Failed to create pending token");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        info!(user_id = %user_id, "Login awaiting second factor");
+        return Ok(LoginOutcome::SecondFactorRequired(SecondFactorChallenge {
+            error: "TWO_FACTOR_REQUIRED",
+            pending_token,
+            methods: two_factor::methods(&cipher),
+        }));
+    }
 
     info!(user_id = %user_id, tier = %tier.tier, "User logged in");
 
-    Ok(Json(AuthResponse {
-        user_id,
-        jwt_token,
-        refresh_token,
-        tier: tier.tier,
-        trial_ends_at: tier.trial_ends_at,
-        wrapped_user_secrets,
-    }))
+    Ok(LoginOutcome::Session(auth_response(user_id, tier, wrapped_user_secrets)?))
+}
+
+#[derive(Deserialize)]
+pub struct SecondFactorLoginRequest {
+    pub pending_token: String,
+    #[serde(flatten)]
+    pub proof: SecondFactorProof,
+}
+
+pub async fn login_second_factor(
+    State(pool): State<PgPool>,
+    axum::Extension(cipher): axum::Extension<SeedCipher>,
+    Json(body): Json<SecondFactorLoginRequest>,
+) -> Result<Json<AuthResponse>, Refusal> {
+    let claims = validate_token(&body.pending_token, PENDING_SECOND_FACTOR).map_err(|_| {
+        warn!("Second factor login failed: invalid pending token");
+        StatusCode::UNAUTHORIZED
+    })?;
+    let user_id = claims.sub;
+
+    let (two_factor_enabled, wrapped_user_secrets): (bool, Option<String>) =
+        sqlx::query_as("SELECT totp_enabled_at IS NOT NULL, wrapped_user_secrets FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(two_factor::db_failure)?
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+    let tier = fetch_tier(&pool, user_id).await?;
+
+    if tier.is_banned {
+        return Err(StatusCode::FORBIDDEN.into());
+    }
+    if !two_factor_enabled || claims.ver != tier.token_version {
+        return Err(StatusCode::UNAUTHORIZED.into());
+    }
+    two_factor::verify(&pool, &cipher, user_id, &body.proof).await?;
+
+    info!(user_id = %user_id, tier = %tier.tier, "User logged in with second factor");
+
+    Ok(Json(auth_response(user_id, tier, wrapped_user_secrets)?))
 }
 
 // ─── Refresh ─────────────────────────────────────────────────────────────────
@@ -681,6 +792,7 @@ pub struct MeResponse {
     pub handle_is_custom: bool,
     pub allow_stranger_invites: bool,
     pub handle_managed: bool,
+    pub two_factor_enabled: bool,
 }
 
 pub(crate) async fn fetch_me_inner(
@@ -688,8 +800,8 @@ pub(crate) async fn fetch_me_inner(
     user_id: Uuid,
     handle_managed: bool,
 ) -> Result<MeResponse, StatusCode> {
-    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool, bool)>(
-        "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, String, Uuid, Option<String>, String, bool, bool, bool, bool)>(
+        "SELECT email, handle AS display_name, account_id, wrapped_user_secrets, handle, handle_is_custom, allow_stranger_invites, email_undeliverable_at IS NOT NULL, totp_enabled_at IS NOT NULL FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -714,6 +826,7 @@ pub(crate) async fn fetch_me_inner(
         handle_is_custom: row.5,
         allow_stranger_invites: row.6,
         handle_managed,
+        two_factor_enabled: row.8,
     })
 }
 
@@ -738,22 +851,7 @@ pub async fn update_email(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<UpdateEmailRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let auth_hash = sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = $1")
-        .bind(auth.0)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %auth.0, "Failed to fetch auth_hash in update_email");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let valid = verify_auth_key(&body.auth_key, &auth_hash).map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to verify auth key in update_email");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    if !valid {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    require_auth_key(&pool, auth.0, &body.auth_key).await?;
 
     let new_email = crate::email::normalize(&body.new_email);
 
@@ -800,30 +898,19 @@ pub struct UpdatePasswordRequest {
     pub old_auth_key: String,
     pub new_auth_key: String,
     pub new_wrapped_user_secrets: String,
+    #[serde(flatten)]
+    pub proof: SecondFactorProof,
 }
 
 pub async fn update_password(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::Extension(cipher): axum::Extension<SeedCipher>,
     Json(body): Json<UpdatePasswordRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    let auth_hash = sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = $1")
-        .bind(auth.0)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %auth.0, "Failed to fetch auth_hash in update_password");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let valid = verify_auth_key(&body.old_auth_key, &auth_hash).map_err(|e| {
-        error!(error = %e, user_id = %auth.0, "Failed to verify old auth key in update_password");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    if !valid {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+) -> Result<Json<AuthResponse>, Refusal> {
+    require_auth_key(&pool, auth.0, &body.old_auth_key).await?;
+    two_factor::verify_if_enabled(&pool, &cipher, auth.0, &body.proof).await?;
 
     let new_auth_hash = hash_auth_key(&body.new_auth_key).map_err(|e| {
         error!(error = %e, user_id = %auth.0, "Failed to hash new auth key");
@@ -844,28 +931,14 @@ pub async fn update_password(
     })?;
 
     let tier = fetch_tier(&pool, auth.0).await?;
-    let (jwt_token, refresh_token) = issue_session(auth.0, &tier)?;
     notifier.notify(auth.0, "token_invalidated".to_string());
 
     info!(user_id = %auth.0, "User password updated");
 
-    Ok(Json(AuthResponse {
-        user_id: auth.0,
-        jwt_token,
-        refresh_token,
-        tier: tier.tier,
-        trial_ends_at: tier.trial_ends_at,
-        wrapped_user_secrets: Some(body.new_wrapped_user_secrets),
-    }))
+    Ok(Json(auth_response(auth.0, tier, Some(body.new_wrapped_user_secrets))?))
 }
 
 // ─── Log out everywhere ───────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct SessionTokens {
-    pub jwt_token: String,
-    pub refresh_token: String,
-}
 
 pub async fn logout_all(
     State(pool): State<PgPool>,
@@ -873,13 +946,12 @@ pub async fn logout_all(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
 ) -> Result<Json<SessionTokens>, StatusCode> {
     bump_token_version(&pool, auth.0).await?;
-    let tier = fetch_tier(&pool, auth.0).await?;
-    let (jwt_token, refresh_token) = issue_session(auth.0, &tier)?;
+    let session = fresh_session(&pool, auth.0).await?;
     notifier.notify(auth.0, "token_invalidated".to_string());
 
     info!(user_id = %auth.0, "User signed out every other session");
 
-    Ok(Json(SessionTokens { jwt_token, refresh_token }))
+    Ok(Json(session))
 }
 
 // ─── Upload wrapped user secrets (migration) ──────────────────────────────────
@@ -1226,16 +1298,24 @@ mod handler_tests {
 
     // ── login: effective tier in the issued session ───────────────────────────
 
-    async fn login_of(pool: &PgPool, account_id: Uuid) -> Result<AuthResponse, StatusCode> {
-        login(
+    async fn login_with(pool: &PgPool, account_id: Uuid, auth_key: &str) -> Result<AuthResponse, StatusCode> {
+        let outcome = login(
             State(pool.clone()),
+            Extension(SeedCipher::for_tests()),
             Json(LoginRequest {
                 account_id,
-                auth_key: "auth-key-secret".to_string(),
+                auth_key: auth_key.to_string(),
             }),
         )
-        .await
-        .map(|Json(r)| r)
+        .await?;
+        match outcome {
+            LoginOutcome::Session(session) => Ok(session),
+            LoginOutcome::SecondFactorRequired(_) => panic!("account has no second factor"),
+        }
+    }
+
+    async fn login_of(pool: &PgPool, account_id: Uuid) -> Result<AuthResponse, StatusCode> {
+        login_with(pool, account_id, "auth-key-secret").await
     }
 
     #[tokio::test]
@@ -1366,14 +1446,7 @@ mod handler_tests {
         let account_id = Uuid::new_v4();
         seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
 
-        let res = login(
-            State(pool.clone()),
-            Json(LoginRequest {
-                account_id,
-                auth_key: "wrong-key".to_string(),
-            }),
-        )
-        .await;
+        let res = login_with(&pool, account_id, "wrong-key").await;
 
         match res {
             Err(s) => assert_eq!(s, StatusCode::UNAUTHORIZED),
@@ -1503,10 +1576,12 @@ mod handler_tests {
             State(pool.clone()),
             Extension(AuthUser(uid)),
             Extension(SyncNotifier::new()),
+            Extension(SeedCipher::for_tests()),
             Json(UpdatePasswordRequest {
                 old_auth_key: "auth-key-secret".to_string(),
                 new_auth_key: "new-auth-key".to_string(),
                 new_wrapped_user_secrets: "wrapped".to_string(),
+                proof: SecondFactorProof::default(),
             }),
         )
         .await

@@ -21,7 +21,10 @@ The server image itself comes from GHCR, so nothing is compiled on the host.
 
 `.env.dockhand`, `.env.db`, `cloudflared/.env`, `cloudflared-api/.env`, `voltius-tofu/.env.tofu` and
 `voltius-tofu/oci_api_key.pem` exist nowhere else. No database backup contains
-them, and losing `JWT_SECRET` alone signs every user out permanently. `scripts/secrets-bundle.sh`
+them, and losing `JWT_SECRET` alone signs every user out permanently. Losing `TOTP_ENC_KEY` locks
+every account with two-factor sign-in out of its authenticator codes: the server refuses them
+rather than skip the step, and each one then needs a recovery code or an admin clear.
+`scripts/secrets-bundle.sh`
 tars them, encrypts them to an age recipient, and uploads them to
 `s3://<bucket>/voltius-prod/secrets/`, keeping `secrets-latest.tar.age` as the pointer.
 

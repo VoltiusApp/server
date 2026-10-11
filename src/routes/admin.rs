@@ -554,6 +554,7 @@ pub struct UserDetail {
     deleted_at: Option<DateTime<Utc>>,
     deletion_reason: Option<String>,
     deleted_by: Option<String>,
+    two_factor_enabled: bool,
 }
 
 pub async fn get_user(
@@ -565,7 +566,8 @@ pub async fn get_user(
         SELECT id, email, handle, account_id, subscription_tier, trial_ends_at, trial_used,
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
                ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
-               last_seen_on, deleted_at, deletion_reason, deleted_by
+               last_seen_on, deleted_at, deletion_reason, deleted_by,
+               totp_enabled_at IS NOT NULL AS two_factor_enabled
         FROM users WHERE id = $1
         "#,
     )
@@ -766,6 +768,34 @@ pub async fn unban_user(
 
     notifier.notify(user_id, "token_invalidated".to_string());
     info!(admin = %admin_email, user = %user_id, "User unbanned");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Two-factor reset ─────────────────────────────────────────────────────────
+
+/// The only way back in for someone who lost both the authenticator and the recovery codes.
+pub async fn clear_two_factor(
+    State(pool): State<PgPool>,
+    Extension(AdminEmail(admin_email)): Extension<AdminEmail>,
+    Extension(notifier): Extension<SyncNotifier>,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let failed = |e: sqlx::Error| {
+        error!(error = %e, "Failed to clear two-factor authentication");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let mut tx = pool.begin().await.map_err(failed)?;
+    let cleared = crate::two_factor::clear(&mut tx, user_id).await.map_err(failed)?;
+    tx.commit().await.map_err(failed)?;
+
+    if !cleared {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    write_audit(&pool, &admin_email, Some(user_id), "clear_two_factor", json!({})).await;
+
+    notifier.notify(user_id, "token_invalidated".to_string());
+    info!(admin = %admin_email, user = %user_id, "Two-factor authentication cleared");
     Ok(StatusCode::NO_CONTENT)
 }
 
