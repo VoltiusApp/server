@@ -165,6 +165,7 @@ mod authz_tests {
             is_admin: false,
             is_banned,
             email_verified: true,
+            ver: 0,
         }
     }
 

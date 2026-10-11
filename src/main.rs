@@ -286,7 +286,6 @@ async fn main() {
     let public = Router::new()
         .route("/v1/auth/challenge", get(routes::auth::challenge))
         .route("/v1/auth/login", post(routes::auth::login))
-        .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/verify-email", post(routes::auth::verify_email))
         .route(
             "/v1/invitations/:token",
@@ -294,6 +293,15 @@ async fn main() {
         )
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
         .layer(Extension(auth_limiter));
+
+    // A revoked session retries refresh every few seconds; it must not spend the sign-in budget.
+    let refresh_route = Router::new()
+        .route("/v1/auth/refresh", post(routes::auth::refresh))
+        .layer(middleware::from_fn(rate_limit::auth_rate_limit))
+        .layer(Extension(RateLimiter::<std::net::IpAddr>::new(
+            auth_per_minute * 3,
+            Duration::from_secs(60),
+        )));
 
     let waitlist = Router::new()
         .route(
@@ -360,6 +368,7 @@ async fn main() {
         .route("/v1/auth/me", get(routes::auth::get_me))
         .route("/v1/auth/email", put(routes::auth::update_email))
         .route("/v1/auth/password", put(routes::auth::update_password))
+        .route("/v1/auth/logout-all", post(routes::auth::logout_all))
         .route(
             "/v1/auth/wrapped-user-secrets",
             put(routes::auth::upload_wrapped_user_secrets),
@@ -760,6 +769,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(public)
+        .merge(refresh_route)
         .merge(waitlist)
         .merge(register_route)
         .merge(webhooks)
