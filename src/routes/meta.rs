@@ -23,6 +23,8 @@ pub struct MetaResponse {
     pub two_factor: bool,
     /// Whether a passkey can be a second factor here: needs a relying party and the portal.
     pub passkeys: bool,
+    /// `PUT /v1/auth/wrapped-user-secrets` honours `expected_wrapped_user_secrets`; absent on servers that predate it.
+    pub wrapped_secrets_cas: bool,
 }
 
 pub async fn get_meta(
@@ -41,6 +43,7 @@ pub async fn get_meta(
         team_secret_types: team_objects::secret_types(),
         two_factor: cipher.available(),
         passkeys: passkeys.available(),
+        wrapped_secrets_cas: true,
     })
 }
 
@@ -85,5 +88,11 @@ mod tests {
         let Json(meta) =
             get_meta(Extension(Features::open()), Extension(SeedCipher::absent()), Extension(Passkeys::for_tests())).await;
         assert_eq!(serde_json::to_value(&meta).unwrap()["passkeys"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn meta_advertises_wrapped_secrets_cas() {
+        let Json(meta) = get_meta(Extension(Features::open()), Extension(SeedCipher::for_tests()), Extension(Passkeys::for_tests())).await;
+        assert_eq!(serde_json::to_value(&meta).unwrap()["wrapped_secrets_cas"], serde_json::json!(true));
     }
 }

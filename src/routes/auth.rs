@@ -974,11 +974,13 @@ pub async fn logout_all(
     Ok(Json(session))
 }
 
-// ─── Upload wrapped user secrets (migration) ──────────────────────────────────
+// ─── Upload wrapped user secrets ──────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct UploadWrappedSecretsRequest {
     pub wrapped_user_secrets: String,
+    #[serde(default)]
+    pub expected_wrapped_user_secrets: Option<String>,
 }
 
 pub async fn upload_wrapped_user_secrets(
@@ -986,19 +988,28 @@ pub async fn upload_wrapped_user_secrets(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<UploadWrappedSecretsRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    sqlx::query(
-        "UPDATE users SET wrapped_user_secrets = $1, updated_at = now() WHERE id = $2",
+    // No expectation means NULL: the legacy migration, the only caller that sends none, runs only then.
+    let updated = sqlx::query(
+        "UPDATE users SET wrapped_user_secrets = $1, updated_at = now()
+         WHERE id = $2 AND wrapped_user_secrets IS NOT DISTINCT FROM $3",
     )
     .bind(&body.wrapped_user_secrets)
     .bind(auth.0)
+    .bind(&body.expected_wrapped_user_secrets)
     .execute(&pool)
     .await
     .map_err(|e| {
         error!(error = %e, user_id = %auth.0, "Failed to upload wrapped_user_secrets");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })?
+    .rows_affected();
 
-    info!(user_id = %auth.0, "Uploaded wrapped_user_secrets (migration)");
+    if updated == 0 {
+        warn!(user_id = %auth.0, "Refused a wrapped_user_secrets upload that expected another value");
+        return Err(StatusCode::CONFLICT);
+    }
+
+    info!(user_id = %auth.0, "Uploaded wrapped_user_secrets");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1841,5 +1852,52 @@ mod handler_tests {
         let (generated, _) = handle_row(&pool, off_id).await;
         verify(&pool, false, off_token).await;
         assert_eq!(handle_row(&pool, off_id).await, (generated, false));
+    }
+
+    async fn stored_wrapped(pool: &PgPool, id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT wrapped_user_secrets FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn upload_wrapped(pool: &PgPool, id: Uuid, next: &str, expected: Option<&str>) -> Result<StatusCode, StatusCode> {
+        upload_wrapped_user_secrets(
+            State(pool.clone()),
+            Extension(AuthUser(id)),
+            Json(UploadWrappedSecretsRequest {
+                wrapped_user_secrets: next.to_string(),
+                expected_wrapped_user_secrets: expected.map(str::to_string),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn wrapped_secrets_first_upload_needs_no_expectation() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        assert_eq!(upload_wrapped(&pool, id, "W1", None).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(stored_wrapped(&pool, id).await.as_deref(), Some("W1"));
+    }
+
+    #[tokio::test]
+    async fn wrapped_secrets_replace_only_the_value_they_expect() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        upload_wrapped(&pool, id, "W1", None).await.unwrap();
+        assert_eq!(upload_wrapped(&pool, id, "W2", Some("W1")).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(upload_wrapped(&pool, id, "W3", Some("W1")).await, Err(StatusCode::CONFLICT));
+        assert_eq!(stored_wrapped(&pool, id).await.as_deref(), Some("W2"));
+    }
+
+    #[tokio::test]
+    async fn wrapped_secrets_are_never_overwritten_without_an_expectation() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        upload_wrapped(&pool, id, "W1", None).await.unwrap();
+        assert_eq!(upload_wrapped(&pool, id, "W2", None).await, Err(StatusCode::CONFLICT));
+        assert_eq!(stored_wrapped(&pool, id).await.as_deref(), Some("W1"));
     }
 }
