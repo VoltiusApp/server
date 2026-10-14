@@ -213,3 +213,27 @@ pub async fn send_verification_email(
 
     send_via_resend(to, "Verify your Voltius email", html, text).await
 }
+
+pub async fn send_password_changed_email(
+    to: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let account_url = format!("{}/account", app_url().trim_end_matches('/'));
+    let when = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+    let html = branded_email_html(
+        "The master password of your Voltius account was just changed.",
+        "Security notice",
+        "Your master password was changed",
+        &format!(
+            r#"<p style="margin:0 0 14px;">The master password of your Voltius account was changed on {when}.</p>
+                    <p style="margin:0;">If you did this, there is nothing else to do. If you did not, someone with access to one of your signed-in devices changed it: write to <a href="mailto:contact@voltius.app" style="color:#22d3ee;text-decoration:none;">contact@voltius.app</a> right away.</p>"#
+        ),
+        "Open your account",
+        &account_url,
+        "Every other device signed in to this account has been signed out and needs the new password.",
+    );
+    let text = format!(
+        "The master password of your Voltius account was changed on {when}.\n\nIf you did this, there is nothing else to do. If you did not, write to contact@voltius.app right away.\n\nEvery other device signed in to this account has been signed out and needs the new password."
+    );
+
+    send_via_resend(to, "Your Voltius master password was changed", html, text).await
+}

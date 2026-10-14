@@ -15,7 +15,7 @@ use crate::auth::{
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
-use crate::email::send_verification_email;
+use crate::email::{send_password_changed_email, send_verification_email};
 use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
@@ -937,13 +937,13 @@ pub async fn update_password(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    sqlx::query(
-        "UPDATE users SET auth_hash = $1, wrapped_user_secrets = $2, token_version = token_version + 1, updated_at = now() WHERE id = $3",
+    let (email, undeliverable) = sqlx::query_as::<_, (String, bool)>(
+        "UPDATE users SET auth_hash = $1, wrapped_user_secrets = $2, token_version = token_version + 1, updated_at = now() WHERE id = $3 RETURNING email, email_undeliverable_at IS NOT NULL",
     )
     .bind(&new_auth_hash)
     .bind(&body.new_wrapped_user_secrets)
     .bind(auth.0)
-    .execute(&pool)
+    .fetch_one(&pool)
     .await
     .map_err(|e| {
         error!(error = %e, user_id = %auth.0, "Failed to update password");
@@ -952,6 +952,14 @@ pub async fn update_password(
 
     let tier = fetch_tier(&pool, auth.0).await?;
     notifier.notify(auth.0, "token_invalidated".to_string());
+    if !undeliverable {
+        let user_id = auth.0;
+        tokio::spawn(async move {
+            if let Err(e) = send_password_changed_email(&email).await {
+                error!(error = %e, user_id = %user_id, "Failed to send password change notice");
+            }
+        });
+    }
 
     info!(user_id = %auth.0, "User password updated");
 
