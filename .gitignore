@@ -1,6 +1,8 @@
 target/
 .worktrees/
 .env
+# production env on the host, and its dated backups (docs/runbooks/deploy-server.md)
+.env.prod*
 graphify-out/
 .cargo-home/
 

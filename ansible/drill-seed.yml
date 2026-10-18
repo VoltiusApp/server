@@ -118,7 +118,7 @@
 
     - name: Start the server
       ansible.builtin.command:
-        cmd: docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml up -d server
+        cmd: docker compose -p voltius --env-file .env.prod -f compose.prod.yml up -d server
         chdir: "{{ voltius_root }}/voltius-server"
       changed_when: true
 

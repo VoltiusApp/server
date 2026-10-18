@@ -6,12 +6,9 @@ BUNDLE_PREFIX="${BUNDLE_PREFIX:-voltius-prod/secrets}"
 AGE_RECIPIENTS="${AGE_RECIPIENTS:-}"
 AGE_IDENTITY="${AGE_IDENTITY:-}"
 ROOT="${ROOT:-/home/ubuntu/fourretout}"
-# On the current production host .env.dockhand lives inside the dockhand volume,
-# not under $ROOT, and is root-owned. Point this at it there.
-DOCKHAND_ENV_FILE="${DOCKHAND_ENV_FILE:-}"
 
 FILES=(
-  "voltius-server/.env.dockhand"
+  "voltius-server/.env.prod"
   "voltius-db/.env.db"
   "cloudflared/.env"
   "cloudflared-api/.env"
@@ -46,13 +43,8 @@ rclone_run() {
   rm -f "$envfile"
 }
 
-# Where a bundle entry is read from, which is $ROOT/<entry> unless overridden.
-source_for() {
-  case "$1" in
-    voltius-server/.env.dockhand) printf '%s\n' "${DOCKHAND_ENV_FILE:-$ROOT/$1}" ;;
-    *) printf '%s\n' "$ROOT/$1" ;;
-  esac
-}
+# Bundles packed before 2026-10-18 carry the server env under its old name.
+LEGACY_SERVER_ENV="voltius-server/.env.dockhand"
 
 pack() {
   need age
@@ -60,7 +52,7 @@ pack() {
   mkwork
   local staged=0
   for f in "${FILES[@]}"; do
-    local src; src=$(source_for "$f")
+    local src="$ROOT/$f"
     if [ -r "$src" ]; then
       install -D -m 600 "$src" "$WORK/bundle/$f"
       staged=$((staged + 1))
@@ -91,6 +83,10 @@ unpack() {
     [ -e "$ROOT/$f" ] && die "$ROOT/$f already exists; move it aside first"
   done
   mkdir -p "$WORK/out" && tar -C "$WORK/out" -xf "$WORK/secrets.tar"
+  if [ ! -f "$WORK/out/voltius-server/.env.prod" ] && [ -f "$WORK/out/$LEGACY_SERVER_ENV" ]; then
+    mv "$WORK/out/$LEGACY_SERVER_ENV" "$WORK/out/voltius-server/.env.prod"
+    echo "bundle predates the rename: restoring $LEGACY_SERVER_ENV as voltius-server/.env.prod"
+  fi
   for f in "${FILES[@]}"; do
     [ -f "$WORK/out/$f" ] || { echo "not in bundle: $f" >&2; continue; }
     install -D -m 600 "$WORK/out/$f" "$ROOT/$f"

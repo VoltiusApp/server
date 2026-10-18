@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="${ROOT:-/home/ubuntu/fourretout}"
 REPO="${REPO:-https://github.com/VoltiusApp/server}"
 REF="${REF:-main}"
-# TRUSTED_PROXIES in .env.dockhand names this subnet, so it is fixed, not Docker's default pick.
+# TRUSTED_PROXIES in .env.prod names this subnet, so it is fixed, not Docker's default pick.
 CLOUDFLARE_SUBNET="${CLOUDFLARE_SUBNET:-172.22.0.0/16}"
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
@@ -127,11 +127,11 @@ UNIT
 
 check_secrets() {
   local missing=0
-  for f in voltius-server/.env.dockhand voltius-db/.env.db cloudflared/.env; do
+  for f in voltius-server/.env.prod voltius-db/.env.db cloudflared/.env; do
     [ -r "$ROOT/$f" ] || { echo "[bootstrap] missing $ROOT/$f" >&2; missing=1; }
   done
   [ "$missing" -eq 0 ] || die "restore the env files first: AGE_IDENTITY=<key> scripts/secrets-bundle.sh unpack"
-  grep -q '^SERVER_TAG=' "$ROOT/voltius-server/.env.dockhand" || die "SERVER_TAG is unset in .env.dockhand"
+  grep -q '^SERVER_TAG=' "$ROOT/voltius-server/.env.prod" || die "SERVER_TAG is unset in .env.prod"
 }
 
 start_db() {
@@ -144,8 +144,8 @@ start_db() {
 }
 
 start_server() {
-  (cd "$ROOT/voltius-server" && docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml pull -q server \
-    && docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml up -d server)
+  (cd "$ROOT/voltius-server" && docker compose -p voltius --env-file .env.prod -f compose.prod.yml pull -q server \
+    && docker compose -p voltius --env-file .env.prod -f compose.prod.yml up -d server)
 }
 
 start_tunnel() {

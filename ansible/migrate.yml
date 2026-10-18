@@ -137,7 +137,7 @@
         path: "{{ voltius_root }}/{{ item }}"
       register: voltius_secret_state
       loop:
-        - voltius-server/.env.dockhand
+        - voltius-server/.env.prod
         - voltius-db/.env.db
 
     - name: Note that the secrets are already in place
@@ -177,14 +177,14 @@
         path: "{{ voltius_root }}/{{ item }}"
       register: voltius_restored
       loop:
-        - voltius-server/.env.dockhand
+        - voltius-server/.env.prod
         - voltius-db/.env.db
       failed_when: not voltius_restored.stat.exists
 
     - name: Read the target's server tag
       ansible.builtin.slurp:
-        src: "{{ voltius_root }}/voltius-server/.env.dockhand"
-      register: voltius_tgt_dockhand_env
+        src: "{{ voltius_root }}/voltius-server/.env.prod"
+      register: voltius_tgt_prod_env
       no_log: true
 
     # The bundle is packed by hand and can predate the last deploy. An older binary
@@ -195,11 +195,11 @@
         fail_msg: >-
           the secrets bundle has SERVER_TAG={{ voltius_tgt_server_tag }} but {{ voltius_source }} runs
           {{ voltius_src_server_tag }}. Re-pack the bundle (docs/runbooks/deploy-server.md), delete
-          voltius-server/.env.dockhand and voltius-db/.env.db on {{ inventory_hostname }}, and run again.
+          voltius-server/.env.prod and voltius-db/.env.db on {{ inventory_hostname }}, and run again.
       vars:
         voltius_src_server_tag: "{{ hostvars[voltius_source].voltius_src_image.stdout | trim | split(':') | last }}"
         voltius_tgt_server_tag: >-
-          {{ voltius_tgt_dockhand_env.content | b64decode
+          {{ voltius_tgt_prod_env.content | b64decode
              | regex_findall('(?m)^SERVER_TAG=(.*)$') | last | default('unset') | trim }}
 
     - name: Read the target's copy of .env.db
@@ -338,13 +338,13 @@
   tasks:
     - name: Pull the pinned image
       ansible.builtin.command:
-        cmd: docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml pull -q server
+        cmd: docker compose -p voltius --env-file .env.prod -f compose.prod.yml pull -q server
         chdir: "{{ voltius_root }}/voltius-server"
       changed_when: true
 
     - name: Start it
       ansible.builtin.command:
-        cmd: docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml up -d server
+        cmd: docker compose -p voltius --env-file .env.prod -f compose.prod.yml up -d server
         chdir: "{{ voltius_root }}/voltius-server"
       changed_when: true
 
