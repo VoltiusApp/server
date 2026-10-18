@@ -15,6 +15,7 @@ mod routes;
 mod self_host;
 mod single_instance;
 mod session_grants;
+mod team_authority;
 mod team_join_grants;
 mod team_plan;
 mod vault_key_exposure;
@@ -443,6 +444,7 @@ async fn main() {
                 .layer(middleware::from_fn(features::require_team_invites)),
         )
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
+        .route("/v1/teams/:team_id/billing-owner", put(routes::team_ownership::transfer_billing_owner))
         .route(
             "/v1/teams/:team_id/lock-policy",
             put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),

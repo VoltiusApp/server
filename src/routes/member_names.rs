@@ -212,7 +212,7 @@ mod db_tests {
     use super::*;
     use crate::permissions::{PERM_INVITE_MEMBERS, PERM_MANAGE_MEMBERS};
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, member_with_role, seed_team, seed_user};
+    use crate::test_support::{add_member, inviter_with, member_with_role, seed_team, seed_user};
 
     async fn wait_for_audit_rows(pool: &PgPool, team: Uuid, action: &str, expected: i64) {
         for _ in 0..100 {
@@ -284,7 +284,7 @@ mod db_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
         let plain = member_with_role(&pool, team, 0).await;
         let target = seed_user(&pool).await;
         add_member(&pool, team, target).await;
@@ -368,7 +368,7 @@ mod db_tests {
     async fn invite_with_name_needs_manage_members() {
         let pool = test_pool_or_skip!();
         let (_, team) = team_for_invites(&pool).await;
-        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
         let email = format!("{}@corp.test", Uuid::new_v4());
 
         assert_eq!(invite_email(&pool, inviter, team, &email, Some("Jan")).await, Err(StatusCode::FORBIDDEN));
@@ -380,7 +380,7 @@ mod db_tests {
     async fn invite_stores_name_and_reinvite_without_name_keeps_it() {
         let pool = test_pool_or_skip!();
         let (_, team) = team_for_invites(&pool).await;
-        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let admin = inviter_with(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
         let email = format!("{}@corp.test", Uuid::new_v4());
 
         invite_email(&pool, admin, team, &email, Some("Jan Novák")).await.unwrap();
@@ -395,7 +395,7 @@ mod db_tests {
     async fn add_member_by_id_carries_the_name_into_membership() {
         let pool = test_pool_or_skip!();
         let (_, team) = team_for_invites(&pool).await;
-        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let admin = inviter_with(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
         let invitee = seed_user(&pool).await;
 
         let _ = add_member_route(
@@ -532,7 +532,7 @@ mod db_tests {
     async fn reinvite_without_a_name_does_not_revive_the_first_invites_name() {
         let pool = test_pool_or_skip!();
         let (_, team) = team_for_invites(&pool).await;
-        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let admin = inviter_with(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
         let user = seed_user(&pool).await;
         let email = crate::test_support::test_user_email(user);
 
@@ -584,7 +584,7 @@ mod db_tests {
     async fn invite_audit_carries_the_name_on_every_path() {
         let pool = test_pool_or_skip!();
         let (_, team) = team_for_invites(&pool).await;
-        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let admin = inviter_with(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
         let existing = seed_user(&pool).await;
         invite_email(&pool, admin, team, &format!("{}@corp.test", Uuid::new_v4()), Some("ByEmail")).await.unwrap();
         invite_email(&pool, admin, team, &crate::test_support::test_user_email(existing), Some("ByKnownEmail")).await.unwrap();
@@ -615,7 +615,7 @@ mod db_tests {
     async fn pending_list_returns_the_member_name() {
         let pool = test_pool_or_skip!();
         let (_, team) = team_for_invites(&pool).await;
-        let admin = member_with_role(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
+        let admin = inviter_with(&pool, team, PERM_MANAGE_MEMBERS | PERM_INVITE_MEMBERS).await;
         invite_email(&pool, admin, team, &format!("{}@corp.test", Uuid::new_v4()), Some("Pat")).await.unwrap();
         let Json(rows) = crate::routes::teams::list_pending_invitations(State(pool.clone()), Extension(AuthUser(admin)), Path(team))
             .await

@@ -106,6 +106,7 @@ pub async fn create_grant(
         warn!(team_id = %team_id, user_id = %auth.0, role = %role, "Rejected non-grantable role");
         return Err(StatusCode::BAD_REQUEST);
     }
+    crate::team_authority::require_may_confer_builtin(&pool, team_id, auth.0, &role).await?;
 
     let max_uses = grants::clamp_max_uses(body.max_uses);
     let ttl = grants::clamp_ttl(body.expires_in_secs);
@@ -390,7 +391,7 @@ mod tests {
     use crate::sync_notifier::SyncEvent;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        member_with_role, seed_team_with_roles, seed_user, set_user_seats,
+        add_member, grant_builtin_role, member_with_role, seed_team_with_roles, seed_user, set_user_seats,
     };
     use crate::permissions::PERM_CONNECT;
     use std::time::Duration;
@@ -408,7 +409,9 @@ mod tests {
     async fn seed_team_with_manager(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
         let owner = seed_user(pool).await;
         let team = seed_team_with_roles(pool, owner).await;
-        let manager = member_with_role(pool, team, PERM_INVITE_MEMBERS).await;
+        let manager = seed_user(pool).await;
+        add_member(pool, team, manager).await;
+        grant_builtin_role(pool, team, manager, "manager").await;
         (team, owner, manager)
     }
 

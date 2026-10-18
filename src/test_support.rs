@@ -307,6 +307,13 @@ pub async fn member_with_role(pool: &PgPool, team: Uuid, perms: i64) -> Uuid {
 
 /// Set a user's `subscription_tier` (e.g. "business"). Used by tier-gated
 /// handler tests; the seed default is 'free'.
+/// A member holding the builtin `member` role's bits plus `extra`, so they may admit someone as `member`.
+pub async fn inviter_with(pool: &PgPool, team: Uuid, extra: i64) -> Uuid {
+    seed_builtin_roles(pool, team).await;
+    let (_, member, _) = crate::permissions::BUILTIN_ROLES.iter().find(|(name, _, _)| *name == "member").expect("member role");
+    member_with_role(pool, team, member | extra).await
+}
+
 pub async fn set_user_tier(pool: &PgPool, user: Uuid, tier: &str) {
     sqlx::query("UPDATE users SET subscription_tier = $1 WHERE id = $2")
         .bind(tier)

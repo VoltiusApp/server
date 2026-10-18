@@ -25,6 +25,8 @@ pub struct MetaResponse {
     pub passkeys: bool,
     /// `PUT /v1/auth/wrapped-user-secrets` honours `expected_wrapped_user_secrets`; absent on servers that predate it.
     pub wrapped_secrets_cas: bool,
+    /// Only Owners confer the Owner role, and `PUT /v1/teams/:id/billing-owner` exists.
+    pub multi_owner: bool,
 }
 
 pub async fn get_meta(
@@ -44,6 +46,7 @@ pub async fn get_meta(
         two_factor: cipher.available(),
         passkeys: passkeys.available(),
         wrapped_secrets_cas: true,
+        multi_owner: true,
     })
 }
 
@@ -94,5 +97,11 @@ mod tests {
     async fn meta_advertises_wrapped_secrets_cas() {
         let Json(meta) = get_meta(Extension(Features::open()), Extension(SeedCipher::for_tests()), Extension(Passkeys::for_tests())).await;
         assert_eq!(serde_json::to_value(&meta).unwrap()["wrapped_secrets_cas"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn meta_advertises_multi_owner() {
+        let Json(meta) = get_meta(Extension(Features::open()), Extension(SeedCipher::for_tests()), Extension(Passkeys::for_tests())).await;
+        assert_eq!(serde_json::to_value(&meta).unwrap()["multi_owner"], serde_json::json!(true));
     }
 }
