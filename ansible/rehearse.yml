@@ -160,7 +160,7 @@
         path: "{{ voltius_root }}/{{ item }}"
         state: absent
       loop:
-        - voltius-server/.env.dockhand
+        - voltius-server/.env.prod
         - voltius-db/.env.db
         - cloudflared/.env
         - cloudflared-api/.env

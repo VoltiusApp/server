@@ -10,14 +10,13 @@ Merging or pushing a commit does not change production. Only a pull + recreate d
 
 | Thing | Location |
 |---|---|
-| Deployment tree | `/var/lib/docker/volumes/dockhand_dockhand_data/_data/stacks/Docker/voltius` |
+| Deployment tree | `/home/ubuntu/fourretout/voltius-server` |
 | Compose project | `-p voltius -f compose.prod.yml` |
-| Environment | `.env.dockhand` in that tree (untracked, never in git, must survive every operation) |
+| Environment | `.env.prod` in that tree (untracked, gitignored, mode 600, must survive every operation) |
 | Image | `ghcr.io/voltiusapp/voltius-server:sha-<short>` |
 
-The tree is root-owned and `/var/lib/docker` is `0710`, so every command runs as
-`sudo sh -c 'cd <tree> && …'`. A plain `cd` fails. Read the path back off the container rather than
-trusting this document:
+The tree is owned by `ubuntu`, which is in the `docker` group, so no command below needs `sudo`.
+Read the path back off the container rather than trusting this document:
 
 ```sh
 docker inspect voltius-server --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
@@ -31,7 +30,7 @@ branch name, as one multi-arch manifest covering `linux/amd64` and `linux/arm64`
 Deploy `sha-<short>`, never `latest`. `latest` is mutable and overlapping pushes race on it, so
 `latest` cannot be rolled back to and cannot be reasoned about after the fact.
 
-`SERVER_TAG` in `.env.dockhand` selects the tag. `compose.prod.yml` refuses to start without it.
+`SERVER_TAG` in `.env.prod` selects the tag. `compose.prod.yml` refuses to start without it.
 
 ## Deploy
 
@@ -56,13 +55,14 @@ Deploy `sha-<short>`, never `latest`. `latest` is mutable and overlapping pushes
 3. Pull first, so the download is not part of the outage window:
 
    ```sh
-   sudo sh -c 'cd <tree> && SERVER_TAG=sha-'$SHA' docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml pull server'
+   cd /home/ubuntu/fourretout/voltius-server
+   SERVER_TAG=sha-$SHA docker compose -p voltius --env-file .env.prod -f compose.prod.yml pull server
    ```
 
-4. Record the tag you are leaving, for rollback, then set the new one in `.env.dockhand`:
+4. Record the tag you are leaving, for rollback, then set the new one in `.env.prod`:
 
    ```sh
-   sudo sh -c 'cd <tree> && grep ^SERVER_TAG .env.dockhand'
+   grep ^SERVER_TAG .env.prod
    ```
 
    Edit `SERVER_TAG=sha-<new>` in place. Do not rewrite the file wholesale; it holds every
@@ -71,7 +71,7 @@ Deploy `sha-<short>`, never `latest`. `latest` is mutable and overlapping pushes
 5. Recreate and wait for health:
 
    ```sh
-   sudo sh -c 'cd <tree> && docker compose -p voltius --env-file .env.dockhand -f compose.prod.yml up -d server'
+   docker compose -p voltius --env-file .env.prod -f compose.prod.yml up -d server
    docker inspect voltius-server --format '{{.State.Health.Status}}'
    ```
 
@@ -80,7 +80,7 @@ Deploy `sha-<short>`, never `latest`. `latest` is mutable and overlapping pushes
    at startup.
 
 6. Once the checks under Verify pass, re-pack the secrets bundle (`bootstrap-host.md`, "The secrets
-   bundle"). It carries `.env.dockhand`, so until then it names the tag you just left, and
+   bundle"). It carries `.env.prod`, so until then it names the tag you just left, and
    `ansible/migrate.yml` refuses to move a host whose bundle disagrees with the image it runs.
 
 ## Verify
@@ -134,13 +134,29 @@ the tunnel at `https://api.voltius.app`.
 The steps, for reference or for a second host:
 
 1. Confirm the tree's tracked files are clean and at the commit whose image you are about to
-   deploy. `git status --porcelain` in the tree shows untracked leftovers (`.env.dockhand` and its
+   deploy. `git status --porcelain` in the tree shows untracked leftovers (`.env.prod` and its
    backups, `build.rs`, orphan `src/*.rs` files); those are expected and are not copied into a
    CI-built image.
 2. Keep the last locally built image as a fallback: `docker tag voltius-server:latest voltius-server:pre-ghcr-<date>`.
-3. Add `SERVER_TAG=sha-<short>` to `.env.dockhand`.
+3. Add `SERVER_TAG=sha-<short>` to `.env.prod`.
 4. Update `compose.prod.yml` in the tree to this repo's version (`image:` instead of `build: .`).
 5. Deploy as above.
 
 Local builds took 13–17 minutes on this host's 2 cores, competing with the running server for CPU
 the whole time. CI finishes sooner and the host no longer needs a Rust toolchain or a build cache.
+
+## Move out of the dockhand volume — done 2026-10-18
+
+Until 2026-10-18 the deployment tree lived at
+`/var/lib/docker/volumes/dockhand_dockhand_data/_data/stacks/Docker/voltius`, root-owned, with the
+environment in `.env.dockhand`: Dockhand had created the stack and the files stayed in its volume.
+Dockhand was then retired from the host, and the tree was copied to
+`/home/ubuntu/fourretout/voltius-server` — the layout `bootstrap-host.sh` and `ansible/` already
+produce — owned by `ubuntu`, with the environment renamed to `.env.prod` (mode 600, byte-identical).
+
+`docker compose config` gave the same output from both trees before the switch. The server was then
+recreated with `--force-recreate --no-deps` on the same image (`sha-afe9104`), healthy after about
+15 seconds, and `/health`, `/v1/billing/subscription` and `https://api.voltius.app/health/deep`
+answered 200, 401 and 200. The container's compose labels now point at the new tree.
+
+The old copy in the dockhand volume is stale from that moment. Do not deploy from it.

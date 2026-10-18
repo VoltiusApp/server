@@ -124,5 +124,5 @@ Production was untouched: no port published, not on the `cloudflare` network, `a
 and `voltius-db` stayed healthy throughout.
 
 Recovery-time objective for the data is therefore about two minutes. The real outage window in a
-host-loss scenario is dominated by provisioning a replacement host and restoring `.env.dockhand`,
+host-loss scenario is dominated by provisioning a replacement host and restoring `.env.prod`,
 neither of which this drill covers.
