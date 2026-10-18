@@ -18,6 +18,7 @@ pub mod team_lock_policy;
 pub mod team_sync;
 pub mod team_objects;
 pub mod team_object_prefs;
+pub mod team_ownership;
 pub mod team_rule_sets;
 pub mod teams;
 pub mod terminal;

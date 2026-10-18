@@ -9,6 +9,9 @@ use crate::auth::AuthUser;
 use crate::models::team::{Team, TeamMember, TeamRole};
 use crate::routes::audit::write_audit_event;
 use crate::sync_notifier::SyncNotifier;
+use crate::team_authority::{
+    holds_owner_role, lock_billing_owner, require_covers, require_may_confer_builtin, role_authority, Authority,
+};
 use crate::PresenceMap;
 
 pub(crate) async fn notify_team_members_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
@@ -449,10 +452,7 @@ pub async fn add_member(
     ensure_seat_available(&pool, owner_id).await?;
 
     let role_name = body.role.as_deref().unwrap_or("member").to_string();
-    const VALID_ROLES: &[&str] = &["owner", "manager", "editor", "member", "connect-only"];
-    if !VALID_ROLES.contains(&role_name.as_str()) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    require_may_confer_builtin(&pool, team_id, auth.0, &role_name).await?;
 
     // Already a member — no-op
     let already_member = sqlx::query_scalar::<_, bool>(
@@ -565,27 +565,20 @@ pub async fn remove_member(
             warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to remove members");
             return Err(StatusCode::FORBIDDEN);
         }
-    }
-
-    // Cannot remove the team owner
-    let is_owner = sqlx::query_scalar::<_, bool>(
-        "SELECT owner_id = $2 FROM teams WHERE id = $1",
-    )
-    .bind(team_id)
-    .bind(user_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to check team owner"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    if is_owner {
-        return Err(StatusCode::FORBIDDEN);
+        if holds_owner_role(&pool, team_id, user_id).await? {
+            require_covers(&pool, team_id, auth.0, Authority::OWNER).await?;
+        }
     }
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin remove_member transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    if lock_billing_owner(&mut tx, team_id).await? == user_id {
+        warn!(team_id = %team_id, "Billing owner cannot leave or be removed");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let result = sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
         .bind(team_id)
@@ -942,6 +935,7 @@ pub async fn create_role(
     } else {
         permissions | crate::permissions::PERM_VIEW
     };
+    require_covers(&pool, team_id, auth.0, Authority::role(permissions)).await?;
 
     let role = sqlx::query_as::<_, TeamRole>(
         r#"INSERT INTO team_roles (team_id, name, color, permissions, is_builtin, position)
@@ -1033,6 +1027,7 @@ pub async fn update_role(
         let p = p & crate::permissions::ALL_PERMISSIONS;
         if legacy { crate::permissions::keep_era_bits(p, role_info.1) } else { p }
     });
+    require_covers(&pool, team_id, auth.0, Authority::role(role_info.1 | permissions.unwrap_or(0))).await?;
 
     sqlx::query(
         r#"UPDATE team_roles
@@ -1083,20 +1078,12 @@ pub async fn delete_role(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let role_info = sqlx::query_as::<_, (bool,)>(
-        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
-    )
-    .bind(role_id)
-    .bind(team_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to fetch role info"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    if role_info.0 {
+    let role = role_authority(&pool, team_id, role_id).await?;
+    if role.is_builtin {
         warn!(role_id = %role_id, "Cannot delete builtin role");
         return Err(StatusCode::FORBIDDEN);
     }
+    require_covers(&pool, team_id, auth.0, role.authority).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin delete_role transaction");
@@ -1209,17 +1196,9 @@ pub async fn assign_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let is_builtin = sqlx::query_scalar::<_, bool>(
-        "SELECT is_builtin FROM team_roles WHERE id = $1 AND team_id = $2",
-    )
-    .bind(body.role_id)
-    .bind(team_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to verify role"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    crate::team_plan::require_granular(&pool, team_id, is_builtin).await?;
+    let role = role_authority(&pool, team_id, body.role_id).await?;
+    crate::team_plan::require_granular(&pool, team_id, role.is_builtin).await?;
+    require_covers(&pool, team_id, auth.0, role.authority).await?;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -1268,32 +1247,17 @@ pub async fn remove_member_role(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Cannot remove the owner role from the team owner
-    let is_target_team_owner = sqlx::query_scalar::<_, bool>(
-        "SELECT owner_id = $2 FROM teams WHERE id = $1",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to check team owner"); StatusCode::INTERNAL_SERVER_ERROR })?
-    .unwrap_or(false);
+    let role = role_authority(&pool, team_id, role_id).await?;
+    require_covers(&pool, team_id, auth.0, role.authority).await?;
 
-    if is_target_team_owner {
-        let is_owner_role = sqlx::query_scalar::<_, bool>(
-            "SELECT is_builtin AND name = 'owner' FROM team_roles WHERE id = $1 AND team_id = $2",
-        )
-        .bind(role_id)
-        .bind(team_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "Failed to check role type"); StatusCode::INTERNAL_SERVER_ERROR })?
-        .unwrap_or(false);
-
-        if is_owner_role {
-            warn!(team_id = %team_id, "Cannot remove owner role from team owner");
-            return Err(StatusCode::FORBIDDEN);
-        }
+    let db = |e: sqlx::Error| {
+        error!(error = %e, "Failed to remove member role");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let mut tx = pool.begin().await.map_err(db)?;
+    if role.authority.owner && lock_billing_owner(&mut tx, team_id).await? == target_user_id {
+        warn!(team_id = %team_id, "Cannot remove owner role from the billing owner");
+        return Err(StatusCode::FORBIDDEN);
     }
 
     let result = sqlx::query(
@@ -1302,13 +1266,14 @@ pub async fn remove_member_role(
     .bind(team_id)
     .bind(target_user_id)
     .bind(role_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| { error!(error = %e, "Failed to remove member role"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(db)?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
+    tx.commit().await.map_err(db)?;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -1410,20 +1375,7 @@ async fn override_guardrails(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let target_is_owner = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-             SELECT 1 FROM team_member_roles tmr \
-             JOIN team_roles tr ON tr.id = tmr.role_id \
-             WHERE tmr.team_id = $1 AND tmr.user_id = $2 \
-               AND tr.is_builtin AND tr.name = 'owner')",
-    )
-    .bind(team_id)
-    .bind(target_user_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to check target owner role"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if target_is_owner {
+    if holds_owner_role(pool, team_id, target_user_id).await? {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1638,6 +1590,7 @@ pub async fn invite_member(
     }
 
     let role = body.role.as_deref().unwrap_or("member").to_string();
+    require_may_confer_builtin(&pool, team_id, auth.0, &role).await?;
 
     let owner_id = team_owner(&pool, team_id).await?;
 
@@ -1854,7 +1807,7 @@ mod authz_tests {
     use crate::terminal_manager::TerminalManager;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        add_member as add_team_member, env_lock, member_with_role, seed_role, seed_team,
+        add_member as add_team_member, env_lock, inviter_with, member_with_role, seed_role, seed_team,
         seed_team_with_roles, seed_user, set_user_ls_status, set_user_seats, set_user_tier, set_user_trial,
         unique_handle, BillingMode, EnvLockGuard,
     };
@@ -2099,7 +2052,7 @@ mod authz_tests {
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
-        let caller = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let caller = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
         let invitee = seed_user(&pool).await;
 
         let res = add_member(
@@ -2778,6 +2731,8 @@ mod authz_tests {
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::PAYMENT_REQUIRED);
     }
 
+    const ROLE_EDITOR_BITS: i64 = crate::permissions::PERM_CONNECT | crate::permissions::PERM_VIEW | PERM_VIEW_SECRETS;
+
     #[tokio::test]
     async fn create_role_ok_when_business_and_manage_roles() {
         let _env = BillingMode::hosted();
@@ -2785,7 +2740,7 @@ mod authz_tests {
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "business").await;
         let team = seed_team(&pool, owner).await;
-        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES | ROLE_EDITOR_BITS).await;
 
         let res = create_role(
             State(pool.clone()),
@@ -2870,7 +2825,7 @@ mod authz_tests {
         let owner = seed_user(&pool).await;
         set_user_tier(&pool, owner, "business").await;
         let team = seed_team(&pool, owner).await;
-        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES).await;
+        let caller = member_with_role(&pool, team, PERM_MANAGE_ROLES | ROLE_EDITOR_BITS).await;
         let role = seed_role(&pool, team, "editable", PERM_VIEW_SECRETS).await; // non-builtin
 
         let res = update_role(
@@ -2900,7 +2855,7 @@ mod authz_tests {
         let team = seed_team(&pool, owner).await;
 
         // A caller that CAN invite, so only the seat cap can reject.
-        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
         // `member_with_role` adds `inviter` to `team_members`; `seed_team` does
         // NOT add the owner, so `inviter` alone already fills the single seat.
         let invitee = seed_user(&pool).await;
@@ -2933,7 +2888,7 @@ mod authz_tests {
         let owner = seed_user(&pool).await;
         set_user_seats(&pool, owner, 50).await;
         let team = seed_team(&pool, owner).await;
-        let inviter = member_with_role(&pool, team, PERM_INVITE_MEMBERS).await;
+        let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
         let invitee = seed_user(&pool).await;
 
         let res = add_member(
@@ -2957,7 +2912,7 @@ mod authz_tests {
     /// the inviter. Owner is not a member (seed_team doesn't add them), so the used
     /// seat count equals `n`.
     async fn fill_seats(pool: &sqlx::PgPool, team: Uuid, n: usize) -> Uuid {
-        let inviter = member_with_role(pool, team, PERM_INVITE_MEMBERS).await;
+        let inviter = inviter_with(pool, team, PERM_INVITE_MEMBERS).await;
         for _ in 1..n {
             member_with_role(pool, team, 0).await;
         }
@@ -3855,5 +3810,199 @@ mod rule_set_era_tests {
         let deny: i64 = sqlx::query_scalar("SELECT deny_mask FROM team_member_permission_overrides WHERE team_id = $1 AND user_id = $2")
             .bind(team).bind(target).fetch_one(&pool).await.unwrap();
         assert_eq!(deny, PERM_COPY_SECRETS | PERM_VIEW);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::permissions::{ALL_PERMISSIONS, PERM_ADMINISTRATOR, PERM_INVITE_MEMBERS, PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES};
+    use crate::terminal_manager::TerminalManager;
+    use crate::test_support::{
+        add_member as seed_member, grant_builtin_role, rule_set_client_headers, seed_role, seed_team_with_roles,
+        seed_user, BillingMode,
+    };
+    use axum::Extension;
+
+    struct Team {
+        pool: PgPool,
+        id: Uuid,
+        creator: Uuid,
+        owner_role: Uuid,
+    }
+
+    async fn team() -> Option<Team> {
+        let pool = crate::test_support::test_pool().await?;
+        let creator = seed_user(&pool).await;
+        let id = seed_team_with_roles(&pool, creator).await;
+        let owner_role = sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = 'owner' AND is_builtin")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        Some(Team { pool, id, creator, owner_role })
+    }
+
+    impl Team {
+        async fn member(&self, builtin: &str) -> Uuid {
+            let user = seed_user(&self.pool).await;
+            seed_member(&self.pool, self.id, user).await;
+            grant_builtin_role(&self.pool, self.id, user, builtin).await;
+            user
+        }
+
+        async fn assign(&self, actor: Uuid, target: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
+            assign_member_role(
+                State(self.pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                Path((self.id, target)),
+                Json(AssignRoleRequest { role_id: role }),
+            )
+            .await
+        }
+
+        async fn unassign(&self, actor: Uuid, target: Uuid, role: Uuid) -> Result<StatusCode, StatusCode> {
+            remove_member_role(
+                State(self.pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                Path((self.id, target, role)),
+            )
+            .await
+        }
+
+        async fn remove(&self, actor: Uuid, target: Uuid) -> Result<StatusCode, StatusCode> {
+            remove_member(
+                State(self.pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                Extension(TerminalManager::new()),
+                Path((self.id, target)),
+            )
+            .await
+        }
+
+        async fn add(&self, actor: Uuid, role: &str) -> Result<StatusCode, StatusCode> {
+            let invitee = seed_user(&self.pool).await;
+            add_member(
+                State(self.pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                Path(self.id),
+                Json(AddMemberRequest { email: None, user_id: Some(invitee), role: Some(role.into()), name: None }),
+            )
+            .await
+            .map(|(status, _)| status)
+        }
+
+        async fn create_role(&self, actor: Uuid, permissions: i64) -> Result<StatusCode, StatusCode> {
+            create_role(
+                State(self.pool.clone()),
+                Extension(AuthUser(actor)),
+                Extension(SyncNotifier::new()),
+                rule_set_client_headers(),
+                Path(self.id),
+                Json(CreateRoleRequest { name: format!("r-{}", Uuid::new_v4()), color: None, permissions }),
+            )
+            .await
+            .map(|(status, _)| status)
+        }
+
+        async fn is_owner(&self, user: Uuid) -> bool {
+            holds_owner_role(&self.pool, self.id, user).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manager_cannot_make_themselves_or_anyone_an_owner() {
+        let _mode = BillingMode::self_hosted();
+        let Some(t) = team().await else { return };
+        let manager = t.member("manager").await;
+        let member = t.member("member").await;
+
+        assert_eq!(t.assign(manager, manager, t.owner_role).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.assign(manager, member, t.owner_role).await, Err(StatusCode::FORBIDDEN));
+        assert!(!t.is_owner(manager).await && !t.is_owner(member).await);
+    }
+
+    #[tokio::test]
+    async fn a_manager_cannot_hand_out_a_custom_role_above_their_own_bits() {
+        let _mode = BillingMode::self_hosted();
+        let Some(t) = team().await else { return };
+        let manager = t.member("manager").await;
+        let admin_role = seed_role(&t.pool, t.id, "admins", ALL_PERMISSIONS).await;
+
+        assert_eq!(t.assign(manager, manager, admin_role).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.create_role(manager, PERM_ADMINISTRATOR).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.create_role(manager, PERM_MANAGE_ROLES | PERM_MANAGE_MEMBERS).await, Ok(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn an_inviter_cannot_admit_someone_above_their_own_role() {
+        let _mode = BillingMode::self_hosted();
+        let Some(t) = team().await else { return };
+        let manager = t.member("manager").await;
+        let inviter_role = seed_role(&t.pool, t.id, "inviters", PERM_INVITE_MEMBERS).await;
+        let inviter = seed_user(&t.pool).await;
+        seed_member(&t.pool, t.id, inviter).await;
+        crate::test_support::assign_role(&t.pool, t.id, inviter, inviter_role).await;
+
+        assert_eq!(t.add(manager, "owner").await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.add(inviter, "manager").await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.add(manager, "manager").await, Ok(StatusCode::CREATED));
+        assert_eq!(t.add(manager, "no-such-role").await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(t.add(t.creator, "owner").await, Ok(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn owners_promote_and_demote_each_other_but_never_the_billing_owner() {
+        let _mode = BillingMode::self_hosted();
+        let Some(t) = team().await else { return };
+        let bob = t.member("manager").await;
+
+        assert_eq!(t.assign(t.creator, bob, t.owner_role).await, Ok(StatusCode::NO_CONTENT));
+        assert!(t.is_owner(bob).await);
+        assert_eq!(t.unassign(bob, t.creator, t.owner_role).await, Err(StatusCode::FORBIDDEN));
+        assert!(t.is_owner(t.creator).await);
+        assert_eq!(t.unassign(t.creator, bob, t.owner_role).await, Ok(StatusCode::NO_CONTENT));
+        assert!(!t.is_owner(bob).await);
+    }
+
+    #[tokio::test]
+    async fn a_manager_cannot_demote_or_remove_a_co_owner() {
+        let _mode = BillingMode::self_hosted();
+        let Some(t) = team().await else { return };
+        let manager = t.member("manager").await;
+        let bob = t.member("owner").await;
+
+        assert_eq!(t.unassign(manager, bob, t.owner_role).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.remove(manager, bob).await, Err(StatusCode::FORBIDDEN));
+        assert!(t.is_owner(bob).await);
+        assert_eq!(t.remove(t.creator, bob).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn a_co_owner_may_leave_but_the_billing_owner_must_hand_billing_over_first() {
+        let _mode = BillingMode::self_hosted();
+        let Some(t) = team().await else { return };
+        let bob = t.member("owner").await;
+        let carol = t.member("owner").await;
+
+        assert_eq!(t.remove(t.creator, t.creator).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.remove(bob, t.creator).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(t.remove(carol, carol).await, Ok(StatusCode::NO_CONTENT));
+
+        crate::routes::team_ownership::transfer_billing_owner(
+            State(t.pool.clone()),
+            Extension(AuthUser(bob)),
+            Extension(SyncNotifier::new()),
+            Path(t.id),
+            Json(crate::routes::team_ownership::TransferBillingOwnerRequest { user_id: bob }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.remove(t.creator, t.creator).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(team_owner(&t.pool, t.id).await.unwrap(), bob);
     }
 }
