@@ -211,7 +211,7 @@ const DELETED_USER_HANDLE: &str = "[deleted user]";
 /// `user_public_key_inner`, falling back to the key a deleted account left in
 /// `retired_user_keys`. Clients read this endpoint to *unwrap* a team key with
 /// the public key of whoever wrapped it (`wrapped_by_user_id`), and that wrapper
-/// may since have deleted their account (migration 053). Wrapping a new key to
+/// may since have deleted their account (migration 061). Wrapping a new key to
 /// a retired user is harmless: `team_vault_keys.user_id` still has its FK.
 pub(crate) async fn public_key_for_unwrap(
     pool: &PgPool,

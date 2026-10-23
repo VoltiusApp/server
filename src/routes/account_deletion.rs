@@ -1,15 +1,19 @@
 //! `DELETE /v1/auth/account`: a user deleting their own account.
 //!
 //! One transaction, in this order:
-//! 1. Teams the user owns. A team with no other member goes with them; a team
-//!    that still has members refuses the whole deletion with
-//!    `409 OWNS_TEAM_WITH_MEMBERS` (there is no ownership transfer, so the user
-//!    must remove the members or delete the team first).
+//! 1. Teams the user is the billing owner of (`teams.owner_id`). If another
+//!    member holds the Owner role, the earliest-joined one becomes the billing
+//!    owner and the user then leaves like any member. Otherwise a team with no
+//!    other member goes with them, and a team that still has members refuses
+//!    the whole deletion with `409 OWNS_TEAM_WITH_MEMBERS` (the user must make
+//!    someone else an Owner, remove the members, or delete the team first).
+//!    Teams where the user is an Owner but not the billing owner need nothing
+//!    special: other Owners may leave.
 //! 2. Teams the user is only a member of: the same cleanup as leaving
 //!    (`teams::remove_member`) — their member rule entries go and a key rotation
 //!    is queued, since they held the team key.
 //! 3. Their public key is kept if a teammate's copy of a team key was wrapped by
-//!    them (migration 053 explains why), then the user row is deleted. Every
+//!    them (migration 061 explains why), then the user row is deleted. Every
 //!    other reference cascades or goes NULL.
 //! 4. A subscription that would still renew is cancelled at Lemon Squeezy
 //!    *before* the commit. If that fails nothing is deleted
@@ -59,7 +63,11 @@ impl IntoResponse for DeleteAccountError {
             Self::NotFound => (StatusCode::NOT_FOUND, serde_json::json!({ "error": "NOT_FOUND" })),
             Self::OwnsTeamWithMembers(teams) => (
                 StatusCode::CONFLICT,
-                serde_json::json!({ "error": "OWNS_TEAM_WITH_MEMBERS", "teams": teams }),
+                serde_json::json!({
+                    "error": "OWNS_TEAM_WITH_MEMBERS",
+                    "message": "You are the only Owner of a team that still has members. Make another member an Owner, remove the members, or delete the team first.",
+                    "teams": teams,
+                }),
             ),
             Self::SubscriptionCancelFailed => (
                 StatusCode::BAD_GATEWAY,
@@ -76,10 +84,13 @@ impl IntoResponse for DeleteAccountError {
 
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct DeletedAccount {
-    /// Teams the user was a member (not owner) of; their rosters changed.
+    /// Teams the user left (as member, co-owner, or handing billing to another
+    /// Owner); their rosters changed.
     pub left_teams: Vec<Uuid>,
     /// Teams the user owned alone, deleted with them.
     pub deleted_teams: Vec<Uuid>,
+    /// (team, new billing owner) for teams another Owner took over.
+    pub handed_over: Vec<(Uuid, Uuid)>,
     pub cancelled_subscription: Option<String>,
 }
 
@@ -131,18 +142,46 @@ where
     .await
     .map_err(|e| db_err(e, "list owned teams", user_id))?;
 
-    let blocking: Vec<BlockingTeam> = owned
-        .iter()
-        .filter(|(_, _, others)| *others > 0)
-        .map(|(id, name, others)| BlockingTeam { id: *id, name: name.clone(), other_members: *others })
-        .collect();
+    let mut blocking = Vec::new();
+    let mut deleted_teams = Vec::new();
+    let mut handed_over = Vec::new();
+    for (team_id, name, others) in owned {
+        // Another Owner takes billing over; the earliest to join, for determinism.
+        let successor: Option<Uuid> = sqlx::query_scalar(
+            "SELECT m.user_id FROM team_members m
+               JOIN team_member_roles tmr ON tmr.team_id = m.team_id AND tmr.user_id = m.user_id
+               JOIN team_roles tr ON tr.id = tmr.role_id AND tr.is_builtin AND tr.name = 'owner'
+              WHERE m.team_id = $1 AND m.user_id <> $2
+              ORDER BY m.joined_at, m.user_id
+              LIMIT 1",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err(e, "find successor owner", user_id))?;
+        match successor {
+            Some(next) => handed_over.push((team_id, next)),
+            None if others > 0 => blocking.push(BlockingTeam { id: team_id, name, other_members: others }),
+            None => deleted_teams.push(team_id),
+        }
+    }
     if !blocking.is_empty() {
         return Err(DeleteAccountError::OwnsTeamWithMembers(blocking));
     }
-    let deleted_teams: Vec<Uuid> = owned.into_iter().map(|(id, _, _)| id).collect();
 
-    sqlx::query("DELETE FROM teams WHERE owner_id = $1")
-        .bind(user_id)
+    for (team_id, next) in &handed_over {
+        sqlx::query("UPDATE teams SET owner_id = $2 WHERE id = $1")
+            .bind(team_id)
+            .bind(next)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_err(e, "hand over billing owner", user_id))?;
+        info!(team_id = %team_id, from = %user_id, to = %next, "Billing owner handed over on account deletion");
+    }
+
+    sqlx::query("DELETE FROM teams WHERE id = ANY($1)")
+        .bind(&deleted_teams)
         .execute(&mut *tx)
         .await
         .map_err(|e| db_err(e, "delete owned teams", user_id))?;
@@ -192,7 +231,7 @@ where
         return Err(db_err(e, "commit", user_id));
     }
 
-    Ok(DeletedAccount { left_teams, deleted_teams, cancelled_subscription: renewing_subscription })
+    Ok(DeletedAccount { left_teams, deleted_teams, handed_over, cancelled_subscription: renewing_subscription })
 }
 
 /// Lemon Squeezy cancellation for the live server: stop renewal. Self-hosted
@@ -537,6 +576,62 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0, "{status}/{cancelled}");
             assert!(!user_exists(&pool, me).await);
         }
+    }
+
+    async fn billing_owner(pool: &PgPool, team: Uuid) -> Uuid {
+        sqlx::query_scalar("SELECT owner_id FROM teams WHERE id = $1").bind(team).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_billing_owner_with_a_co_owner_hands_over_and_leaves() {
+        let pool = test_pool_or_skip!();
+        let me = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, me).await;
+        let plain = seed_user(&pool).await;
+        add_member(&pool, team, plain).await;
+        let co = seed_user(&pool).await;
+        add_member(&pool, team, co).await;
+        grant_builtin_role(&pool, team, co, "owner").await;
+
+        let out = delete_account_inner(&pool, me, no_ls).await.unwrap();
+
+        assert_eq!(out.handed_over, vec![(team, co)]);
+        assert_eq!(out.left_teams, vec![team]);
+        assert!(out.deleted_teams.is_empty());
+        assert!(!user_exists(&pool, me).await);
+        assert!(team_exists(&pool, team).await);
+        assert_eq!(billing_owner(&pool, team).await, co, "never handed to a non-Owner");
+    }
+
+    #[tokio::test]
+    async fn a_co_owner_who_is_not_billing_owner_just_leaves() {
+        let pool = test_pool_or_skip!();
+        let boss = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, boss).await;
+        let me = seed_user(&pool).await;
+        add_member(&pool, team, me).await;
+        grant_builtin_role(&pool, team, me, "owner").await;
+
+        let out = delete_account_inner(&pool, me, no_ls).await.unwrap();
+
+        assert_eq!(out.left_teams, vec![team]);
+        assert!(out.handed_over.is_empty());
+        assert_eq!(billing_owner(&pool, team).await, boss);
+        assert!(!user_exists(&pool, me).await);
+    }
+
+    #[tokio::test]
+    async fn a_sole_owner_with_non_owner_members_is_refused() {
+        let pool = test_pool_or_skip!();
+        let me = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, me).await;
+        let admin = member_with_role(&pool, team, crate::permissions::PERM_ADMINISTRATOR).await;
+
+        let err = delete_account_inner(&pool, me, no_ls).await.unwrap_err();
+
+        assert!(matches!(err, DeleteAccountError::OwnsTeamWithMembers(ref t) if t.len() == 1 && t[0].id == team));
+        assert_eq!(billing_owner(&pool, team).await, me);
+        assert!(user_exists(&pool, admin).await);
     }
 
     #[tokio::test]

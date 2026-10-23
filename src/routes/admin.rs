@@ -1011,7 +1011,7 @@ pub async fn delete_user(
 
     if force {
         // Hard delete. Only teams.owner_id (RESTRICT) still blocks it since
-        // migration 053. Surface a structured 409 with the constraint name so
+        // migration 061. Surface a structured 409 with the constraint name so
         // the dashboard can explain what blocks the purge.
         if let Err(e) = crate::routes::users::retire_public_key_if_wrapper(&pool, user_id).await {
             error!(error = %e, user = %user_id, "Failed to retire public key before hard delete");

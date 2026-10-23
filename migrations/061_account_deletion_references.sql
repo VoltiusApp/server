@@ -52,10 +52,6 @@ ALTER TABLE team_members
     ADD CONSTRAINT team_members_invited_by_fkey
         FOREIGN KEY (invited_by) REFERENCES users(id) ON DELETE SET NULL;
 
-ALTER TABLE admin_audit_log
-    DROP CONSTRAINT admin_audit_log_target_id_fkey,
-    ADD CONSTRAINT admin_audit_log_target_id_fkey
-        FOREIGN KEY (target_id) REFERENCES users(id) ON DELETE SET NULL;
 
 -- A terminal session cannot exist without its host; everything hanging off it
 -- (keys, vaults, invitees, grants) already cascades from terminal_sessions.
