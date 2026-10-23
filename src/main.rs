@@ -382,7 +382,7 @@ async fn main() {
 
     // Protected routes — auth required + rate limited at 60/hour per IP
     let protected = Router::new()
-        .route("/v1/auth/account", delete(routes::auth::delete_account))
+        .route("/v1/auth/account", delete(routes::account_deletion::delete_account))
         .route("/v1/auth/me", get(routes::auth::get_me))
         .route("/v1/auth/email", put(routes::auth::update_email))
         .route("/v1/auth/password", put(routes::auth::update_password))

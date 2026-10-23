@@ -528,7 +528,7 @@ pub(crate) async fn request_team_rotation(
     Ok(())
 }
 
-async fn delete_subject_rule_entries(
+pub(crate) async fn delete_subject_rule_entries(
     tx: &mut sqlx::PgConnection,
     team_id: Uuid,
     subject_type: &str,

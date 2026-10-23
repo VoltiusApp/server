@@ -1021,26 +1021,6 @@ pub async fn upload_wrapped_user_secrets(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── Delete account ──────────────────────────────────────────────────────────
-
-pub async fn delete_account(
-    State(pool): State<PgPool>,
-    axum::Extension(auth): axum::Extension<AuthUser>,
-) -> Result<StatusCode, StatusCode> {
-    sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(auth.0)
-        .execute(&pool)
-        .await
-        .map_err(|err| {
-            error!(error = %err, user_id = %auth.0, "Failed to delete account");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    info!(user_id = %auth.0, "Account deleted");
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
 #[cfg(test)]
 mod handler_tests {
     //! DB-backed characterization of the `register` / `login` handler bodies,

@@ -238,6 +238,15 @@ async fn mutate_ls_subscription(
     })
 }
 
+/// Stop a subscription from renewing (Lemon Squeezy "cancel": it runs to the
+/// end of the paid period, then expires). Account deletion calls this so a
+/// deleted account is never billed again.
+pub(crate) async fn cancel_ls_subscription(subscription_id: &str) -> Result<(), StatusCode> {
+    mutate_ls_subscription(subscription_id, reqwest::Method::DELETE)
+        .await
+        .map(|_| ())
+}
+
 async fn fetch_current_subscription_id(pool: &PgPool, user_id: Uuid) -> Result<String, StatusCode> {
     let row = sqlx::query_as::<_, (Option<String>,)>(
         "SELECT ls_subscription_id FROM users WHERE id = $1",
