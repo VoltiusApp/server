@@ -57,11 +57,13 @@ pub async fn write_audit_event(
     }
 }
 
-pub(crate) const AUDIT_ACTOR_JOINS: &str = "JOIN users u ON u.id = al.actor_id \
+// LEFT JOIN: `actor_id` is NULL once the actor deleted their account, and that
+// row is still part of the team's history.
+pub(crate) const AUDIT_ACTOR_JOINS: &str = "LEFT JOIN users u ON u.id = al.actor_id \
      LEFT JOIN team_member_names mn ON mn.team_id = al.team_id AND mn.user_id = al.actor_id";
 
 const AUDIT_ROW_COLUMNS: &str = "al.id, al.team_id, al.vault_id, al.actor_id, \
-     u.handle AS actor_name, mn.name AS actor_member_name, \
+     COALESCE(u.handle, '[deleted user]') AS actor_name, mn.name AS actor_member_name, \
      al.action, al.source, al.target_type, al.target_id, al.target_name, \
      al.metadata, al.ip_address::text AS ip_address, al.created_at";
 
@@ -72,7 +74,8 @@ pub struct AuditLogRow {
     pub id: i64,
     pub team_id: Uuid,
     pub vault_id: Option<Uuid>,
-    pub actor_id: Uuid,
+    /// `None` once the actor deleted their account.
+    pub actor_id: Option<Uuid>,
     pub actor_name: String,
     pub actor_member_name: Option<String>,
     pub action: String,
@@ -266,7 +269,7 @@ pub async fn export_audit_logs(
                     log.id,
                     log.team_id,
                     log.vault_id.map(|v| v.to_string()).unwrap_or_default(),
-                    log.actor_id,
+                    log.actor_id.map(|v| v.to_string()).unwrap_or_default(),
                     csv_escape(&log.actor_name),
                     log.action,
                     log.source,

@@ -205,12 +205,66 @@ pub(crate) async fn user_public_key_inner(
     .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// Shown for a user who deleted their account; handles never contain brackets.
+const DELETED_USER_HANDLE: &str = "[deleted user]";
+
+/// `user_public_key_inner`, falling back to the key a deleted account left in
+/// `retired_user_keys`. Clients read this endpoint to *unwrap* a team key with
+/// the public key of whoever wrapped it (`wrapped_by_user_id`), and that wrapper
+/// may since have deleted their account (migration 061). Wrapping a new key to
+/// a retired user is harmless: `team_vault_keys.user_id` still has its FK.
+pub(crate) async fn public_key_for_unwrap(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<UserKeyResponse, StatusCode> {
+    match user_public_key_inner(pool, user_id).await {
+        Err(StatusCode::NOT_FOUND) => sqlx::query_scalar::<_, String>(
+            "SELECT public_key FROM retired_user_keys WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to read retired public key");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map(|public_key| UserKeyResponse {
+            user_id,
+            display_name: DELETED_USER_HANDLE.to_string(),
+            handle: DELETED_USER_HANDLE.to_string(),
+            public_key,
+        })
+        .ok_or(StatusCode::NOT_FOUND),
+        other => other,
+    }
+}
+
+/// Before deleting `user_id`: if a teammate's copy of a team key was wrapped by
+/// them, keep their public key so that copy can still be unwrapped. Every path
+/// that hard-deletes a user must call this first.
+pub(crate) async fn retire_public_key_if_wrapper<'e, E>(executor: E, user_id: Uuid) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "INSERT INTO retired_user_keys (user_id, public_key)
+         SELECT id, public_key FROM users
+          WHERE id = $1 AND public_key IS NOT NULL
+            AND EXISTS (SELECT 1 FROM team_vault_keys WHERE wrapped_by = $1 AND user_id <> $1)
+         ON CONFLICT (user_id) DO UPDATE SET public_key = EXCLUDED.public_key, retired_at = now()",
+    )
+    .bind(user_id)
+    .execute(executor)
+    .await
+    .map(|_| ())
+}
+
 pub async fn get_user_public_key(
     State(pool): State<PgPool>,
     Extension(_auth): Extension<AuthUser>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserKeyResponse>, StatusCode> {
-    Ok(Json(user_public_key_inner(&pool, user_id).await?))
+    Ok(Json(public_key_for_unwrap(&pool, user_id).await?))
 }
 
 #[cfg(test)]

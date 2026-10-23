@@ -42,7 +42,8 @@ pub struct RuleSetResponse {
     pub id: Uuid,
     pub entries: Vec<RuleEntryBody>,
     pub updated_at: DateTime<Utc>,
-    pub updated_by: Uuid,
+    /// `None` once the last editor deleted their account.
+    pub updated_by: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,7 +193,7 @@ pub async fn get_rule_set(
 ) -> Result<Json<RuleSetResponse>, StatusCode> {
     let authz = load_member(&pool, team_id, auth.0).await?;
     require_on_set(&pool, &authz, team_id, set_id, PERM_MANAGE_ROLES).await?;
-    let (updated_at, updated_by): (DateTime<Utc>, Uuid) =
+    let (updated_at, updated_by): (DateTime<Utc>, Option<Uuid>) =
         sqlx::query_as("SELECT updated_at, updated_by FROM team_rule_sets WHERE id = $1")
             .bind(set_id).fetch_one(&pool).await.map_err(|e| internal(e, "read set"))?;
     let entries = load_entries(&pool, set_id).await?;

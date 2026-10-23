@@ -1010,10 +1010,13 @@ pub async fn delete_user(
     .ok_or((StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))))?;
 
     if force {
-        // Hard delete. May fail on FK RESTRICT constraints (teams.owner_id,
-        // audit_logs.actor_id, team_vault_*.updated_by, terminal_sessions.host_user_id).
-        // Surface a structured 409 with the constraint name so the dashboard can
-        // explain what blocks the purge.
+        // Hard delete. Only teams.owner_id (RESTRICT) still blocks it since
+        // migration 061. Surface a structured 409 with the constraint name so
+        // the dashboard can explain what blocks the purge.
+        if let Err(e) = crate::routes::users::retire_public_key_if_wrapper(&pool, user_id).await {
+            error!(error = %e, user = %user_id, "Failed to retire public key before hard delete");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "delete_failed"}))));
+        }
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
             .execute(&pool)

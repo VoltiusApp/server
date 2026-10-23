@@ -173,7 +173,8 @@ pub struct TeamObjectResponse {
     pub folder_id: Option<String>,
     pub metadata: serde_json::Value,
     pub updated_at: DateTime<Utc>,
-    pub updated_by: Uuid,
+    /// `None` once the last editor deleted their account.
+    pub updated_by: Option<Uuid>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub rule_set_id: Option<Uuid>,
     pub my_permissions: i64,
@@ -225,7 +226,7 @@ pub async fn list_objects(
             Option<String>,
             serde_json::Value,
             DateTime<Utc>,
-            Uuid,
+            Option<Uuid>,
             Option<DateTime<Utc>>,
             Option<Uuid>,
         ),
