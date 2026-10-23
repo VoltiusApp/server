@@ -555,6 +555,10 @@ pub struct UserDetail {
     deletion_reason: Option<String>,
     deleted_by: Option<String>,
     two_factor_enabled: bool,
+    email_verified: bool,
+    email_verified_at: Option<DateTime<Utc>>,
+    /// Set by the Resend webhook when mail to the address bounced.
+    email_undeliverable_at: Option<DateTime<Utc>>,
 }
 
 pub async fn get_user(
@@ -567,6 +571,7 @@ pub async fn get_user(
                is_banned, is_admin, ban_reason, banned_at, admin_notes, discount_pct,
                ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
                last_seen_on, deleted_at, deletion_reason, deleted_by,
+               email_verified, email_verified_at, email_undeliverable_at,
                {} AS two_factor_enabled
         FROM users WHERE id = $1
         "#,
@@ -596,6 +601,11 @@ pub struct PatchUserRequest {
     admin_notes: Option<String>,
     admin_override: Option<bool>,
     seat_count: Option<i32>,
+    /// `true` marks the email verified (keeping an earlier `email_verified_at`)
+    /// for accounts whose mailbox cannot receive the link, e.g. store-review demo
+    /// accounts. It also clears `email_undeliverable_at`: that flag only means
+    /// something for an unverified address. `false` reverts to unverified.
+    email_verified: Option<bool>,
 }
 
 pub async fn patch_user(
@@ -659,7 +669,18 @@ pub async fn patch_user(
                 WHEN $9::int IS NOT NULL THEN $9
                 WHEN seat_count IS NULL AND COALESCE($1, subscription_tier) IN ('teams', 'business') THEN 3
                 ELSE seat_count
-            END
+            END,
+            email_verified = COALESCE($10::boolean, email_verified),
+            email_verified_at = CASE
+                WHEN $10::boolean = TRUE THEN COALESCE(email_verified_at, now())
+                WHEN $10::boolean = FALSE THEN NULL
+                ELSE email_verified_at
+            END,
+            email_undeliverable_at = CASE
+                WHEN $10::boolean = TRUE THEN NULL
+                ELSE email_undeliverable_at
+            END,
+            updated_at = CASE WHEN $10::boolean IS NOT NULL THEN now() ELSE updated_at END
         WHERE id = $7
         "#,
     )
@@ -672,6 +693,7 @@ pub async fn patch_user(
     .bind(user_id)
     .bind(body.admin_override)
     .bind(body.seat_count)
+    .bind(body.email_verified)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -690,6 +712,7 @@ pub async fn patch_user(
             "trial_used": body.trial_used,
             "discount_pct": body.discount_pct,
             "admin_override": body.admin_override,
+            "email_verified": body.email_verified,
             "old_tier": old_tier,
         }),
     )
@@ -1524,6 +1547,7 @@ mod admin_handler_tests {
             admin_notes: None,
             admin_override: None,
             seat_count: None,
+            email_verified: None,
         }
     }
 
@@ -1726,6 +1750,122 @@ mod admin_handler_tests {
 
         assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
         assert!(trial_of(&pool, user).await.is_none());
+    }
+
+    async fn email_verification_of(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> (bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+        sqlx::query_as::<_, (bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+            "SELECT email_verified, email_verified_at, email_undeliverable_at FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn patch_email_verified(pool: &PgPool, id: Uuid, verified: bool) -> StatusCode {
+        patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(id),
+            Json(PatchUserRequest {
+                email_verified: Some(verified),
+                ..patch_defaults()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn patch_user_marks_email_verified_and_clears_undeliverable() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_undeliverable_at = now() WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(patch_email_verified(&pool, user, true).await, StatusCode::NO_CONTENT);
+
+        let (verified, verified_at, undeliverable_at) = email_verification_of(&pool, user).await;
+        assert!(verified);
+        assert!(verified_at.is_some());
+        assert!(undeliverable_at.is_none());
+
+        let detail = get_user(State(pool.clone()), Path(user)).await.expect("get user").0;
+        let body = serde_json::to_value(&detail).expect("serialize detail");
+        assert_eq!(body["email_verified"], json!(true));
+        assert!(body["email_verified_at"].is_string());
+
+        let audit: Value = sqlx::query_scalar(
+            "SELECT detail FROM admin_audit_log WHERE target_id = $1 AND action = 'patch_user'",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit["email_verified"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn patch_user_reverifying_keeps_original_verified_at() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        sqlx::query(
+            "UPDATE users SET email_verified = TRUE, email_verified_at = now() - interval '1 day' WHERE id = $1",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_, before, _) = email_verification_of(&pool, user).await;
+
+        assert_eq!(patch_email_verified(&pool, user, true).await, StatusCode::NO_CONTENT);
+
+        let (verified, after, _) = email_verification_of(&pool, user).await;
+        assert!(verified);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn patch_user_marks_email_unverified() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        assert_eq!(patch_email_verified(&pool, user, true).await, StatusCode::NO_CONTENT);
+
+        assert_eq!(patch_email_verified(&pool, user, false).await, StatusCode::NO_CONTENT);
+
+        let (verified, verified_at, _) = email_verification_of(&pool, user).await;
+        assert!(!verified);
+        assert!(verified_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_user_without_email_verified_leaves_it_alone() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        assert_eq!(patch_email_verified(&pool, user, true).await, StatusCode::NO_CONTENT);
+        let before = email_verification_of(&pool, user).await;
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                seat_count: Some(4),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(email_verification_of(&pool, user).await, before);
     }
 
     #[tokio::test]
