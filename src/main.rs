@@ -194,6 +194,7 @@ async fn main() {
                 vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, None).await;
                 terminal_manager.recheck_sessions(None).await;
                 routes::devices::sweep_expired(&pool).await;
+                relay::sweep_expired(&pool).await;
             }
         });
     }
@@ -203,8 +204,14 @@ async fn main() {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
                 interval.tick().await;
-                if let Err(e) = relay::poll_once(&pool, &cf, chrono::Utc::now()).await {
-                    tracing::warn!(error = %e, "Relay usage poll failed");
+                let (pool, cf) = (pool.clone(), cf.clone());
+                let run = tokio::spawn(async move {
+                    relay::poll_once(&pool, &cf, chrono::Utc::now()).await
+                });
+                match run.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(error = %e, "Relay usage poll failed"),
+                    Err(e) => tracing::error!(error = %e, "Relay usage poll panicked"),
                 }
             }
         });

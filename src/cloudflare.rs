@@ -257,9 +257,9 @@ async fn turn_usage_at(
             return Err(CfError::Malformed("usage truncated".into()));
         }
         for g in account.groups {
-            if let Some(id) = g.dimensions.custom_identifier {
-                *totals.entry(id).or_default() += g.sum.egress_bytes;
-            }
+            let id = g.dimensions.custom_identifier.unwrap_or_default();
+            let total = totals.entry(id).or_default();
+            *total = total.saturating_add(g.sum.egress_bytes);
         }
         from = to;
     }
@@ -397,7 +397,10 @@ mod tests {
         let out = turn_usage_at(&base, &cfg(), until - ChronoDuration::days(31), until)
             .await
             .unwrap();
-        assert_eq!(out, vec![("a".to_string(), 100), ("b".to_string(), 7)]);
+        assert_eq!(
+            out,
+            vec![("".to_string(), 9), ("a".to_string(), 100), ("b".to_string(), 7)]
+        );
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, "/graphql");
@@ -422,7 +425,10 @@ mod tests {
             }
             assert!(seen[0].2["query"].as_str().unwrap().contains("datetime_lt: $to"));
         }
-        assert_eq!(out, vec![("a".to_string(), 300), ("b".to_string(), 21)]);
+        assert_eq!(
+            out,
+            vec![("".to_string(), 27), ("a".to_string(), 300), ("b".to_string(), 21)]
+        );
     }
 
     #[tokio::test]

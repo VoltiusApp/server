@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use futures_util::StreamExt;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use rand::RngCore;
 use sqlx::PgPool;
@@ -14,6 +15,8 @@ const STALE_POLL_MINUTES: i64 = 30;
 const GB: u64 = 1_000_000_000;
 const DEFAULT_BUDGET_GB: u64 = 800;
 const BUDGET_WINDOW_DAYS: i64 = 31;
+const REVOKE_CONCURRENCY: usize = 8;
+const REVOKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RelayRefusal {
@@ -196,14 +199,28 @@ async fn record_usage(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Resul
     Ok(())
 }
 
+async fn revoke_one(pool: &PgPool, cf: &CfConfig, username: String, now: DateTime<Utc>) {
+    if let Err(e) = revoke_credential(cf, &username).await {
+        tracing::warn!(error = ?e, "Relay credential revoke failed; retrying next poll");
+        return;
+    }
+    if let Err(e) = sqlx::query("UPDATE relay_credentials SET revoked_at = $2 WHERE username = $1")
+        .bind(&username)
+        .bind(now)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %e, "Relay credential revoked but not recorded; retrying next poll");
+    }
+}
+
 async fn revoke_over_limit(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Result<(), PollError> {
     let (month, _) = month_start(now);
-    let tripped: bool =
-        sqlx::query_scalar("SELECT tripped FROM relay_budget WHERE id = 1")
-            .fetch_optional(pool)
-            .await?
-            .unwrap_or(false);
-    let live: Vec<(String, Uuid, i64)> = sqlx::query_as(
+    let tripped: bool = sqlx::query_scalar("SELECT tripped FROM relay_budget WHERE id = 1")
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(true);
+    let live: Vec<(String, Option<Uuid>, i64)> = sqlx::query_as(
         "SELECT c.username, c.user_id, COALESCE(u.egress_bytes, 0) \
          FROM relay_credentials c \
          LEFT JOIN relay_usage u ON u.user_id = c.user_id AND u.month = $2 \
@@ -215,31 +232,42 @@ async fn revoke_over_limit(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> 
     .await?;
 
     let mut caps: HashMap<Uuid, u64> = HashMap::new();
+    let mut doomed = Vec::new();
     for (username, user_id, used) in live {
-        let cap = match caps.get(&user_id) {
-            Some(c) => *c,
-            None => {
-                let tier = crate::entitlement::benefit_tier_for_user(pool, user_id).await;
-                let c = relay_cap_bytes(&tier).unwrap_or(0);
-                caps.insert(user_id, c);
-                c
-            }
+        let cap = match user_id {
+            None => 0,
+            Some(id) => match caps.get(&id) {
+                Some(c) => *c,
+                None => {
+                    let tier = crate::entitlement::benefit_tier_for_user(pool, id).await;
+                    let c = relay_cap_bytes(&tier).unwrap_or(0);
+                    caps.insert(id, c);
+                    c
+                }
+            },
         };
-        if !tripped && (used.max(0) as u64) < cap {
-            continue;
-        }
-        match revoke_credential(cf, &username).await {
-            Ok(()) => {
-                sqlx::query("UPDATE relay_credentials SET revoked_at = $2 WHERE username = $1")
-                    .bind(&username)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-            Err(e) => tracing::warn!(error = ?e, "Relay credential revoke failed; retrying next poll"),
+        if tripped || (used.max(0) as u64) >= cap {
+            doomed.push(username);
         }
     }
+
+    let revoking = futures_util::stream::iter(doomed)
+        .for_each_concurrent(REVOKE_CONCURRENCY, |u| revoke_one(pool, cf, u, now));
+    if tokio::time::timeout(REVOKE_DEADLINE, revoking).await.is_err() {
+        tracing::warn!("Relay revocation hit its deadline; remaining credentials retry next poll");
+    }
     Ok(())
+}
+
+pub async fn sweep_expired(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "DELETE FROM relay_credentials WHERE expires_at < now() - interval '1 day'",
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(error = %e, "Relay credential sweep failed");
+    }
 }
 
 pub async fn poll_once(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Result<(), PollError> {
@@ -576,6 +604,59 @@ pub(crate) mod tests {
         let (day, from) = month_start(now);
         assert_eq!(day.to_string(), "2026-10-01");
         assert_eq!(from.to_rfc3339(), "2026-10-01T00:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn window_counts_unattributed_egress() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let now = whole_seconds_now();
+        feed(&h, now, vec![], vec![("".into(), 801_000_000_000)]);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        let (window, _, tripped) = budget_row(&pool).await;
+        assert_eq!(window, 801_000_000_000);
+        assert!(tripped);
+    }
+
+    #[tokio::test]
+    async fn orphaned_credential_is_revoked_after_account_deletion() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (user, _) = user_with_ident(&pool, "pro").await;
+        let cred = live_credential(&pool, user).await;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(user).execute(&pool).await.unwrap();
+        let now = whole_seconds_now();
+        feed(&h, now, vec![], vec![]);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(is_revoked(&pool, &cred).await);
+    }
+
+    #[tokio::test]
+    async fn missing_budget_row_revokes_everything() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (user, _) = user_with_ident(&pool, "pro").await;
+        let cred = live_credential(&pool, user).await;
+        h.state.lock().unwrap().usage_status = 500;
+        assert!(poll_once(&pool, &h.cf, Utc::now()).await.is_err());
+        assert!(is_revoked(&pool, &cred).await);
+    }
+
+    #[tokio::test]
+    async fn sweep_drops_credentials_expired_over_a_day() {
+        let pool = test_pool_or_skip!();
+        let _h = harness(&pool).await;
+        let (user, _) = user_with_ident(&pool, "pro").await;
+        let old = live_credential(&pool, user).await;
+        let recent = live_credential(&pool, user).await;
+        sqlx::query("UPDATE relay_credentials SET expires_at = now() - interval '25 hours' WHERE username = $1")
+            .bind(&old).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE relay_credentials SET expires_at = now() - interval '1 hour' WHERE username = $1")
+            .bind(&recent).execute(&pool).await.unwrap();
+        sweep_expired(&pool).await;
+        let left: Vec<String> = sqlx::query_scalar("SELECT username FROM relay_credentials WHERE username = ANY($1)")
+            .bind(vec![old, recent.clone()]).fetch_all(&pool).await.unwrap();
+        assert_eq!(left, vec![recent]);
     }
 
     #[test]

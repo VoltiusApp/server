@@ -649,6 +649,9 @@ mod tests {
         crate::relay::tests::set_budget(&pool, true, 0).await;
         crate::relay::tests::set_usage(&pool, pro, 0, 0).await;
         assert_eq!(relay_status(&pool, pro).await, StatusCode::SERVICE_UNAVAILABLE);
+        for k in ["CF_ACCOUNT_ID", "CF_TURN_KEY_ID", "CF_TURN_KEY_TOKEN", "CF_ANALYTICS_TOKEN"] {
+            std::env::remove_var(k);
+        }
         drop(h);
     }
 }
