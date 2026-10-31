@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::routes::teams::{delete_subject_rule_entries, notify_team_members_changed, request_team_rotation};
 use crate::self_host;
+use crate::team_plan::reconcile_team_plan;
 use crate::sync_notifier::SyncNotifier;
 
 const LS_CANCEL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -279,6 +280,11 @@ pub async fn delete_account(
     notifier.notify(auth.0, "token_invalidated".to_string());
     for team_id in deleted.left_teams {
         notify_team_members_changed(&pool, &notifier, team_id).await;
+    }
+    for (team_id, _) in deleted.handed_over {
+        if let Err(status) = reconcile_team_plan(&pool, &notifier, team_id).await {
+            error!(team_id = %team_id, %status, "Team plan reconcile failed after account deletion");
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

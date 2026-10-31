@@ -22,6 +22,14 @@ pub fn locked_from_row(row: &TierRow) -> bool {
     plan_from_row(row) != "business"
 }
 
+pub fn seat_plan_from_row(row: &TierRow) -> &'static str {
+    match plan_from_row(row).as_str() {
+        "business" => "business",
+        "teams" => "teams",
+        _ => "free",
+    }
+}
+
 async fn owner_plan_row(pool: &PgPool, team_id: Uuid) -> Result<TierRow, StatusCode> {
     sqlx::query_as::<_, TierRow>(&format!(
         "SELECT {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM} WHERE t.id = $1"
@@ -53,33 +61,45 @@ pub async fn reconcile_team_plan(
         StatusCode::INTERNAL_SERVER_ERROR
     };
     let mut tx = pool.begin().await.map_err(db)?;
-    let row = sqlx::query_as::<_, (bool, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
-        "SELECT t.granular_locked, {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM} WHERE t.id = $1 FOR UPDATE OF t"
+    let row = sqlx::query_as::<_, (bool, String, Uuid, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
+        "SELECT t.granular_locked, t.seat_plan, t.owner_id, {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM} WHERE t.id = $1 FOR UPDATE OF t"
     ))
     .bind(team_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db)?;
-    let Some((stored, tier, trial_ends_at, admin_override, ls_sub)) = row else {
+    let Some((stored_lock, stored_plan, owner_id, tier, trial_ends_at, admin_override, ls_sub)) = row else {
         return Ok(());
     };
-    let locked_now = locked_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
-    if stored == locked_now {
+    let owner_row = (tier, trial_ends_at, admin_override, ls_sub);
+    let locked_now = locked_from_row(&owner_row);
+    let plan_now = seat_plan_from_row(&owner_row);
+    let lock_flipped = stored_lock != locked_now;
+    let plan_flipped = stored_plan != plan_now;
+    if !lock_flipped && !plan_flipped {
         return Ok(());
     }
     let members = member_rows(pool, team_id, None).await?;
-    sqlx::query("UPDATE teams SET granular_locked = $2 WHERE id = $1")
+    sqlx::query("UPDATE teams SET granular_locked = $2, seat_plan = $3 WHERE id = $1")
         .bind(team_id)
         .bind(locked_now)
+        .bind(plan_now)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
     tx.commit().await.map_err(db)?;
-    info!(team_id = %team_id, locked = locked_now, "Team plan transition reconciled");
-    notify_team_members_changed(pool, notifier, team_id).await;
-    if !locked_now {
-        for m in &members {
-            notifier.notify_vault_key_changed(m.user_id);
+    info!(team_id = %team_id, locked = locked_now, plan = plan_now, "Team plan transition reconciled");
+    if plan_flipped {
+        for m in members.iter().filter(|m| m.user_id != owner_id) {
+            notifier.notify_plan_changed(m.user_id);
+        }
+    }
+    if lock_flipped {
+        notify_team_members_changed(pool, notifier, team_id).await;
+        if !locked_now {
+            for m in &members {
+                notifier.notify_vault_key_changed(m.user_id);
+            }
         }
     }
     Ok(())
@@ -89,8 +109,8 @@ pub async fn reconcile_all_teams(pool: &PgPool, notifier: &SyncNotifier) {
     if self_host::is_self_hosted() {
         return;
     }
-    let rows = sqlx::query_as::<_, (Uuid, bool, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
-        "SELECT t.id, t.granular_locked, {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM}"
+    let rows = sqlx::query_as::<_, (Uuid, bool, String, String, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>)>(&format!(
+        "SELECT t.id, t.granular_locked, t.seat_plan, {OWNER_PLAN_COLUMNS} {OWNER_PLAN_FROM}"
     ))
     .fetch_all(pool)
     .await;
@@ -98,9 +118,9 @@ pub async fn reconcile_all_teams(pool: &PgPool, notifier: &SyncNotifier) {
         Ok(r) => r,
         Err(e) => return error!(error = %e, "Failed to list teams for plan reconcile"),
     };
-    for (team_id, stored, tier, trial_ends_at, admin_override, ls_sub) in rows {
-        let locked_now = locked_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
-        if locked_now != stored {
+    for (team_id, stored_lock, stored_plan, tier, trial_ends_at, admin_override, ls_sub) in rows {
+        let owner_row = (tier, trial_ends_at, admin_override, ls_sub);
+        if locked_from_row(&owner_row) != stored_lock || seat_plan_from_row(&owner_row) != stored_plan {
             if let Err(status) = reconcile_team_plan(pool, notifier, team_id).await {
                 error!(team_id = %team_id, %status, "Team plan reconcile failed");
             }
@@ -238,6 +258,81 @@ mod db_tests {
             }
         }
         assert!(key_changed.contains(&member));
+    }
+
+    fn drain_plan_changed(rx: &mut tokio::sync::broadcast::Receiver<SyncEvent>) -> Vec<Uuid> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let SyncEvent::PlanChanged { user_id } = ev {
+                out.push(user_id);
+            }
+        }
+        out
+    }
+
+    async fn stored_plan(pool: &PgPool, team: Uuid) -> String {
+        sqlx::query_scalar("SELECT seat_plan FROM teams WHERE id = $1")
+            .bind(team)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_notifies_members_when_owner_lapses() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_VIEW).await;
+        let notifier = SyncNotifier::new();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert_eq!(stored_plan(&pool, team).await, "business");
+
+        set_user_tier(&pool, owner, "free").await;
+        let mut rx = notifier.subscribe();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert_eq!(drain_plan_changed(&mut rx), vec![member]);
+        assert_eq!(stored_plan(&pool, team).await, "free");
+    }
+
+    #[tokio::test]
+    async fn reconcile_silent_when_plan_unchanged() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        member_with_role(&pool, team, PERM_VIEW).await;
+        let notifier = SyncNotifier::new();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        let mut rx = notifier.subscribe();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconcile_notifies_after_billing_owner_transfer_to_free_owner() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = member_with_role(&pool, team, PERM_VIEW).await;
+        let notifier = SyncNotifier::new();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+
+        sqlx::query("UPDATE teams SET owner_id = $2 WHERE id = $1")
+            .bind(team)
+            .bind(member)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut rx = notifier.subscribe();
+        reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+        assert_eq!(drain_plan_changed(&mut rx), vec![owner]);
+        assert_eq!(stored_plan(&pool, team).await, "free");
     }
 
     #[tokio::test]

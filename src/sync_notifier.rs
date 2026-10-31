@@ -11,6 +11,8 @@ pub enum SyncEvent {
     MembershipChanged { user_id: Uuid, team_id: Uuid, added: bool },
     /// A vault key was (re)wrapped for a user who was already a member.
     VaultKeyChanged { user_id: Uuid },
+    /// The plan a team seat grants this user changed; refresh the token.
+    PlanChanged { user_id: Uuid },
     /// A teammate's online/offline status changed. `recipient` is who should receive it.
     PresenceChanged {
         recipient: Uuid,
@@ -61,6 +63,10 @@ impl SyncNotifier {
     /// Not a membership change — see `SyncEvent::VaultKeyChanged`.
     pub fn notify_vault_key_changed(&self, user_id: Uuid) {
         let _ = self.0.tx.send(SyncEvent::VaultKeyChanged { user_id });
+    }
+
+    pub fn notify_plan_changed(&self, user_id: Uuid) {
+        let _ = self.0.tx.send(SyncEvent::PlanChanged { user_id });
     }
 
     /// Tell this user's own devices to refetch `/my/pending-invitations`, after
