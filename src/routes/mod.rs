@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod client_version;
+pub mod devices;
 pub mod health;
 pub mod invitations;
 pub mod member_identity_picks;
