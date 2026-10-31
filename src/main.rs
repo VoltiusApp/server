@@ -1,5 +1,4 @@
 mod auth;
-#[allow(dead_code)]
 mod cloudflare;
 mod db;
 mod email;
@@ -195,6 +194,18 @@ async fn main() {
                 vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, None).await;
                 terminal_manager.recheck_sessions(None).await;
                 routes::devices::sweep_expired(&pool).await;
+            }
+        });
+    }
+    if let Some(cf) = cloudflare::CfConfig::from_env() {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                if let Err(e) = relay::poll_once(&pool, &cf, chrono::Utc::now()).await {
+                    tracing::warn!(error = %e, "Relay usage poll failed");
+                }
             }
         });
     }

@@ -1,13 +1,19 @@
-use chrono::{DateTime, Duration, Utc};
+use std::collections::HashMap;
+
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use rand::RngCore;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::cloudflare::{generate_ice_servers, revoke_credential, CfConfig, IceServers};
+use crate::cloudflare::{
+    generate_ice_servers, revoke_credential, turn_usage, CfConfig, CfError, IceServers,
+};
 
 pub const CREDENTIAL_TTL_SECS: u64 = 3600;
 const STALE_POLL_MINUTES: i64 = 30;
 const GB: u64 = 1_000_000_000;
+const DEFAULT_BUDGET_GB: u64 = 800;
+const BUDGET_WINDOW_DAYS: i64 = 31;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RelayRefusal {
@@ -105,6 +111,141 @@ pub async fn mint(
         return Err(unavailable("record", e));
     }
     Ok(ice)
+}
+
+pub fn budget_bytes() -> u64 {
+    std::env::var("RELAY_MONTHLY_BUDGET_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUDGET_GB)
+        .saturating_mul(GB)
+}
+
+#[derive(Debug)]
+pub enum PollError {
+    Cloudflare(CfError),
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for PollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PollError::Cloudflare(e) => std::fmt::Display::fmt(e, f),
+            PollError::Db(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl From<CfError> for PollError {
+    fn from(e: CfError) -> Self {
+        PollError::Cloudflare(e)
+    }
+}
+
+impl From<sqlx::Error> for PollError {
+    fn from(e: sqlx::Error) -> Self {
+        PollError::Db(e)
+    }
+}
+
+fn month_start(now: DateTime<Utc>) -> (NaiveDate, DateTime<Utc>) {
+    let day = now.date_naive().with_day(1).expect("day 1 exists");
+    (day, day.and_hms_opt(0, 0, 0).expect("midnight exists").and_utc())
+}
+
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+async fn record_usage(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Result<(), PollError> {
+    let (month, month_from) = month_start(now);
+    let by_user = turn_usage(cf, month_from, now).await?;
+    let window: u64 = turn_usage(cf, now - Duration::days(BUDGET_WINDOW_DAYS), now)
+        .await?
+        .iter()
+        .fold(0u64, |a, (_, b)| a.saturating_add(*b));
+
+    let idents: Vec<String> = by_user.iter().map(|(i, _)| i.clone()).collect();
+    let bytes: Vec<i64> = by_user.iter().map(|(_, b)| clamp_i64(*b)).collect();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO relay_usage (user_id, month, egress_bytes) \
+         SELECT i.user_id, $3, u.bytes \
+         FROM UNNEST($1::text[], $2::bigint[]) AS u(ident, bytes) \
+         JOIN relay_identities i ON i.ident = u.ident \
+         ON CONFLICT (user_id, month) DO UPDATE SET egress_bytes = EXCLUDED.egress_bytes",
+    )
+    .bind(&idents)
+    .bind(&bytes)
+    .bind(month)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO relay_budget (id, window_bytes, last_ok_at, tripped) \
+         VALUES (1, $1, now(), $2) \
+         ON CONFLICT (id) DO UPDATE SET \
+             window_bytes = EXCLUDED.window_bytes, \
+             last_ok_at = EXCLUDED.last_ok_at, \
+             tripped = EXCLUDED.tripped",
+    )
+    .bind(clamp_i64(window))
+    .bind(window >= budget_bytes())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn revoke_over_limit(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Result<(), PollError> {
+    let (month, _) = month_start(now);
+    let tripped: bool =
+        sqlx::query_scalar("SELECT tripped FROM relay_budget WHERE id = 1")
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(false);
+    let live: Vec<(String, Uuid, i64)> = sqlx::query_as(
+        "SELECT c.username, c.user_id, COALESCE(u.egress_bytes, 0) \
+         FROM relay_credentials c \
+         LEFT JOIN relay_usage u ON u.user_id = c.user_id AND u.month = $2 \
+         WHERE c.revoked_at IS NULL AND c.expires_at > $1",
+    )
+    .bind(now)
+    .bind(month)
+    .fetch_all(pool)
+    .await?;
+
+    let mut caps: HashMap<Uuid, u64> = HashMap::new();
+    for (username, user_id, used) in live {
+        let cap = match caps.get(&user_id) {
+            Some(c) => *c,
+            None => {
+                let tier = crate::entitlement::benefit_tier_for_user(pool, user_id).await;
+                let c = relay_cap_bytes(&tier).unwrap_or(0);
+                caps.insert(user_id, c);
+                c
+            }
+        };
+        if !tripped && (used.max(0) as u64) < cap {
+            continue;
+        }
+        match revoke_credential(cf, &username).await {
+            Ok(()) => {
+                sqlx::query("UPDATE relay_credentials SET revoked_at = $2 WHERE username = $1")
+                    .bind(&username)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+            }
+            Err(e) => tracing::warn!(error = ?e, "Relay credential revoke failed; retrying next poll"),
+        }
+    }
+    Ok(())
+}
+
+pub async fn poll_once(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Result<(), PollError> {
+    let usage = record_usage(pool, cf, now).await;
+    let revoked = revoke_over_limit(pool, cf, now).await;
+    usage.and(revoked)
 }
 
 pub fn expiry_from(issued: DateTime<Utc>) -> DateTime<Utc> {
@@ -250,6 +391,191 @@ pub(crate) mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn user_with_ident(pool: &PgPool, tier: &str) -> (Uuid, String) {
+        let user = paid_user(pool, tier).await;
+        let ident = format!("ident-{}", user.simple());
+        sqlx::query("INSERT INTO relay_identities (user_id, ident) VALUES ($1, $2)")
+            .bind(user)
+            .bind(&ident)
+            .execute(pool)
+            .await
+            .unwrap();
+        (user, ident)
+    }
+
+    async fn live_credential(pool: &PgPool, user: Uuid) -> String {
+        let username = format!("cred-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO relay_credentials (username, user_id, expires_at) \
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(&username)
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+        username
+    }
+
+    async fn is_revoked(pool: &PgPool, username: &str) -> bool {
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM relay_credentials WHERE username = $1")
+            .bind(username)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn budget_row(pool: &PgPool) -> (i64, Option<DateTime<Utc>>, bool) {
+        sqlx::query_as("SELECT window_bytes, last_ok_at, tripped FROM relay_budget WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn month_usage(pool: &PgPool, user: Uuid) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT egress_bytes FROM relay_usage WHERE user_id = $1 \
+             AND month = date_trunc('month', now() AT TIME ZONE 'UTC')::date",
+        )
+        .bind(user)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    fn whole_seconds_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap()
+    }
+
+    fn feed(h: &Harness, now: DateTime<Utc>, month: Vec<(String, u64)>, window: Vec<(String, u64)>) {
+        let mut s = h.state.lock().unwrap();
+        s.now = Some(now);
+        s.month_usage = month;
+        s.window_usage = window;
+    }
+
+    #[tokio::test]
+    async fn poll_updates_usage_and_budget() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (user, ident) = user_with_ident(&pool, "pro").await;
+        let now = whole_seconds_now();
+        feed(&h, now, vec![(ident.clone(), 5_000), ("unknown".into(), 9)], vec![(ident, 7_000), ("unknown".into(), 9)]);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert_eq!(month_usage(&pool, user).await, Some(5_000));
+        let (window, last_ok, tripped) = budget_row(&pool).await;
+        assert_eq!(window, 7_009);
+        assert!(last_ok.unwrap() > Utc::now() - Duration::minutes(1));
+        assert!(!tripped);
+        let ice = mint(&pool, Some(&h.cf), user).await;
+        assert!(ice.is_ok());
+    }
+
+    #[tokio::test]
+    async fn poll_trips_budget_and_revokes_all_live() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (a, ident_a) = user_with_ident(&pool, "pro").await;
+        let (b, _) = user_with_ident(&pool, "business").await;
+        let (ca, cb) = (live_credential(&pool, a).await, live_credential(&pool, b).await);
+        let expired = live_credential(&pool, a).await;
+        sqlx::query("UPDATE relay_credentials SET expires_at = now() - interval '1 minute' WHERE username = $1")
+            .bind(&expired)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = whole_seconds_now();
+        feed(&h, now, vec![], vec![(ident_a, 800_000_000_000)]);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(budget_row(&pool).await.2);
+        assert!(is_revoked(&pool, &ca).await);
+        assert!(is_revoked(&pool, &cb).await);
+        assert!(!is_revoked(&pool, &expired).await);
+        assert_eq!(mint(&pool, Some(&h.cf), a).await.unwrap_err(), RelayRefusal::Unavailable);
+
+        feed(&h, now, vec![], vec![]);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(!budget_row(&pool).await.2);
+    }
+
+    #[tokio::test]
+    async fn poll_revokes_only_capped_users() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (capped, capped_ident) = user_with_ident(&pool, "pro").await;
+        let (fine, fine_ident) = user_with_ident(&pool, "pro").await;
+        let (teams, teams_ident) = user_with_ident(&pool, "teams").await;
+        let cc = live_credential(&pool, capped).await;
+        let cf_ = live_credential(&pool, fine).await;
+        let ct = live_credential(&pool, teams).await;
+        let now = whole_seconds_now();
+        let month = vec![
+            (capped_ident, 25_000_000_000),
+            (fine_ident, 24_999_999_999),
+            (teams_ident, 30_000_000_000),
+        ];
+        feed(&h, now, month.clone(), month);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(is_revoked(&pool, &cc).await);
+        assert!(!is_revoked(&pool, &cf_).await);
+        assert!(!is_revoked(&pool, &ct).await);
+        assert_eq!(h.state.lock().unwrap().revoked, vec![cc]);
+    }
+
+    #[tokio::test]
+    async fn revoke_failure_retried_next_poll() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (user, ident) = user_with_ident(&pool, "pro").await;
+        let cred = live_credential(&pool, user).await;
+        let now = whole_seconds_now();
+        feed(&h, now, vec![(ident.clone(), 26_000_000_000)], vec![(ident, 26_000_000_000)]);
+        h.state.lock().unwrap().revoke_status = 503;
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(!is_revoked(&pool, &cred).await);
+        assert_eq!(month_usage(&pool, user).await, Some(26_000_000_000));
+        assert_eq!(budget_row(&pool).await.0, 26_000_000_000);
+
+        h.state.lock().unwrap().revoke_status = 204;
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(is_revoked(&pool, &cred).await);
+    }
+
+    #[tokio::test]
+    async fn usage_failure_keeps_last_ok_at() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        set_budget(&pool, false, 10).await;
+        let before = budget_row(&pool).await.1;
+        h.state.lock().unwrap().usage_status = 502;
+        assert!(poll_once(&pool, &h.cf, Utc::now()).await.is_err());
+        assert_eq!(budget_row(&pool).await.1, before);
+
+        set_budget(&pool, false, 31).await;
+        let (user, _) = user_with_ident(&pool, "pro").await;
+        assert_eq!(mint(&pool, Some(&h.cf), user).await.unwrap_err(), RelayRefusal::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn usage_failure_still_revokes_from_stored_usage() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (user, _) = user_with_ident(&pool, "pro").await;
+        let cred = live_credential(&pool, user).await;
+        set_usage(&pool, user, 0, 30_000_000_000).await;
+        h.state.lock().unwrap().usage_status = 500;
+        assert!(poll_once(&pool, &h.cf, Utc::now()).await.is_err());
+        assert!(is_revoked(&pool, &cred).await);
+    }
+
+    #[test]
+    fn month_start_is_utc_calendar_month() {
+        let now: DateTime<Utc> = "2026-10-31T23:59:59Z".parse().unwrap();
+        let (day, from) = month_start(now);
+        assert_eq!(day.to_string(), "2026-10-01");
+        assert_eq!(from.to_rfc3339(), "2026-10-01T00:00:00+00:00");
     }
 
     #[test]
