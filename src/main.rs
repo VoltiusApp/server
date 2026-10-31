@@ -1,5 +1,4 @@
 mod auth;
-mod cloudflare;
 mod db;
 mod email;
 mod entitlement;
@@ -12,7 +11,6 @@ mod object_authz;
 mod observability;
 mod permissions;
 mod rate_limit;
-mod relay;
 mod routes;
 mod self_host;
 mod single_instance;
@@ -37,7 +35,7 @@ use axum::{
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
     GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
-    RedeemRateLimiter, RegisterRateLimiter, RendezvousListRateLimiter, RendezvousRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
+    RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
@@ -193,34 +191,6 @@ async fn main() {
                 team_plan::reconcile_all_teams(&pool, &notifier).await;
                 vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, None).await;
                 terminal_manager.recheck_sessions(None).await;
-                routes::devices::sweep_expired(&pool).await;
-                relay::sweep_expired(&pool).await;
-            }
-        });
-    }
-    let relay_missing = cloudflare::CfConfig::missing_vars();
-    match relay_missing.len() {
-        0 => tracing::info!("Relay configured: usage poll every 300 s"),
-        n if n == cloudflare::CfConfig::VARS.len() => {
-            tracing::info!("Relay not configured: relay credentials answer RELAY_UNAVAILABLE")
-        }
-        _ => tracing::warn!(missing = ?relay_missing, "Relay partially configured and disabled"),
-    }
-    if let Some(cf) = cloudflare::CfConfig::from_env() {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                let (pool, cf) = (pool.clone(), cf.clone());
-                let run = tokio::spawn(async move {
-                    relay::poll_once(&pool, &cf, chrono::Utc::now()).await
-                });
-                match run.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!(error = %e, "Relay usage poll failed"),
-                    Err(e) => tracing::error!(error = %e, "Relay usage poll panicked"),
-                }
             }
         });
     }
@@ -252,14 +222,6 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let rendezvous_per_hour: usize = std::env::var("RENDEZVOUS_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120);
-    let rendezvous_list_per_hour: usize = std::env::var("RENDEZVOUS_LIST_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(600);
     let auth_per_minute: usize = std::env::var("AUTH_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -296,14 +258,6 @@ async fn main() {
         GrantMintRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
     let grant_redeem_limiter =
         GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
-    let rendezvous_limiter = RendezvousRateLimiter(RateLimiter::<uuid::Uuid>::new(
-        rendezvous_per_hour,
-        Duration::from_secs(3600),
-    ));
-    let rendezvous_list_limiter = RendezvousListRateLimiter(RateLimiter::<uuid::Uuid>::new(
-        rendezvous_list_per_hour,
-        Duration::from_secs(3600),
-    ));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -317,8 +271,6 @@ async fn main() {
         sync_per_hour = sync_rate,
         search_per_minute = search_rate,
         knock_per_hour,
-        rendezvous_per_hour,
-        rendezvous_list_per_hour,
         "Configured rate limits"
     );
     let features = features::Features::from_env();
@@ -326,7 +278,6 @@ async fn main() {
         registration = features.registration,
         team_invites = features.team_invites,
         handles_from_email = features.handles_from_email,
-        device_internet_files = features.device_internet_files,
         "Configured features"
     );
     let seed_cipher = two_factor::SeedCipher::from_env();
@@ -475,23 +426,6 @@ async fn main() {
         )
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
-        .merge(
-            Router::new()
-                .route(
-                    "/v1/devices/rendezvous",
-                    post(routes::devices::create_rendezvous).get(routes::devices::list_pending),
-                )
-                .route(
-                    "/v1/devices/relay-credentials",
-                    post(routes::devices::relay_credentials),
-                )
-                .route("/v1/devices/rendezvous/:id", get(routes::devices::get_rendezvous))
-                .route(
-                    "/v1/devices/rendezvous/:id/answer",
-                    post(routes::devices::answer_rendezvous),
-                )
-                .layer(middleware::from_fn(features::require_device_internet_files)),
-        )
         .route(
             "/v1/presence/connection-usage",
             get(routes::presence::get_connection_usage),
@@ -800,8 +734,6 @@ async fn main() {
         .layer(Extension(redeem_limiter))
         .layer(Extension(grant_mint_limiter))
         .layer(Extension(grant_redeem_limiter))
-        .layer(Extension(rendezvous_limiter))
-        .layer(Extension(rendezvous_list_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
