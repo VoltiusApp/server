@@ -504,6 +504,19 @@ fn host_tier_session_limit(tier: &str) -> Option<i64> {
     }
 }
 
+async fn guest_cap_for(pool: &PgPool, vault_owner_id: Option<Uuid>, host_user_id: Uuid) -> usize {
+    let tier = match vault_owner_id {
+        Some(owner) => crate::entitlement::effective_tier_for_user(pool, owner).await,
+        None => crate::entitlement::benefit_tier_for_user(pool, host_user_id).await,
+    };
+    match tier.as_str() {
+        "business" => 50,
+        "teams" => 10,
+        "pro" => 1,
+        _ => 0,
+    }
+}
+
 // ─── Create terminal session ──────────────────────────────────────────────────
 
 pub async fn create_session(
@@ -3811,19 +3824,6 @@ mod tests {
 
         assert_eq!(stored_key_bytes(&pool, ended).await, None);
         assert_eq!(stored_key_bytes(&pool, live).await.as_deref(), Some("fake-key-bytes"));
-    }
-}
-
-async fn guest_cap_for(pool: &PgPool, vault_owner_id: Option<Uuid>, host_user_id: Uuid) -> usize {
-    let tier = match vault_owner_id {
-        Some(owner) => crate::entitlement::effective_tier_for_user(pool, owner).await,
-        None => crate::entitlement::benefit_tier_for_user(pool, host_user_id).await,
-    };
-    match tier.as_str() {
-        "business" => 50,
-        "teams" => 10,
-        "pro" => 1,
-        _ => 0,
     }
 }
 

@@ -76,12 +76,8 @@ fn tier_rank(tier: &str) -> u8 {
     }
 }
 
-pub fn best_tier<'a>(a: &'a str, b: &'a str) -> &'a str {
-    if tier_rank(b) > tier_rank(a) {
-        b
-    } else {
-        a
-    }
+pub fn seat_upgrade(own: &str, seat: Option<SeatPlan>) -> Option<SeatPlan> {
+    seat.filter(|s| tier_rank(&s.tier) > tier_rank(own))
 }
 
 type SeatRow = (
@@ -136,8 +132,8 @@ pub async fn seat_plan_for_user(pool: &PgPool, user_id: Uuid) -> Option<SeatPlan
 
 pub async fn benefit_tier_for_user(pool: &PgPool, user_id: Uuid) -> String {
     let own = effective_tier_for_user(pool, user_id).await;
-    match seat_plan_for_user(pool, user_id).await {
-        Some(seat) => best_tier(&own, &seat.tier).to_string(),
+    match seat_upgrade(&own, seat_plan_for_user(pool, user_id).await) {
+        Some(seat) => seat.tier,
         None => own,
     }
 }
@@ -218,13 +214,18 @@ mod tests {
     }
 
     #[test]
-    fn best_tier_ranks_plans() {
-        assert_eq!(best_tier("free", "pro"), "pro");
-        assert_eq!(best_tier("pro", "teams"), "teams");
-        assert_eq!(best_tier("teams", "business"), "business");
-        assert_eq!(best_tier("business", "teams"), "business");
-        assert_eq!(best_tier("pro", "free"), "pro");
-        assert_eq!(best_tier("teams", "teams"), "teams");
+    fn seat_upgrade_only_when_strictly_better() {
+        let seat = |tier: &str| SeatPlan {
+            tier: tier.to_string(),
+            team_id: Uuid::nil(),
+            team_name: String::new(),
+            trial: false,
+        };
+        assert!(seat_upgrade("free", Some(seat("teams"))).is_some());
+        assert!(seat_upgrade("pro", Some(seat("teams"))).is_some());
+        assert!(seat_upgrade("teams", Some(seat("teams"))).is_none());
+        assert!(seat_upgrade("business", Some(seat("teams"))).is_none());
+        assert!(seat_upgrade("free", None).is_none());
     }
 
     #[tokio::test]

@@ -11,7 +11,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{
-    jwt::{create_access_token, PlanClaims, SeatTeamClaim, create_pending_token, create_refresh_token, validate_token, PENDING_SECOND_FACTOR},
+    jwt::{
+        create_access_token, create_pending_token, create_refresh_token, validate_token, PlanClaims,
+        SeatTeamClaim, PENDING_SECOND_FACTOR,
+    },
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
@@ -161,9 +164,10 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
     let downgraded = effective != stored_tier;
 
     let own = effective.to_string();
-    let seat = crate::entitlement::seat_plan_for_user(pool, user_id)
-        .await
-        .filter(|s| crate::entitlement::best_tier(&own, &s.tier) == s.tier && s.tier != own);
+    let seat = crate::entitlement::seat_upgrade(
+        &own,
+        crate::entitlement::seat_plan_for_user(pool, user_id).await,
+    );
     let tier = seat.as_ref().map_or_else(|| own.clone(), |s| s.tier.clone());
 
     Ok(TierInfo {
@@ -402,7 +406,7 @@ async fn register_with(
         }
     }
 
-    let email_verified = if !delivery_configured {
+    if !delivery_configured {
         sqlx::query(
             "UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1",
         )
@@ -413,7 +417,6 @@ async fn register_with(
             error!(error = %e, user_id = %user_id, "Failed to auto-verify user email");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        true
     } else {
         let mut conn = pool.acquire().await.map_err(|e| {
             error!(error = %e, "Failed to acquire connection for verification token");
@@ -424,8 +427,7 @@ async fn register_with(
         if let Err(e) = send_verification_email(&email, &token).await {
             error!(error = %e, user_id = %user_id, "Failed to send verification email");
         }
-        false
-    };
+    }
 
     let pending = sqlx::query_as::<_, PendingInvitation>(&format!(
         "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
@@ -444,22 +446,7 @@ async fn register_with(
         }
     }
 
-    let trial_ends_ts = trial_ends_at.map(|t| t.timestamp());
-    let session = auth_response(
-        user_id,
-        TierInfo {
-            tier: initial_tier.to_string(),
-            billing_tier: initial_tier.to_string(),
-            seat_team: None,
-            trial_ends_at: trial_ends_ts,
-            trial_used: false,
-            is_admin: false,
-            is_banned: false,
-            email_verified,
-            token_version: 0,
-        },
-        body.wrapped_user_secrets,
-    )?;
+    let session = auth_response(user_id, fetch_tier(&pool, user_id).await?, body.wrapped_user_secrets)?;
 
     // `account_id` is deliberately absent: despite the name it is the KDF salt
     // passed to derive_keys, so a log line carrying it hands anyone who can read
@@ -1055,7 +1042,9 @@ mod handler_tests {
     use super::*;
     use crate::auth::jwt::validate_token;
     use crate::test_pool_or_skip;
-    use crate::test_support::{add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial};
+    use crate::test_support::{
+        add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial,
+    };
     use axum::extract::State;
     use axum::Extension;
 
@@ -1259,6 +1248,35 @@ mod handler_tests {
 
         let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
         assert_eq!(claims.tier, "free");
+    }
+
+    #[tokio::test]
+    async fn register_with_pending_invitation_issues_seat_token() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        crate::test_support::seed_invitation(&pool, team, &email, "member", None).await;
+
+        let (_, Json(resp)) = register_with(
+            pool.clone(),
+            &SyncNotifier::new(),
+            Features::open(),
+            true,
+            register_req(&email, Uuid::new_v4(), None),
+        )
+        .await
+        .expect("register ok");
+
+        assert_eq!(resp.tier, "teams");
+        assert_eq!(resp.billing_tier, "pro");
+        assert_eq!(resp.seat_team.as_ref().map(|s| s.id), Some(team));
+        let claims = validate_token(&resp.jwt_token, "access").unwrap();
+        assert_eq!(claims.tier, "teams");
+        assert_eq!(claims.seat_team, resp.seat_team);
     }
 
     #[tokio::test]

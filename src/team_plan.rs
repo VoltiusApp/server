@@ -183,6 +183,25 @@ mod db_tests {
     }
 
     #[tokio::test]
+    async fn a_business_seat_does_not_unlock_a_free_owners_own_team() {
+        let _mode = BillingMode::hosted();
+        let pool = crate::test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let own_team = seed_team(&pool, user).await;
+        add_member(&pool, own_team, user).await;
+        let biz_owner = seed_user(&pool).await;
+        set_user_tier(&pool, biz_owner, "business").await;
+        let biz_team = seed_team(&pool, biz_owner).await;
+        add_member(&pool, biz_team, biz_owner).await;
+        add_member(&pool, biz_team, user).await;
+
+        assert_eq!(crate::entitlement::benefit_tier_for_user(&pool, user).await, "business");
+        assert!(team_locked(&pool, own_team).await.unwrap());
+        assert_eq!(require_granular(&pool, own_team, false).await, Err(StatusCode::PAYMENT_REQUIRED));
+        assert!(!team_locked(&pool, biz_team).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn a_repeat_downgrade_reconcile_is_silent() {
         let _mode = BillingMode::hosted();
         let pool = crate::test_pool_or_skip!();
