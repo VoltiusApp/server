@@ -1570,15 +1570,7 @@ async fn handle_socket(
 
     // Participant cap: guests only (host is always allowed)
     if user_id != host_user_id {
-        let tier_owner = vault_owner_id.unwrap_or(host_user_id);
-        let effective_tier = crate::entitlement::effective_tier_for_user(&pool, tier_owner).await;
-
-        let guest_cap: usize = match effective_tier.as_str() {
-            "business" => 50,
-            "teams"    => 10,
-            "pro"      => 1,
-            _          => 0,
-        };
+        let guest_cap = guest_cap_for(&pool, vault_owner_id, host_user_id).await;
 
         let current_guests = {
             let sessions = manager.sessions.lock().await;
@@ -3819,6 +3811,56 @@ mod tests {
 
         assert_eq!(stored_key_bytes(&pool, ended).await, None);
         assert_eq!(stored_key_bytes(&pool, live).await.as_deref(), Some("fake-key-bytes"));
+    }
+}
+
+async fn guest_cap_for(pool: &PgPool, vault_owner_id: Option<Uuid>, host_user_id: Uuid) -> usize {
+    let tier = match vault_owner_id {
+        Some(owner) => crate::entitlement::effective_tier_for_user(pool, owner).await,
+        None => crate::entitlement::benefit_tier_for_user(pool, host_user_id).await,
+    };
+    match tier.as_str() {
+        "business" => 50,
+        "teams" => 10,
+        "pro" => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod guest_cap_tests {
+    use super::*;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{add_member, seed_team, seed_user, set_user_tier, BillingMode};
+
+    async fn host_with_teams_seat(pool: &PgPool) -> Uuid {
+        let host = seed_user(pool).await;
+        let owner = seed_user(pool).await;
+        set_user_tier(pool, owner, "teams").await;
+        let team = seed_team(pool, owner).await;
+        add_member(pool, team, owner).await;
+        add_member(pool, team, host).await;
+        host
+    }
+
+    #[tokio::test]
+    async fn guest_cap_on_personal_share_uses_hosts_seat_plan() {
+        let pool = test_pool_or_skip!();
+        let _mode = BillingMode::hosted();
+        let host = host_with_teams_seat(&pool).await;
+        assert_eq!(guest_cap_for(&pool, None, host).await, 10);
+    }
+
+    #[tokio::test]
+    async fn guest_cap_on_vault_share_uses_vault_owner() {
+        let pool = test_pool_or_skip!();
+        let _mode = BillingMode::hosted();
+        let host = host_with_teams_seat(&pool).await;
+        let free_owner = seed_user(&pool).await;
+        assert_eq!(guest_cap_for(&pool, Some(free_owner), host).await, 0);
+        let biz_owner = seed_user(&pool).await;
+        set_user_tier(&pool, biz_owner, "business").await;
+        assert_eq!(guest_cap_for(&pool, Some(biz_owner), host).await, 50);
     }
 }
 
