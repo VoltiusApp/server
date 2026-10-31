@@ -37,8 +37,8 @@ that manages buckets could run — and buys nothing until a second person or a C
 local backend does take a lockfile, so two runs on this host serialise; only cross-machine
 concurrency is unprotected, and there is one machine.
 
-The API token comes from the environment, but the TURN app (`turn.tf`) stores its bearer key in the
-state, so the file is a secret: keep it mode 600 — this host runs other containers.
+The state file holds no secret: the token comes from the environment and no resource here has a
+sensitive attribute. Keep it mode 600 anyway — this host runs other containers.
 
 ## Do not delete imports.tf
 

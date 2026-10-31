@@ -34,10 +34,6 @@ pub enum SyncEvent {
     },
     /// A team session this recipient could see has ended.
     SessionEnded { recipient: Uuid, session_id: Uuid },
-    /// One of the user's devices wants a direct connection to another of theirs.
-    DeviceRendezvous { user_id: Uuid, rendezvous_id: Uuid, to_device: String },
-    /// The target device answered a rendezvous the user's other device opened.
-    DeviceRendezvousAnswer { user_id: Uuid, rendezvous_id: Uuid },
 }
 
 #[derive(Clone)]
@@ -120,14 +116,6 @@ impl SyncNotifier {
             recipient,
             session_id,
         });
-    }
-
-    pub fn notify_device_rendezvous(&self, user_id: Uuid, rendezvous_id: Uuid, to_device: String) {
-        let _ = self.0.tx.send(SyncEvent::DeviceRendezvous { user_id, rendezvous_id, to_device });
-    }
-
-    pub fn notify_device_rendezvous_answer(&self, user_id: Uuid, rendezvous_id: Uuid) {
-        let _ = self.0.tx.send(SyncEvent::DeviceRendezvousAnswer { user_id, rendezvous_id });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SyncEvent> {
