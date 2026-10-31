@@ -262,6 +262,15 @@ async fn fetch_current_subscription_id(pool: &PgPool, user_id: Uuid) -> Result<S
     row.0.ok_or(StatusCode::NOT_FOUND)
 }
 
+async fn require_per_seat_plan(pool: &PgPool, user_id: Uuid) -> Result<(), StatusCode> {
+    let tier = crate::entitlement::effective_tier_for_user(pool, user_id).await;
+    if PER_SEAT_PLANS.contains(&tier.as_str()) {
+        Ok(())
+    } else {
+        Err(StatusCode::PAYMENT_REQUIRED)
+    }
+}
+
 // `Response` in the Err slot is the point: these handlers answer with a typed
 // JSON error body, not a bare status. Boxing it, as the lint suggests, would
 // cost the `IntoResponse` impl axum requires of a handler's error type.
@@ -433,6 +442,7 @@ pub async fn update_seats(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    require_per_seat_plan(&pool, auth.0).await?;
     let subscription_id = fetch_current_subscription_id(&pool, auth.0).await?;
     let api_key = std::env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
@@ -916,5 +926,35 @@ mod seat_reporting_tests {
 
         assert_eq!(info.effective_seats, None);
         assert_eq!(info.used_seats, None);
+    }
+
+    #[tokio::test]
+    async fn pro_plan_owner_cannot_change_seat_quantity() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        set_user_tier(&pool, user, "pro").await;
+        let _billing = crate::test_support::BillingMode::hosted();
+
+        let res = update_seats(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            Json(UpdateSeatsRequest {
+                seats: 5,
+                invoice_immediately: Some(true),
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn per_seat_plan_owners_pass_the_plan_check() {
+        let pool = test_pool_or_skip!();
+        for plan in PER_SEAT_PLANS {
+            let user = seed_user(&pool).await;
+            set_user_tier(&pool, user, plan).await;
+            assert_eq!(require_per_seat_plan(&pool, user).await, Ok(()), "{plan}");
+        }
     }
 }
