@@ -933,7 +933,7 @@ mod seat_reporting_tests {
         let pool = test_pool_or_skip!();
         let user = seed_user(&pool).await;
         set_user_tier(&pool, user, "pro").await;
-        crate::self_host::set_test_billing_mode(Some(false));
+        let _billing = crate::test_support::BillingMode::hosted();
 
         let res = update_seats(
             State(pool.clone()),
