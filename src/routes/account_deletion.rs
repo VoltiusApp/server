@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::routes::teams::{delete_subject_rule_entries, notify_team_members_changed, request_team_rotation};
 use crate::self_host;
-use crate::team_plan::reconcile_team_plan;
+use crate::team_plan::after_billing_owner_change;
 use crate::sync_notifier::SyncNotifier;
 
 const LS_CANCEL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -277,16 +277,20 @@ pub async fn delete_account(
         "Account deleted"
     );
 
-    notifier.notify(auth.0, "token_invalidated".to_string());
+    announce_deletion(&pool, &notifier, auth.0, deleted).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn announce_deletion(pool: &PgPool, notifier: &SyncNotifier, user_id: Uuid, deleted: DeletedAccount) {
+    notifier.notify(user_id, "token_invalidated".to_string());
     for team_id in deleted.left_teams {
-        notify_team_members_changed(&pool, &notifier, team_id).await;
+        notify_team_members_changed(pool, notifier, team_id).await;
     }
-    for (team_id, _) in deleted.handed_over {
-        if let Err(status) = reconcile_team_plan(&pool, &notifier, team_id).await {
+    for (team_id, next) in deleted.handed_over {
+        if let Err(status) = after_billing_owner_change(pool, notifier, team_id, user_id, next).await {
             error!(team_id = %team_id, %status, "Team plan reconcile failed after account deletion");
         }
     }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -607,6 +611,35 @@ mod tests {
         assert!(!user_exists(&pool, me).await);
         assert!(team_exists(&pool, team).await);
         assert_eq!(billing_owner(&pool, team).await, co, "never handed to a non-Owner");
+    }
+
+    #[tokio::test]
+    async fn a_handover_tells_the_new_billing_owner_and_members_their_plan_changed() {
+        let _mode = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let me = seed_user(&pool).await;
+        set_user_tier(&pool, me, "teams").await;
+        let team = seed_team_with_roles(&pool, me).await;
+        let plain = seed_user(&pool).await;
+        add_member(&pool, team, plain).await;
+        let co = seed_user(&pool).await;
+        add_member(&pool, team, co).await;
+        grant_builtin_role(&pool, team, co, "owner").await;
+        let notifier = SyncNotifier::new();
+        crate::team_plan::reconcile_team_plan(&pool, &notifier, team).await.unwrap();
+
+        let out = delete_account_inner(&pool, me, no_ls).await.unwrap();
+        let mut rx = notifier.subscribe();
+        announce_deletion(&pool, &notifier, me, out).await;
+
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::sync_notifier::SyncEvent::PlanChanged { user_id } = ev {
+                got.push(user_id);
+            }
+        }
+        assert!(got.contains(&co));
+        assert!(got.contains(&plain));
     }
 
     #[tokio::test]

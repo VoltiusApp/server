@@ -101,7 +101,7 @@ pub async fn transfer_billing_owner(
         None,
         Some(json!({ "from": current, "to": body.user_id })),
     ));
-    crate::team_plan::reconcile_team_plan(&pool, &notifier, team_id).await?;
+    crate::team_plan::after_billing_owner_change(&pool, &notifier, team_id, current, body.user_id).await?;
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
