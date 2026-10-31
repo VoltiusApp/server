@@ -22,6 +22,16 @@ pub struct CfConfig {
 }
 
 impl CfConfig {
+    pub const VARS: [&'static str; 4] =
+        ["CF_ACCOUNT_ID", "CF_TURN_KEY_ID", "CF_TURN_KEY_TOKEN", "CF_ANALYTICS_TOKEN"];
+
+    pub fn missing_vars() -> Vec<&'static str> {
+        Self::VARS
+            .into_iter()
+            .filter(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).is_none())
+            .collect()
+    }
+
     pub fn from_env() -> Option<CfConfig> {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Some(CfConfig {

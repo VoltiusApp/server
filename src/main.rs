@@ -37,7 +37,7 @@ use axum::{
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
     GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
-    RedeemRateLimiter, RegisterRateLimiter, RendezvousRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
+    RedeemRateLimiter, RegisterRateLimiter, RendezvousListRateLimiter, RendezvousRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
@@ -198,6 +198,14 @@ async fn main() {
             }
         });
     }
+    let relay_missing = cloudflare::CfConfig::missing_vars();
+    match relay_missing.len() {
+        0 => tracing::info!("Relay configured: usage poll every 300 s"),
+        n if n == cloudflare::CfConfig::VARS.len() => {
+            tracing::info!("Relay not configured: relay credentials answer RELAY_UNAVAILABLE")
+        }
+        _ => tracing::warn!(missing = ?relay_missing, "Relay partially configured and disabled"),
+    }
     if let Some(cf) = cloudflare::CfConfig::from_env() {
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -248,6 +256,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
+    let rendezvous_list_per_hour: usize = std::env::var("RENDEZVOUS_LIST_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
     let auth_per_minute: usize = std::env::var("AUTH_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -288,6 +300,10 @@ async fn main() {
         rendezvous_per_hour,
         Duration::from_secs(3600),
     ));
+    let rendezvous_list_limiter = RendezvousListRateLimiter(RateLimiter::<uuid::Uuid>::new(
+        rendezvous_list_per_hour,
+        Duration::from_secs(3600),
+    ));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -301,6 +317,8 @@ async fn main() {
         sync_per_hour = sync_rate,
         search_per_minute = search_rate,
         knock_per_hour,
+        rendezvous_per_hour,
+        rendezvous_list_per_hour,
         "Configured rate limits"
     );
     let features = features::Features::from_env();
@@ -783,6 +801,7 @@ async fn main() {
         .layer(Extension(grant_mint_limiter))
         .layer(Extension(grant_redeem_limiter))
         .layer(Extension(rendezvous_limiter))
+        .layer(Extension(rendezvous_list_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

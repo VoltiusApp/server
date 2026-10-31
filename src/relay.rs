@@ -117,11 +117,15 @@ pub async fn mint(
 }
 
 pub fn budget_bytes() -> u64 {
-    std::env::var("RELAY_MONTHLY_BUDGET_GB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_BUDGET_GB)
-        .saturating_mul(GB)
+    let gb = match std::env::var("RELAY_MONTHLY_BUDGET_GB") {
+        Ok(v) if v.trim().is_empty() => DEFAULT_BUDGET_GB,
+        Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(value = %v, "RELAY_MONTHLY_BUDGET_GB is not a whole number; using {DEFAULT_BUDGET_GB}");
+            DEFAULT_BUDGET_GB
+        }),
+        Err(_) => DEFAULT_BUDGET_GB,
+    };
+    gb.saturating_mul(GB)
 }
 
 #[derive(Debug)]
@@ -196,6 +200,11 @@ async fn record_usage(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> Resul
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    tracing::info!(
+        window_bytes = window,
+        tripped = window >= budget_bytes(),
+        "Relay usage poll ok"
+    );
     Ok(())
 }
 
@@ -219,7 +228,8 @@ async fn revoke_over_limit(pool: &PgPool, cf: &CfConfig, now: DateTime<Utc>) -> 
     let tripped: bool = sqlx::query_scalar("SELECT tripped FROM relay_budget WHERE id = 1")
         .fetch_optional(pool)
         .await?
-        .unwrap_or(true);
+        .unwrap_or(true)
+        || !crate::features::Features::from_env().device_internet_files;
     let live: Vec<(String, Option<Uuid>, i64)> = sqlx::query_as(
         "SELECT c.username, c.user_id, COALESCE(u.egress_bytes, 0) \
          FROM relay_credentials c \
@@ -616,6 +626,49 @@ pub(crate) mod tests {
         let (window, _, tripped) = budget_row(&pool).await;
         assert_eq!(window, 801_000_000_000);
         assert!(tripped);
+    }
+
+    #[tokio::test]
+    async fn feature_off_revokes_all_live_credentials() {
+        let pool = test_pool_or_skip!();
+        let h = harness(&pool).await;
+        let (user, _) = user_with_ident(&pool, "pro").await;
+        let cred = live_credential(&pool, user).await;
+        let now = whole_seconds_now();
+        feed(&h, now, vec![], vec![]);
+        poll_once(&pool, &h.cf, now).await.unwrap();
+        assert!(!is_revoked(&pool, &cred).await);
+        std::env::set_var("DEVICE_INTERNET_FILES", "false");
+        let polled = poll_once(&pool, &h.cf, now).await;
+        std::env::remove_var("DEVICE_INTERNET_FILES");
+        polled.unwrap();
+        assert!(is_revoked(&pool, &cred).await);
+    }
+
+    #[test]
+    fn malformed_budget_falls_back_to_default() {
+        let _g = EnvLockGuard(env_lock());
+        for (v, want) in [("lots", 800), ("", 800), ("12", 12), (" 5 ", 5)] {
+            std::env::set_var("RELAY_MONTHLY_BUDGET_GB", v);
+            assert_eq!(budget_bytes(), want * 1_000_000_000, "{v:?}");
+        }
+        std::env::remove_var("RELAY_MONTHLY_BUDGET_GB");
+        assert_eq!(budget_bytes(), 800_000_000_000);
+    }
+
+    #[test]
+    fn missing_vars_names_the_gaps() {
+        let _g = EnvLockGuard(env_lock());
+        for k in CfConfig::VARS {
+            std::env::remove_var(k);
+        }
+        assert_eq!(CfConfig::missing_vars().len(), 4);
+        std::env::set_var("CF_TURN_KEY_ID", "k");
+        assert_eq!(
+            CfConfig::missing_vars(),
+            vec!["CF_ACCOUNT_ID", "CF_TURN_KEY_TOKEN", "CF_ANALYTICS_TOKEN"]
+        );
+        std::env::remove_var("CF_TURN_KEY_ID");
     }
 
     #[tokio::test]

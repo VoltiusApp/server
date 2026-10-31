@@ -13,7 +13,9 @@ use uuid::Uuid;
 use super::coded_error;
 use crate::auth::AuthUser;
 use crate::cloudflare::{CfConfig, IceServer};
-use crate::rate_limit::{check_user_budget, RateLimiter, RendezvousRateLimiter};
+use crate::rate_limit::{
+    check_user_budget, RateLimiter, RendezvousListRateLimiter, RendezvousRateLimiter,
+};
 use crate::relay::{self, RelayRefusal};
 use crate::sync_notifier::SyncNotifier;
 
@@ -139,7 +141,7 @@ pub struct PendingRendezvous {
 pub async fn list_pending(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
-    Extension(RendezvousRateLimiter(limiter)): Extension<RendezvousRateLimiter>,
+    Extension(RendezvousListRateLimiter(limiter)): Extension<RendezvousListRateLimiter>,
     axum::extract::Query(query): axum::extract::Query<PendingQuery>,
 ) -> Result<Json<Vec<PendingRendezvous>>, Response> {
     rendezvous_budget(&limiter, auth.0).await?;
@@ -282,6 +284,10 @@ mod tests {
         seed_device(pool, user, "laptop").await;
         seed_device(pool, user, "phone").await;
         user
+    }
+
+    fn list_limiter(max: usize) -> Extension<RendezvousListRateLimiter> {
+        Extension(RendezvousListRateLimiter(RateLimiter::new(max, Duration::from_secs(3600))))
     }
 
     fn limiter(max: usize) -> Extension<RendezvousRateLimiter> {
@@ -557,7 +563,7 @@ mod tests {
         list_pending(
             State(pool.clone()),
             Extension(AuthUser(user)),
-            limiter(lim),
+            list_limiter(lim),
             axum::extract::Query(PendingQuery { to_device: to.into() }),
         )
         .await
@@ -595,7 +601,7 @@ mod tests {
         let free = seed_user(&pool).await;
         assert_eq!(status_of(pending(&pool, free, "phone", 100).await), StatusCode::PAYMENT_REQUIRED);
         let paid = paid_user_with_devices(&pool).await;
-        let lim = limiter(1);
+        let lim = list_limiter(1);
         let call = || {
             list_pending(
                 State(pool.clone()),
