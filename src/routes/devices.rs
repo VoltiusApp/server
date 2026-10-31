@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -52,47 +54,21 @@ pub struct AnswerRendezvous {
     pub answer: String,
 }
 
-#[derive(Debug)]
-pub struct Refusal(StatusCode, Option<&'static str>);
-
-impl From<StatusCode> for Refusal {
-    fn from(status: StatusCode) -> Self {
-        Self(status, None)
-    }
+fn internal(e: sqlx::Error) -> Response {
+    tracing::error!(error = %e, "Device rendezvous query failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
-impl From<sqlx::Error> for Refusal {
-    fn from(_: sqlx::Error) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, None)
-    }
-}
-
-impl IntoResponse for Refusal {
-    fn into_response(self) -> Response {
-        match self.1 {
-            Some(code) => coded_error(self.0, code),
-            None => self.0.into_response(),
-        }
-    }
-}
-
-async fn require_paid(pool: &PgPool, user: Uuid) -> Result<(), Refusal> {
-    if crate::entitlement::benefit_tier_for_user(pool, user).await == "free" {
-        return Err(StatusCode::PAYMENT_REQUIRED.into());
-    }
-    Ok(())
-}
-
-fn decode_sealed(encoded: &str) -> Result<Vec<u8>, Refusal> {
+fn decode_sealed(encoded: &str) -> Result<Vec<u8>, Response> {
     if encoded.len() > MAX_SEALED_BYTES.div_ceil(3) * 4 {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
+        return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
     }
-    let bytes = B64.decode(encoded).map_err(|_| Refusal::from(StatusCode::BAD_REQUEST))?;
+    let bytes = B64.decode(encoded).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     if bytes.is_empty() {
-        return Err(StatusCode::BAD_REQUEST.into());
+        return Err(StatusCode::BAD_REQUEST.into_response());
     }
     if bytes.len() > MAX_SEALED_BYTES {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
+        return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
     }
     Ok(bytes)
 }
@@ -103,23 +79,25 @@ pub async fn create_rendezvous(
     Extension(notifier): Extension<SyncNotifier>,
     Extension(RendezvousRateLimiter(limiter)): Extension<RendezvousRateLimiter>,
     Json(body): Json<CreateRendezvous>,
-) -> Result<(StatusCode, Json<CreatedRendezvous>), Refusal> {
-    check_user_budget(&limiter, auth.0, "device_rendezvous").await?;
-    require_paid(&pool, auth.0).await?;
+) -> Result<(StatusCode, Json<CreatedRendezvous>), Response> {
+    check_user_budget(&limiter, auth.0, "device_rendezvous")
+        .await
+        .map_err(IntoResponse::into_response)?;
+    crate::entitlement::require_paid(&pool, auth.0).await?;
     let offer = decode_sealed(&body.offer)?;
 
-    let target_known = body.to_device != body.from_device
-        && sqlx::query_scalar::<_, i32>(
-            "SELECT 1 FROM sync_blobs WHERE user_id = $1 AND device_id = $2",
+    let both_known = body.to_device != body.from_device
+        && sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM sync_blobs WHERE user_id = $1 AND device_id = ANY($2)",
         )
         .bind(auth.0)
-        .bind(&body.to_device)
-        .fetch_optional(&pool)
+        .bind(vec![body.from_device.clone(), body.to_device.clone()])
+        .fetch_one(&pool)
         .await
-        .map_err(Refusal::from)?
-        .is_some();
-    if !target_known {
-        return Err(Refusal(StatusCode::NOT_FOUND, Some("DEVICE_NOT_FOUND")));
+        .map_err(internal)?
+            == 2;
+    if !both_known {
+        return Err(coded_error(StatusCode::NOT_FOUND, "DEVICE_NOT_FOUND"));
     }
 
     let (id, expires_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
@@ -134,17 +112,52 @@ pub async fn create_rendezvous(
     .bind(LIFETIME_SECS as f64)
     .fetch_one(&pool)
     .await
-    .map_err(Refusal::from)?;
+    .map_err(internal)?;
 
     notifier.notify_device_rendezvous(auth.0, id, body.to_device);
     Ok((StatusCode::CREATED, Json(CreatedRendezvous { id, expires_at })))
+}
+
+#[derive(Deserialize)]
+pub struct PendingQuery {
+    pub to_device: String,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct PendingRendezvous {
+    pub id: Uuid,
+    pub from_device: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn list_pending(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(RendezvousRateLimiter(limiter)): Extension<RendezvousRateLimiter>,
+    axum::extract::Query(query): axum::extract::Query<PendingQuery>,
+) -> Result<Json<Vec<PendingRendezvous>>, Response> {
+    check_user_budget(&limiter, auth.0, "device_rendezvous")
+        .await
+        .map_err(IntoResponse::into_response)?;
+    crate::entitlement::require_paid(&pool, auth.0).await?;
+    let rows = sqlx::query_as::<_, PendingRendezvous>(
+        "SELECT id, from_device, expires_at FROM device_rendezvous \
+         WHERE user_id = $1 AND to_device = $2 AND answer IS NULL AND expires_at > now() \
+         ORDER BY created_at",
+    )
+    .bind(auth.0)
+    .bind(&query.to_device)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
 }
 
 pub async fn get_rendezvous(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
     Path(id): Path<Uuid>,
-) -> Result<Json<RendezvousView>, Refusal> {
+) -> Result<Json<RendezvousView>, Response> {
     let row: Option<RendezvousRow> = sqlx::query_as(
         "SELECT from_device, to_device, offer, answer, expires_at FROM device_rendezvous \
          WHERE id = $1 AND user_id = $2 AND expires_at > now()",
@@ -153,8 +166,8 @@ pub async fn get_rendezvous(
     .bind(auth.0)
     .fetch_optional(&pool)
     .await
-    .map_err(Refusal::from)?;
-    let row = row.ok_or(StatusCode::NOT_FOUND)?;
+    .map_err(internal)?;
+    let row = row.ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
     Ok(Json(RendezvousView {
         from_device: row.from_device,
         to_device: row.to_device,
@@ -170,8 +183,8 @@ pub async fn answer_rendezvous(
     Extension(notifier): Extension<SyncNotifier>,
     Path(id): Path<Uuid>,
     Json(body): Json<AnswerRendezvous>,
-) -> Result<StatusCode, Refusal> {
-    require_paid(&pool, auth.0).await?;
+) -> Result<StatusCode, Response> {
+    crate::entitlement::require_paid(&pool, auth.0).await?;
     let answer = decode_sealed(&body.answer)?;
 
     let updated = sqlx::query(
@@ -183,7 +196,7 @@ pub async fn answer_rendezvous(
     .bind(&answer)
     .execute(&pool)
     .await
-    .map_err(Refusal::from)?;
+    .map_err(internal)?;
 
     if updated.rows_affected() == 0 {
         let live: Option<i32> = sqlx::query_scalar(
@@ -193,8 +206,8 @@ pub async fn answer_rendezvous(
         .bind(auth.0)
         .fetch_optional(&pool)
         .await
-        .map_err(Refusal::from)?;
-        return Err(if live.is_some() { StatusCode::CONFLICT } else { StatusCode::NOT_FOUND }.into());
+        .map_err(internal)?;
+        return Err(if live.is_some() { StatusCode::CONFLICT } else { StatusCode::NOT_FOUND }.into_response());
     }
 
     notifier.notify_device_rendezvous_answer(auth.0, id);
@@ -216,7 +229,6 @@ pub async fn sweep_expired(pool: &PgPool) {
 mod tests {
     use super::*;
     use crate::rate_limit::RateLimiter;
-    use crate::sync_notifier::SyncEvent;
     use crate::test_pool_or_skip;
     use crate::test_support::{seed_user, set_user_tier};
     use std::time::Duration;
@@ -258,7 +270,7 @@ mod tests {
         user: Uuid,
         notifier: &SyncNotifier,
         b: Json<CreateRendezvous>,
-    ) -> Result<(StatusCode, Json<CreatedRendezvous>), Refusal> {
+    ) -> Result<(StatusCode, Json<CreatedRendezvous>), Response> {
         create_rendezvous(
             State(pool.clone()),
             Extension(AuthUser(user)),
@@ -269,8 +281,8 @@ mod tests {
         .await
     }
 
-    fn status_of<T>(r: Result<T, Refusal>) -> StatusCode {
-        r.err().expect("expected refusal").0
+    fn status_of<T>(r: Result<T, Response>) -> StatusCode {
+        r.err().expect("expected refusal").status()
     }
 
     async fn answer(
@@ -279,7 +291,7 @@ mod tests {
         notifier: &SyncNotifier,
         id: Uuid,
         bytes: &[u8],
-    ) -> Result<StatusCode, Refusal> {
+    ) -> Result<StatusCode, Response> {
         answer_rendezvous(
             State(pool.clone()),
             Extension(AuthUser(user)),
@@ -333,8 +345,8 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(err.into_response().into_body(), 1024).await.unwrap();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
         assert_eq!(&bytes[..], br#"{"error":"DEVICE_NOT_FOUND"}"#);
 
         let same = create(&pool, user, &notifier, body("laptop", "laptop", b"x")).await;
@@ -479,6 +491,7 @@ mod tests {
     async fn sse_event_reaches_only_owner() {
         let pool = test_pool_or_skip!();
         let user = paid_user_with_devices(&pool).await;
+        let stranger = Uuid::new_v4();
         let notifier = SyncNotifier::new();
         let mut rx = notifier.subscribe();
 
@@ -486,23 +499,81 @@ mod tests {
             create(&pool, user, &notifier, body("laptop", "phone", b"x")).await.unwrap();
         answer(&pool, user, &notifier, c.id, b"a").await.unwrap();
 
-        let stranger = Uuid::new_v4();
-        let mut seen = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            seen.push(ev);
-        }
-        assert_eq!(seen.len(), 2);
-        for ev in &seen {
-            match ev {
-                SyncEvent::DeviceRendezvous { user_id, rendezvous_id, to_device } => {
-                    assert_eq!((*user_id, *rendezvous_id, to_device.as_str()), (user, c.id, "phone"));
-                    assert_ne!(*user_id, stranger);
-                }
-                SyncEvent::DeviceRendezvousAnswer { user_id, rendezvous_id } => {
-                    assert_eq!((*user_id, *rendezvous_id), (user, c.id));
-                }
-                other => panic!("unexpected event {other:?}"),
-            }
-        }
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        assert_eq!(
+            crate::routes::sync::event_data(&first, user),
+            Some(format!("device_rendezvous:{}:phone", c.id))
+        );
+        assert_eq!(
+            crate::routes::sync::event_data(&second, user),
+            Some(format!("device_rendezvous_answer:{}", c.id))
+        );
+        assert_eq!(crate::routes::sync::event_data(&first, stranger), None);
+        assert_eq!(crate::routes::sync::event_data(&second, stranger), None);
+    }
+
+    #[tokio::test]
+    async fn create_requires_both_devices_on_the_account() {
+        let pool = test_pool_or_skip!();
+        let user = paid_user_with_devices(&pool).await;
+        let notifier = SyncNotifier::new();
+        let r = create(&pool, user, &notifier, body("ghost", "phone", b"x")).await;
+        assert_eq!(status_of(r), StatusCode::NOT_FOUND);
+    }
+
+    async fn pending(pool: &PgPool, user: Uuid, to: &str, lim: usize) -> Result<Vec<PendingRendezvous>, Response> {
+        list_pending(
+            State(pool.clone()),
+            Extension(AuthUser(user)),
+            limiter(lim),
+            axum::extract::Query(PendingQuery { to_device: to.into() }),
+        )
+        .await
+        .map(|Json(v)| v)
+    }
+
+    #[tokio::test]
+    async fn pending_lists_unanswered_for_the_target_device_only() {
+        let pool = test_pool_or_skip!();
+        let user = paid_user_with_devices(&pool).await;
+        let other = paid_user_with_devices(&pool).await;
+        let notifier = SyncNotifier::new();
+
+        let (_, Json(open)) = create(&pool, user, &notifier, body("laptop", "phone", b"x")).await.unwrap();
+        let (_, Json(done)) = create(&pool, user, &notifier, body("laptop", "phone", b"x")).await.unwrap();
+        answer(&pool, user, &notifier, done.id, b"a").await.unwrap();
+        let (_, Json(expired)) = create(&pool, user, &notifier, body("laptop", "phone", b"x")).await.unwrap();
+        sqlx::query("UPDATE device_rendezvous SET expires_at = now() - interval '1 second' WHERE id = $1")
+            .bind(expired.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = create(&pool, user, &notifier, body("phone", "laptop", b"x")).await.unwrap();
+
+        let got = pending(&pool, user, "phone", 100).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].id, got[0].from_device.as_str()), (open.id, "laptop"));
+
+        assert!(pending(&pool, other, "phone", 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_is_paid_gated_and_rate_limited() {
+        let pool = test_pool_or_skip!();
+        let free = seed_user(&pool).await;
+        assert_eq!(status_of(pending(&pool, free, "phone", 100).await), StatusCode::PAYMENT_REQUIRED);
+        let paid = paid_user_with_devices(&pool).await;
+        let lim = limiter(1);
+        let call = || {
+            list_pending(
+                State(pool.clone()),
+                Extension(AuthUser(paid)),
+                lim.clone(),
+                axum::extract::Query(PendingQuery { to_device: "phone".into() }),
+            )
+        };
+        assert!(call().await.is_ok());
+        assert_eq!(status_of(call().await), StatusCode::TOO_MANY_REQUESTS);
     }
 }

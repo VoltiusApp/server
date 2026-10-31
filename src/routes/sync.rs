@@ -263,6 +263,45 @@ impl Drop for PresenceGuard {
     }
 }
 
+pub(crate) fn event_data(ev: &SyncEvent, user_id: Uuid) -> Option<String> {
+    match ev {
+        SyncEvent::BlobPushed { user_id: uid, device_id } if *uid == user_id => {
+            Some(device_id.clone())
+        }
+        SyncEvent::MembershipChanged { user_id: uid, team_id, added } if *uid == user_id => {
+            let kind = if *added { "added" } else { "removed" };
+            Some(format!("membership_changed:{}:{}", kind, team_id))
+        }
+        SyncEvent::VaultKeyChanged { user_id: uid } if *uid == user_id => {
+            Some("vault_key_changed".into())
+        }
+        SyncEvent::PlanChanged { user_id: uid } if *uid == user_id => Some("plan_changed".into()),
+        SyncEvent::PresenceChanged { recipient, subject, online } if *recipient == user_id => {
+            let status = if *online { "online" } else { "offline" };
+            Some(format!("presence:{}:{}", subject, status))
+        }
+        SyncEvent::ConnectionUsageChanged { recipient, subject, connection_id, in_use }
+            if *recipient == user_id =>
+        {
+            let flag = if *in_use { 1 } else { 0 };
+            Some(format!("using:{}:{}:{}", subject, connection_id, flag))
+        }
+        SyncEvent::SessionShared { recipient, session_id, host_user_id } if *recipient == user_id => {
+            Some(format!("session_shared:{}:{}", session_id, host_user_id))
+        }
+        SyncEvent::SessionEnded { recipient, session_id } if *recipient == user_id => {
+            Some(format!("session_ended:{}", session_id))
+        }
+        SyncEvent::DeviceRendezvous { user_id: uid, rendezvous_id, to_device } if *uid == user_id => {
+            Some(format!("device_rendezvous:{}:{}", rendezvous_id, to_device))
+        }
+        SyncEvent::DeviceRendezvousAnswer { user_id: uid, rendezvous_id } if *uid == user_id => {
+            Some(format!("device_rendezvous_answer:{}", rendezvous_id))
+        }
+        _ => None,
+    }
+}
+
 /// Long-lived SSE connection. Sends the pusher's device_id whenever another
 /// device uploads a blob for this account. The client ignores events where
 /// the device_id matches its own (preventing push→event→push loops).
@@ -296,45 +335,7 @@ pub async fn sync_stream(
     let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         let _guard = &guard;
         match msg {
-            Ok(SyncEvent::BlobPushed { user_id: uid, device_id }) if uid == user_id => {
-                Some(Ok(Event::default().data(device_id)))
-            }
-            Ok(SyncEvent::MembershipChanged { user_id: uid, team_id, added }) if uid == user_id => {
-                let kind = if added { "added" } else { "removed" };
-                Some(Ok(Event::default().data(format!("membership_changed:{}:{}", kind, team_id))))
-            }
-            Ok(SyncEvent::VaultKeyChanged { user_id: uid }) if uid == user_id => {
-                Some(Ok(Event::default().data("vault_key_changed")))
-            }
-            Ok(SyncEvent::PlanChanged { user_id: uid }) if uid == user_id => {
-                Some(Ok(Event::default().data("plan_changed")))
-            }
-            Ok(SyncEvent::PresenceChanged { recipient, subject, online }) if recipient == user_id => {
-                let status = if online { "online" } else { "offline" };
-                Some(Ok(Event::default().data(format!("presence:{}:{}", subject, status))))
-            }
-            Ok(SyncEvent::ConnectionUsageChanged { recipient, subject, connection_id, in_use })
-                if recipient == user_id =>
-            {
-                let flag = if in_use { 1 } else { 0 };
-                Some(Ok(Event::default().data(format!(
-                    "using:{}:{}:{}",
-                    subject, connection_id, flag
-                ))))
-            }
-            Ok(SyncEvent::SessionShared { recipient, session_id, host_user_id }) if recipient == user_id => {
-                Some(Ok(Event::default().data(format!("session_shared:{}:{}", session_id, host_user_id))))
-            }
-            Ok(SyncEvent::SessionEnded { recipient, session_id }) if recipient == user_id => {
-                Some(Ok(Event::default().data(format!("session_ended:{}", session_id))))
-            }
-            Ok(SyncEvent::DeviceRendezvous { user_id: uid, rendezvous_id, to_device }) if uid == user_id => {
-                Some(Ok(Event::default().data(format!("device_rendezvous:{}:{}", rendezvous_id, to_device))))
-            }
-            Ok(SyncEvent::DeviceRendezvousAnswer { user_id: uid, rendezvous_id }) if uid == user_id => {
-                Some(Ok(Event::default().data(format!("device_rendezvous_answer:{}", rendezvous_id))))
-            }
-            Ok(_) => None,
+            Ok(ev) => event_data(&ev, user_id).map(|d| Ok(Event::default().data(d))),
             // Lagged: we missed some events, tell the client to sync anyway
             Err(_) => Some(Ok(Event::default().data("sync"))),
         }

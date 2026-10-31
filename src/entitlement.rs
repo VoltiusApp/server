@@ -138,6 +138,16 @@ pub async fn benefit_tier_for_user(pool: &PgPool, user_id: Uuid) -> String {
     }
 }
 
+/// 402 unless the user's benefit tier (own plan or seat) is paid.
+#[allow(clippy::result_large_err)]
+pub async fn require_paid(pool: &PgPool, user_id: Uuid) -> Result<(), axum::response::Response> {
+    use axum::response::IntoResponse;
+    if benefit_tier_for_user(pool, user_id).await == "free" {
+        return Err(axum::http::StatusCode::PAYMENT_REQUIRED.into_response());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

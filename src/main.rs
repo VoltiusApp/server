@@ -438,7 +438,10 @@ async fn main() {
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
         .merge(
             Router::new()
-                .route("/v1/devices/rendezvous", post(routes::devices::create_rendezvous))
+                .route(
+                    "/v1/devices/rendezvous",
+                    post(routes::devices::create_rendezvous).get(routes::devices::list_pending),
+                )
                 .route("/v1/devices/rendezvous/:id", get(routes::devices::get_rendezvous))
                 .route(
                     "/v1/devices/rendezvous/:id/answer",
