@@ -13,6 +13,7 @@ mod object_authz;
 mod observability;
 mod permissions;
 mod rate_limit;
+mod relay;
 mod routes;
 mod self_host;
 mod single_instance;
@@ -443,6 +444,10 @@ async fn main() {
                 .route(
                     "/v1/devices/rendezvous",
                     post(routes::devices::create_rendezvous).get(routes::devices::list_pending),
+                )
+                .route(
+                    "/v1/devices/relay-credentials",
+                    post(routes::devices::relay_credentials),
                 )
                 .route("/v1/devices/rendezvous/:id", get(routes::devices::get_rendezvous))
                 .route(

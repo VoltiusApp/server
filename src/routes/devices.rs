@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use super::coded_error;
 use crate::auth::AuthUser;
-use crate::rate_limit::{check_user_budget, RendezvousRateLimiter};
+use crate::cloudflare::{CfConfig, IceServer};
+use crate::rate_limit::{check_user_budget, RateLimiter, RendezvousRateLimiter};
+use crate::relay::{self, RelayRefusal};
 use crate::sync_notifier::SyncNotifier;
 
 const MAX_SEALED_BYTES: usize = 8 * 1024;
@@ -59,6 +61,12 @@ fn internal(e: sqlx::Error) -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
+async fn rendezvous_budget(limiter: &RateLimiter<Uuid>, user: Uuid) -> Result<(), Response> {
+    check_user_budget(limiter, user, "device_rendezvous")
+        .await
+        .map_err(IntoResponse::into_response)
+}
+
 fn decode_sealed(encoded: &str) -> Result<Vec<u8>, Response> {
     if encoded.len() > MAX_SEALED_BYTES.div_ceil(3) * 4 {
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
@@ -80,9 +88,7 @@ pub async fn create_rendezvous(
     Extension(RendezvousRateLimiter(limiter)): Extension<RendezvousRateLimiter>,
     Json(body): Json<CreateRendezvous>,
 ) -> Result<(StatusCode, Json<CreatedRendezvous>), Response> {
-    check_user_budget(&limiter, auth.0, "device_rendezvous")
-        .await
-        .map_err(IntoResponse::into_response)?;
+    rendezvous_budget(&limiter, auth.0).await?;
     crate::entitlement::require_paid(&pool, auth.0).await?;
     let offer = decode_sealed(&body.offer)?;
 
@@ -136,9 +142,7 @@ pub async fn list_pending(
     Extension(RendezvousRateLimiter(limiter)): Extension<RendezvousRateLimiter>,
     axum::extract::Query(query): axum::extract::Query<PendingQuery>,
 ) -> Result<Json<Vec<PendingRendezvous>>, Response> {
-    check_user_budget(&limiter, auth.0, "device_rendezvous")
-        .await
-        .map_err(IntoResponse::into_response)?;
+    rendezvous_budget(&limiter, auth.0).await?;
     crate::entitlement::require_paid(&pool, auth.0).await?;
     let rows = sqlx::query_as::<_, PendingRendezvous>(
         "SELECT id, from_device, expires_at FROM device_rendezvous \
@@ -212,6 +216,33 @@ pub async fn answer_rendezvous(
 
     notifier.notify_device_rendezvous_answer(auth.0, id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+pub struct RelayCredentials {
+    pub ice_servers: Vec<IceServer>,
+    pub expires_at: i64,
+}
+
+pub async fn relay_credentials(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(RendezvousRateLimiter(limiter)): Extension<RendezvousRateLimiter>,
+) -> Result<Json<RelayCredentials>, Response> {
+    rendezvous_budget(&limiter, auth.0).await?;
+    let cf = CfConfig::from_env();
+    let issued = Utc::now();
+    match relay::mint(&pool, cf.as_ref(), auth.0).await {
+        Ok(ice) => Ok(Json(RelayCredentials {
+            ice_servers: ice.ice_servers,
+            expires_at: relay::expiry_from(issued).timestamp(),
+        })),
+        Err(RelayRefusal::NotPaid) => Err(StatusCode::PAYMENT_REQUIRED.into_response()),
+        Err(RelayRefusal::Limit) => Err(coded_error(StatusCode::TOO_MANY_REQUESTS, "RELAY_LIMIT")),
+        Err(RelayRefusal::Unavailable) => {
+            Err(coded_error(StatusCode::SERVICE_UNAVAILABLE, "RELAY_UNAVAILABLE"))
+        }
+    }
 }
 
 pub async fn sweep_expired(pool: &PgPool) {
@@ -575,5 +606,49 @@ mod tests {
         };
         assert!(call().await.is_ok());
         assert_eq!(status_of(call().await), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    async fn relay_status(pool: &PgPool, user: Uuid) -> StatusCode {
+        match relay_credentials(State(pool.clone()), Extension(AuthUser(user)), limiter(100)).await {
+            Ok(_) => StatusCode::OK,
+            Err(r) => r.status(),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_credentials_status_mapping() {
+        let pool = test_pool_or_skip!();
+        let h = crate::relay::tests::harness(&pool).await;
+        std::env::set_var("CF_ACCOUNT_ID", "acct");
+        std::env::set_var("CF_TURN_KEY_ID", "key1");
+        std::env::set_var("CF_TURN_KEY_TOKEN", "t");
+        std::env::set_var("CF_ANALYTICS_TOKEN", "a");
+        let free = seed_user(&pool).await;
+        let pro = seed_user(&pool).await;
+        set_user_tier(&pool, pro, "pro").await;
+
+        crate::relay::tests::set_budget(&pool, false, 0).await;
+        assert_eq!(relay_status(&pool, free).await, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(relay_status(&pool, pro).await, StatusCode::OK);
+
+        let Json(out) = relay_credentials(State(pool.clone()), Extension(AuthUser(pro)), limiter(100))
+            .await
+            .unwrap();
+        assert!(out.expires_at > Utc::now().timestamp() + 3000);
+        assert_eq!(out.ice_servers.len(), 2);
+
+        crate::relay::tests::set_usage(&pool, pro, 0, 25_000_000_000).await;
+        let err = relay_credentials(State(pool.clone()), Extension(AuthUser(pro)), limiter(100))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"RELAY_LIMIT"}"#);
+
+        crate::relay::tests::set_budget(&pool, true, 0).await;
+        crate::relay::tests::set_usage(&pool, pro, 0, 0).await;
+        assert_eq!(relay_status(&pool, pro).await, StatusCode::SERVICE_UNAVAILABLE);
+        drop(h);
     }
 }
