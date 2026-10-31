@@ -28,10 +28,23 @@ use crate::two_factor::{self, Refusal, SecondFactorProof, SeedCipher};
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeatTeam {
+    pub id: Uuid,
+    pub name: String,
+    pub trial: bool,
+}
+
+impl SeatTeam {
+    fn claim(&self) -> SeatTeamClaim {
+        SeatTeamClaim { id: self.id, trial: self.trial }
+    }
+}
+
 struct TierInfo {
     tier: String,
     billing_tier: String,
-    seat_team: Option<SeatTeamClaim>,
+    seat_team: Option<SeatTeam>,
     trial_ends_at: Option<i64>,
     trial_used: bool,
     is_admin: bool,
@@ -46,7 +59,7 @@ fn access_token_for(user_id: Uuid, tier: &TierInfo) -> Result<String, StatusCode
         PlanClaims {
             tier: tier.tier.clone(),
             billing_tier: tier.billing_tier.clone(),
-            seat_team: tier.seat_team.clone(),
+            seat_team: tier.seat_team.as_ref().map(SeatTeam::claim),
         },
         tier.trial_ends_at,
         tier.trial_used,
@@ -173,7 +186,7 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
     Ok(TierInfo {
         tier,
         billing_tier: own,
-        seat_team: seat.map(|s| SeatTeamClaim { id: s.team_id, name: s.team_name, trial: s.trial }),
+        seat_team: seat.map(|s| SeatTeam { id: s.team_id, name: s.team_name, trial: s.trial }),
         trial_ends_at: if downgraded { None } else { trial_ends_at.map(|t| t.timestamp()) },
         trial_used: trial_used || downgraded,
         is_admin,
@@ -251,7 +264,7 @@ pub struct AuthResponse {
     pub refresh_token: String,
     pub tier: String,
     pub billing_tier: String,
-    pub seat_team: Option<SeatTeamClaim>,
+    pub seat_team: Option<SeatTeam>,
     pub trial_ends_at: Option<i64>,
     pub wrapped_user_secrets: Option<String>,
 }
@@ -812,7 +825,7 @@ pub struct MeResponse {
     pub account_id: Uuid,
     pub tier: String,
     pub billing_tier: String,
-    pub seat_team: Option<SeatTeamClaim>,
+    pub seat_team: Option<SeatTeam>,
     pub trial_ends_at: Option<i64>,
     pub email_verified: bool,
     pub email_undeliverable: bool,
@@ -1276,7 +1289,7 @@ mod handler_tests {
         assert_eq!(resp.seat_team.as_ref().map(|s| s.id), Some(team));
         let claims = validate_token(&resp.jwt_token, "access").unwrap();
         assert_eq!(claims.tier, "teams");
-        assert_eq!(claims.seat_team, resp.seat_team);
+        assert_eq!(claims.seat_team, resp.seat_team.as_ref().map(SeatTeam::claim));
     }
 
     #[tokio::test]
@@ -1382,7 +1395,30 @@ mod handler_tests {
         let claims = validate_token(&token, "access").unwrap();
         assert_eq!(claims.tier, "teams");
         assert_eq!(claims.billing_tier(), "free");
-        assert_eq!(claims.seat_team, info.seat_team);
+        assert_eq!(claims.seat_team, info.seat_team.as_ref().map(SeatTeam::claim));
+    }
+
+    #[tokio::test]
+    async fn access_token_payload_carries_no_team_name() {
+        use base64::Engine;
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let member = seed_user(&pool).await;
+        seat_of(&pool, "teams", member).await;
+        sqlx::query("UPDATE teams SET name = 'Команда?' WHERE id IN (SELECT team_id FROM team_members WHERE user_id = $1)")
+            .bind(member)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let info = fetch_tier(&pool, member).await.unwrap();
+        assert_eq!(info.seat_team.as_ref().unwrap().name, "Команда?");
+        let token = access_token_for(member, &info).unwrap();
+        let payload = token.split('.').nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let seat = json.get("seat_team").and_then(|v| v.as_object()).expect("seat_team claim");
+        assert!(!seat.contains_key("name"));
+        assert!(!String::from_utf8(bytes).unwrap().contains("Команда"));
     }
 
     #[tokio::test]

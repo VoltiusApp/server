@@ -6,7 +6,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatTeamClaim {
     pub id: Uuid,
-    pub name: String,
     pub trial: bool,
 }
 
@@ -276,7 +275,7 @@ pub(crate) mod tests {
     fn seat_claims_round_trip() {
         let _guard = crate::test_support::env_lock();
         std::env::set_var("JWT_SECRET", "test-secret");
-        let seat = SeatTeamClaim { id: Uuid::new_v4(), name: "Acme".into(), trial: true };
+        let seat = SeatTeamClaim { id: Uuid::new_v4(), trial: true };
         let token =
             create_access_token(
                 Uuid::new_v4(),
