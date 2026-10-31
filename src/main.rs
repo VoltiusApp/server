@@ -1,4 +1,6 @@
 mod auth;
+#[allow(dead_code)]
+mod cloudflare;
 mod db;
 mod email;
 mod entitlement;
