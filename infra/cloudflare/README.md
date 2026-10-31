@@ -37,8 +37,13 @@ that manages buckets could run — and buys nothing until a second person or a C
 local backend does take a lockfile, so two runs on this host serialise; only cross-machine
 concurrency is unprotected, and there is one machine.
 
-The API token comes from the environment, but the TURN app (`turn.tf`) stores its bearer key in the
-state, so the file is a secret: keep it mode 600 — this host runs other containers.
+The API token comes from the environment. Keep the state mode 600 — this host runs other containers.
+
+The TURN key used for relayed device connections (`voltius-relay`) is not managed here: provider 5.25 neither
+captures its secret nor supports importing it. It was created once through the Calls API
+(`POST /accounts/{account}/calls/turn_keys`), which returns the secret a single time. The secret lives only in
+the server's env file as `CF_TURN_KEY_TOKEN`, with its id as `CF_TURN_KEY_ID`. To rotate, create a new key the
+same way, update both values, redeploy, then delete the old key.
 
 ## Do not delete imports.tf
 
