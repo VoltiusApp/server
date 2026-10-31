@@ -9,8 +9,9 @@ use serde_json::json;
 const DEFAULT_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const DEFAULT_RTC_BASE: &str = "https://rtc.live.cloudflare.com";
 const MAX_QUERY_WINDOW_DAYS: i64 = 31;
+const USAGE_GROUP_LIMIT: usize = 10000;
 
-const USAGE_QUERY: &str = "query($accountId: string!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $accountId}) { callsTurnUsageAdaptiveGroups(limit: 10000, filter: {datetime_geq: $from, datetime_leq: $to}) { dimensions { customIdentifier } sum { egressBytes } } } } }";
+const USAGE_QUERY: &str = "query($accountId: string!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $accountId}) { callsTurnUsageAdaptiveGroups(limit: 10000, filter: {datetime_geq: $from, datetime_lt: $to}) { dimensions { customIdentifier } sum { egressBytes } } } } }";
 
 #[derive(Clone)]
 pub struct CfConfig {
@@ -158,10 +159,11 @@ async fn revoke_credential_at(
     cfg: &CfConfig,
     username: &str,
 ) -> Result<(), CfError> {
-    let url = format!(
-        "{rtc_base}/v1/turn/keys/{}/credentials/{username}/revoke",
-        cfg.turn_key_id
-    );
+    let mut url = url::Url::parse(rtc_base).map_err(|e| CfError::Malformed(e.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| CfError::Malformed("base url cannot have path".into()))?
+        .pop_if_empty()
+        .extend(["v1", "turn", "keys", &cfg.turn_key_id, "credentials", username, "revoke"]);
     let resp = client()?
         .post(url)
         .bearer_auth(&cfg.turn_key_token)
@@ -251,6 +253,9 @@ async fn turn_usage_at(
             .data
             .and_then(|d| d.viewer.accounts.into_iter().next())
             .ok_or_else(|| CfError::Malformed("no account in response".into()))?;
+        if account.groups.len() >= USAGE_GROUP_LIMIT {
+            return Err(CfError::Malformed("usage truncated".into()));
+        }
         for g in account.groups {
             if let Some(id) = g.dimensions.custom_identifier {
                 *totals.entry(id).or_default() += g.sum.egress_bytes;
@@ -403,12 +408,43 @@ mod tests {
     #[tokio::test]
     async fn usage_splits_long_ranges_and_sums() {
         let (base, seen) = serve(200, usage_reply()).await;
-        let until = Utc::now();
-        let out = turn_usage_at(&base, &cfg(), until - ChronoDuration::days(70), until)
-            .await
-            .unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        let until = DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+        let since = until - ChronoDuration::days(70);
+        let out = turn_usage_at(&base, &cfg(), since, until).await.unwrap();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3);
+            let fmt = |d: DateTime<Utc>| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            assert_eq!(seen[0].2["variables"]["from"], fmt(since));
+            assert_eq!(seen[2].2["variables"]["to"], fmt(until));
+            for w in seen.windows(2) {
+                assert_eq!(w[0].2["variables"]["to"], w[1].2["variables"]["from"]);
+            }
+            assert!(seen[0].2["query"].as_str().unwrap().contains("datetime_lt: $to"));
+        }
         assert_eq!(out, vec![("a".to_string(), 300), ("b".to_string(), 21)]);
+    }
+
+    #[tokio::test]
+    async fn usage_errors_when_truncated_at_limit() {
+        let groups: Vec<Value> = (0..USAGE_GROUP_LIMIT)
+            .map(|i| json!({"dimensions": {"customIdentifier": format!("id{i}")}, "sum": {"egressBytes": 1}}))
+            .collect();
+        let reply = json!({"data": {"viewer": {"accounts": [{"callsTurnUsageAdaptiveGroups": groups}]}}, "errors": null});
+        let (base, _) = serve(200, reply).await;
+        let until = Utc::now();
+        assert!(matches!(
+            turn_usage_at(&base, &cfg(), until - ChronoDuration::days(1), until).await,
+            Err(CfError::Malformed(m)) if m == "usage truncated"
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoke_percent_encodes_username() {
+        let (base, seen) = serve(204, Value::Null).await;
+        revoke_credential_at(&base, &cfg(), "a/b?c#d").await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "/v1/turn/keys/key1/credentials/a%2Fb%3Fc%23d/revoke");
     }
 
     #[tokio::test]
