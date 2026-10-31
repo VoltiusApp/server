@@ -88,10 +88,7 @@ pub async fn create_team(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<CreateTeamRequest>,
 ) -> Result<(StatusCode, Json<TeamWithRole>), StatusCode> {
-    let name = body.name.trim();
-    if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let name = team_name(&body.name)?;
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -652,6 +649,14 @@ pub async fn remove_member(
 
 const MAX_TEAM_NAME_CHARS: usize = 100;
 
+fn team_name(raw: &str) -> Result<&str, StatusCode> {
+    let name = raw.trim();
+    if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(name)
+}
+
 #[derive(Deserialize)]
 pub struct RenameTeamRequest {
     pub name: String,
@@ -673,10 +678,7 @@ pub async fn rename_team(
     Json(body): Json<RenameTeamRequest>,
 ) -> Result<StatusCode, StatusCode> {
     require_vault_manager(&pool, team_id, auth.0).await?;
-    let name = body.name.trim();
-    if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let name = team_name(&body.name)?;
 
     sqlx::query("UPDATE teams SET name = $2 WHERE id = $1")
         .bind(team_id)

@@ -1418,6 +1418,7 @@ mod handler_tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let seat = json.get("seat_team").and_then(|v| v.as_object()).expect("seat_team claim");
         assert!(!seat.contains_key("name"));
+        assert!(!payload.contains(['-', '_']));
         assert!(!String::from_utf8(bytes).unwrap().contains("Команда"));
     }
 
