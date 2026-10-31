@@ -94,7 +94,6 @@ type SeatRow = (
     Option<String>,
 );
 
-#[allow(dead_code)]
 pub async fn seat_plan_for_user(pool: &PgPool, user_id: Uuid) -> Option<SeatPlan> {
     if crate::self_host::is_self_hosted() {
         return None;
@@ -129,13 +128,12 @@ pub async fn seat_plan_for_user(pool: &PgPool, user_id: Uuid) -> Option<SeatPlan
             team_id,
             team_name,
             trial: ls_status.as_deref() == Some("on_trial")
-                || (trial_ends_at.is_some() && ls_id.is_none()),
+                || (trial_ends_at.is_some() && ls_id.is_none() && !admin_override),
         });
     }
     best
 }
 
-#[allow(dead_code)]
 pub async fn benefit_tier_for_user(pool: &PgPool, user_id: Uuid) -> String {
     let own = effective_tier_for_user(pool, user_id).await;
     match seat_plan_for_user(pool, user_id).await {
@@ -294,6 +292,22 @@ mod tests {
         set_user_ls_status(&pool, owner2, "on_trial").await;
         team_of(&pool, owner2, &[member2]).await;
         assert!(seat_plan_for_user(&pool, member2).await.unwrap().trial);
+    }
+
+    #[tokio::test]
+    async fn seat_plan_comped_owner_is_not_a_trial() {
+        let pool = crate::test_pool_or_skip!();
+        let _mode = BillingMode::hosted();
+        let member = seed_user(&pool).await;
+        let owner = owner_with(&pool, "teams").await;
+        set_user_trial(&pool, owner, 5).await;
+        sqlx::query("UPDATE users SET admin_override = true WHERE id = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        team_of(&pool, owner, &[member]).await;
+        assert!(!seat_plan_for_user(&pool, member).await.unwrap().trial);
     }
 
     #[tokio::test]

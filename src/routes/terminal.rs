@@ -1928,6 +1928,8 @@ mod authz_tests {
             email_verified: true,
             ver: 0,
             jti: None,
+            billing_tier: None,
+            seat_team: None,
         })
     }
 
@@ -3849,7 +3851,7 @@ mod live_revoke_tests {
     }
 
     async fn try_connect_with(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid, query: &str) -> Option<Client> {
-        let token = crate::auth::jwt::create_access_token(user, "business", None, false, false, false, true).unwrap();
+        let token = crate::auth::jwt::create_access_token(user, crate::auth::jwt::PlanClaims::own("business"), None, false, false, false, true).unwrap();
         let url = format!("ws://{addr}/v1/terminal-sessions/{session_id}/ws?token={token}{query}");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         next_of_type(&mut ws, "participant_list").await.map(|_| ws)
