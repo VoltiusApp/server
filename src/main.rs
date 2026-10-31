@@ -56,6 +56,12 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, Tr
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
+// Merged routers keep the last one's fallback, layers included; without this an
+// unknown path would run whatever middleware the last merged router carries.
+async fn not_found() -> axum::http::StatusCode {
+    axum::http::StatusCode::NOT_FOUND
+}
+
 /// Downgrade lapsed trials to `free`: a non-free tier whose `trial_ends_at` has
 /// passed, with no paid subscription and no admin override, has consumed its
 /// trial and reverts. Paid accounts carry `trial_ends_at = NULL` and are never
@@ -821,6 +827,7 @@ async fn main() {
         .route("/health", get(routes::health::health))
         .route("/health/deep", get(routes::health::health_deep))
         .route("/v1/meta", get(routes::meta::get_meta))
+        .fallback(not_found)
         .layer(Extension(features))
         .layer({
             let allow_origin = match std::env::var("CORS_ORIGINS") {
@@ -870,5 +877,42 @@ async fn main() {
     .await
     {
         tracing::error!(%error, "Server exited with an error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{env_lock, EnvLockGuard};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn status(app: Router, uri: &str) -> StatusCode {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn unknown_route_is_404_when_admin_gated_router_is_merged_last() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::remove_var("ADMIN_SECRET");
+        let admin_gated = Router::new()
+            .route("/metrics", get(|| async { "ok" }))
+            .layer(middleware::from_fn(auth::require_admin_key));
+        let app = Router::new()
+            .merge(admin_gated)
+            .route("/health", get(|| async { "ok" }))
+            .fallback(not_found);
+
+        assert_eq!(status(app.clone(), "/").await, StatusCode::NOT_FOUND);
+        assert_eq!(status(app.clone(), "/nope").await, StatusCode::NOT_FOUND);
+        assert_eq!(status(app.clone(), "/health").await, StatusCode::OK);
+        assert_eq!(
+            status(app, "/metrics").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
