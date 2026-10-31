@@ -11,7 +11,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{
-    jwt::{create_access_token, create_pending_token, create_refresh_token, validate_token, PENDING_SECOND_FACTOR},
+    jwt::{
+        create_access_token, create_pending_token, create_refresh_token, validate_token, PlanClaims,
+        SeatTeamClaim, PENDING_SECOND_FACTOR,
+    },
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
@@ -25,8 +28,23 @@ use crate::two_factor::{self, Refusal, SecondFactorProof, SeedCipher};
 
 // ─── Tier helper ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeatTeam {
+    pub id: Uuid,
+    pub name: String,
+    pub trial: bool,
+}
+
+impl SeatTeam {
+    fn claim(&self) -> SeatTeamClaim {
+        SeatTeamClaim { id: self.id, trial: self.trial }
+    }
+}
+
 struct TierInfo {
     tier: String,
+    billing_tier: String,
+    seat_team: Option<SeatTeam>,
     trial_ends_at: Option<i64>,
     trial_used: bool,
     is_admin: bool,
@@ -38,7 +56,11 @@ struct TierInfo {
 fn access_token_for(user_id: Uuid, tier: &TierInfo) -> Result<String, StatusCode> {
     create_access_token(
         user_id,
-        &tier.tier,
+        PlanClaims {
+            tier: tier.tier.clone(),
+            billing_tier: tier.billing_tier.clone(),
+            seat_team: tier.seat_team.as_ref().map(SeatTeam::claim),
+        },
         tier.trial_ends_at,
         tier.trial_used,
         tier.is_admin,
@@ -82,6 +104,8 @@ fn auth_response(
         jwt_token,
         refresh_token,
         tier: tier.tier,
+        billing_tier: tier.billing_tier,
+        seat_team: tier.seat_team,
         trial_ends_at: tier.trial_ends_at,
         wrapped_user_secrets,
     })
@@ -152,8 +176,17 @@ async fn fetch_tier(pool: &PgPool, user_id: Uuid) -> Result<TierInfo, StatusCode
     // An expired trial has been consumed and no longer has a live countdown.
     let downgraded = effective != stored_tier;
 
+    let own = effective.to_string();
+    let seat = crate::entitlement::seat_upgrade(
+        &own,
+        crate::entitlement::seat_plan_for_user(pool, user_id).await,
+    );
+    let tier = seat.as_ref().map_or_else(|| own.clone(), |s| s.tier.clone());
+
     Ok(TierInfo {
-        tier: effective.to_string(),
+        tier,
+        billing_tier: own,
+        seat_team: seat.map(|s| SeatTeam { id: s.team_id, name: s.team_name, trial: s.trial }),
         trial_ends_at: if downgraded { None } else { trial_ends_at.map(|t| t.timestamp()) },
         trial_used: trial_used || downgraded,
         is_admin,
@@ -230,6 +263,8 @@ pub struct AuthResponse {
     pub jwt_token: String,
     pub refresh_token: String,
     pub tier: String,
+    pub billing_tier: String,
+    pub seat_team: Option<SeatTeam>,
     pub trial_ends_at: Option<i64>,
     pub wrapped_user_secrets: Option<String>,
 }
@@ -384,7 +419,7 @@ async fn register_with(
         }
     }
 
-    let email_verified = if !delivery_configured {
+    if !delivery_configured {
         sqlx::query(
             "UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1",
         )
@@ -395,7 +430,6 @@ async fn register_with(
             error!(error = %e, user_id = %user_id, "Failed to auto-verify user email");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        true
     } else {
         let mut conn = pool.acquire().await.map_err(|e| {
             error!(error = %e, "Failed to acquire connection for verification token");
@@ -406,8 +440,7 @@ async fn register_with(
         if let Err(e) = send_verification_email(&email, &token).await {
             error!(error = %e, user_id = %user_id, "Failed to send verification email");
         }
-        false
-    };
+    }
 
     let pending = sqlx::query_as::<_, PendingInvitation>(&format!(
         "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
@@ -426,20 +459,7 @@ async fn register_with(
         }
     }
 
-    let trial_ends_ts = trial_ends_at.map(|t| t.timestamp());
-    let session = auth_response(
-        user_id,
-        TierInfo {
-            tier: initial_tier.to_string(),
-            trial_ends_at: trial_ends_ts,
-            trial_used: false,
-            is_admin: false,
-            is_banned: false,
-            email_verified,
-            token_version: 0,
-        },
-        body.wrapped_user_secrets,
-    )?;
+    let session = auth_response(user_id, fetch_tier(&pool, user_id).await?, body.wrapped_user_secrets)?;
 
     // `account_id` is deliberately absent: despite the name it is the KDF salt
     // passed to derive_keys, so a log line carrying it hands anyone who can read
@@ -804,6 +824,8 @@ pub struct MeResponse {
     pub display_name: String,
     pub account_id: Uuid,
     pub tier: String,
+    pub billing_tier: String,
+    pub seat_team: Option<SeatTeam>,
     pub trial_ends_at: Option<i64>,
     pub email_verified: bool,
     pub email_undeliverable: bool,
@@ -838,6 +860,8 @@ pub(crate) async fn fetch_me_inner(
         display_name: row.1,
         account_id: row.2,
         tier: tier.tier,
+        billing_tier: tier.billing_tier,
+        seat_team: tier.seat_team,
         trial_ends_at: tier.trial_ends_at,
         email_verified: tier.email_verified,
         email_undeliverable: row.7,
@@ -1031,7 +1055,9 @@ mod handler_tests {
     use super::*;
     use crate::auth::jwt::validate_token;
     use crate::test_pool_or_skip;
-    use crate::test_support::{seed_user_with_credentials, set_user_tier, set_user_trial};
+    use crate::test_support::{
+        add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial,
+    };
     use axum::extract::State;
     use axum::Extension;
 
@@ -1238,6 +1264,35 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn register_with_pending_invitation_issues_seat_token() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        crate::test_support::seed_invitation(&pool, team, &email, "member", None).await;
+
+        let (_, Json(resp)) = register_with(
+            pool.clone(),
+            &SyncNotifier::new(),
+            Features::open(),
+            true,
+            register_req(&email, Uuid::new_v4(), None),
+        )
+        .await
+        .expect("register ok");
+
+        assert_eq!(resp.tier, "teams");
+        assert_eq!(resp.billing_tier, "pro");
+        assert_eq!(resp.seat_team.as_ref().map(|s| s.id), Some(team));
+        let claims = validate_token(&resp.jwt_token, "access").unwrap();
+        assert_eq!(claims.tier, "teams");
+        assert_eq!(claims.seat_team, resp.seat_team.as_ref().map(SeatTeam::claim));
+    }
+
+    #[tokio::test]
     async fn register_duplicate_email_conflicts() {
         let _env = EnvGuard::new(true);
         let pool = test_pool_or_skip!();
@@ -1313,6 +1368,71 @@ mod handler_tests {
             }
         }
         assert!(owner_told, "the inviter's roster must hear about the sign-up");
+    }
+
+    async fn seat_of(pool: &PgPool, owner_tier: &str, member: Uuid) {
+        let owner = seed_user(pool).await;
+        set_user_tier(pool, owner, owner_tier).await;
+        let team = seed_team(pool, owner).await;
+        add_member(pool, team, owner).await;
+        add_member(pool, team, member).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_tier_grants_seat_plan() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let member = seed_user(&pool).await;
+        seat_of(&pool, "teams", member).await;
+        let info = fetch_tier(&pool, member).await.unwrap();
+        assert_eq!(info.tier, "teams");
+        assert_eq!(info.billing_tier, "free");
+        let seat = info.seat_team.clone().unwrap();
+        assert_eq!(seat.name, "test-team");
+        assert!(!seat.trial);
+
+        let token = access_token_for(member, &info).unwrap();
+        let claims = validate_token(&token, "access").unwrap();
+        assert_eq!(claims.tier, "teams");
+        assert_eq!(claims.billing_tier(), "free");
+        assert_eq!(claims.seat_team, info.seat_team.as_ref().map(SeatTeam::claim));
+    }
+
+    #[tokio::test]
+    async fn access_token_payload_carries_no_team_name() {
+        use base64::Engine;
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let member = seed_user(&pool).await;
+        seat_of(&pool, "teams", member).await;
+        sqlx::query("UPDATE teams SET name = 'Команда?' WHERE id IN (SELECT team_id FROM team_members WHERE user_id = $1)")
+            .bind(member)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let info = fetch_tier(&pool, member).await.unwrap();
+        assert_eq!(info.seat_team.as_ref().unwrap().name, "Команда?");
+        let token = access_token_for(member, &info).unwrap();
+        let payload = token.split('.').nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let seat = json.get("seat_team").and_then(|v| v.as_object()).expect("seat_team claim");
+        assert!(!seat.contains_key("name"));
+        assert!(!payload.contains(['-', '_']));
+        assert!(!String::from_utf8(bytes).unwrap().contains("Команда"));
+    }
+
+    #[tokio::test]
+    async fn fetch_tier_no_seat_team_when_own_plan_wins() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let member = seed_user(&pool).await;
+        set_user_tier(&pool, member, "business").await;
+        seat_of(&pool, "teams", member).await;
+        let info = fetch_tier(&pool, member).await.unwrap();
+        assert_eq!(info.tier, "business");
+        assert_eq!(info.billing_tier, "business");
+        assert!(info.seat_team.is_none());
     }
 
     // ── login: effective tier in the issued session ───────────────────────────

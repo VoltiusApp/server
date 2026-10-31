@@ -306,6 +306,9 @@ pub async fn sync_stream(
             Ok(SyncEvent::VaultKeyChanged { user_id: uid }) if uid == user_id => {
                 Some(Ok(Event::default().data("vault_key_changed")))
             }
+            Ok(SyncEvent::PlanChanged { user_id: uid }) if uid == user_id => {
+                Some(Ok(Event::default().data("plan_changed")))
+            }
             Ok(SyncEvent::PresenceChanged { recipient, subject, online }) if recipient == user_id => {
                 let status = if online { "online" } else { "offline" };
                 Some(Ok(Event::default().data(format!("presence:{}:{}", subject, status))))

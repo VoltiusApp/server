@@ -88,6 +88,7 @@ pub async fn create_team(
     axum::Extension(auth): axum::Extension<AuthUser>,
     Json(body): Json<CreateTeamRequest>,
 ) -> Result<(StatusCode, Json<TeamWithRole>), StatusCode> {
+    let name = team_name(&body.name)?;
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -96,7 +97,7 @@ pub async fn create_team(
     let team = sqlx::query_as::<_, Team>(
         "INSERT INTO teams (name, owner_id) VALUES ($1, $2) RETURNING id, name, owner_id, created_at",
     )
-    .bind(&body.name)
+    .bind(name)
     .bind(auth.0)
     .fetch_one(&mut *tx)
     .await
@@ -648,6 +649,14 @@ pub async fn remove_member(
 
 const MAX_TEAM_NAME_CHARS: usize = 100;
 
+fn team_name(raw: &str) -> Result<&str, StatusCode> {
+    let name = raw.trim();
+    if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(name)
+}
+
 #[derive(Deserialize)]
 pub struct RenameTeamRequest {
     pub name: String,
@@ -669,10 +678,7 @@ pub async fn rename_team(
     Json(body): Json<RenameTeamRequest>,
 ) -> Result<StatusCode, StatusCode> {
     require_vault_manager(&pool, team_id, auth.0).await?;
-    let name = body.name.trim();
-    if name.is_empty() || name.chars().count() > MAX_TEAM_NAME_CHARS {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let name = team_name(&body.name)?;
 
     sqlx::query("UPDATE teams SET name = $2 WHERE id = $1")
         .bind(team_id)
@@ -1908,6 +1914,23 @@ mod authz_tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_team_rejects_empty_and_overlong_names() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "business").await;
+        for name in [String::new(), "   ".to_string(), "x".repeat(MAX_TEAM_NAME_CHARS + 1)] {
+            let res = create_team(
+                State(pool.clone()),
+                Extension(AuthUser(owner)),
+                Json(CreateTeamRequest { name }),
+            )
+            .await;
+            assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
+        }
     }
 
     #[tokio::test]

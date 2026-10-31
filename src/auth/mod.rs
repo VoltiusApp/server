@@ -122,7 +122,7 @@ pub async fn require_teams(
 ) -> Result<Response, StatusCode> {
     let claims = req.extensions().get::<AuthClaims>().cloned();
     match claims {
-        Some(AuthClaims(c)) if c.is_teams_active() => Ok(next.run(req).await),
+        Some(AuthClaims(c)) if c.owns_teams_plan() => Ok(next.run(req).await),
         Some(_) => {
             warn!(path = %req.uri().path(), "Teams feature accessed by non-teams user");
             Err(StatusCode::PAYMENT_REQUIRED)
@@ -167,6 +167,8 @@ mod authz_tests {
             email_verified: true,
             ver: 0,
             jti: None,
+            billing_tier: None,
+            seat_team: None,
         }
     }
 
@@ -285,6 +287,35 @@ mod authz_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    async fn status_for(layer_teams: bool, c: Claims) -> StatusCode {
+        let route = Router::new().route("/x", get(ok_handler));
+        let app = if layer_teams { route.layer(from_fn(require_teams)) } else { route.layer(from_fn(require_pro)) };
+        let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AuthClaims(c));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    fn seat_only() -> Claims {
+        let mut c = claims("teams", false);
+        c.billing_tier = Some("free".to_string());
+        c
+    }
+
+    #[tokio::test]
+    async fn require_pro_accepts_seat_member() {
+        assert_eq!(status_for(false, seat_only()).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_teams_refuses_seat_only_member() {
+        assert_eq!(status_for(true, seat_only()).await, StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn require_teams_accepts_old_token_without_billing_tier() {
+        assert_eq!(status_for(true, claims("teams", false)).await, StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn require_pro_unauthorized_without_claims() {
         // No auth_middleware upstream → no AuthClaims in extensions → 401, not 402.
@@ -332,7 +363,7 @@ mod authz_tests {
     #[tokio::test]
     async fn require_teams_allows_teams_tier() {
         // Guards against a regression that drops the literal "teams" from the
-        // is_teams_active match and 402s real Teams (non-business) subscribers.
+        // owns_teams_plan match and 402s real Teams (non-business) subscribers.
         let app = Router::new()
             .route("/x", get(ok_handler))
             .layer(from_fn(require_teams));
@@ -407,7 +438,7 @@ mod authz_tests {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         let token =
-            jwt::create_access_token(Uuid::new_v4(), "pro", None, false, false, true, true).unwrap();
+            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, true, true).unwrap();
         let app = Router::new()
             .route("/x", get(ok_handler))
             .layer(from_fn(auth_middleware));
@@ -431,7 +462,7 @@ mod authz_tests {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         let token =
-            jwt::create_access_token(Uuid::new_v4(), "pro", None, false, false, false, true)
+            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, false, true)
                 .unwrap();
         let app = Router::new()
             .route("/x", get(ok_handler))

@@ -3,6 +3,25 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatTeamClaim {
+    pub id: Uuid,
+    pub trial: bool,
+}
+
+pub struct PlanClaims {
+    pub tier: String,
+    pub billing_tier: String,
+    pub seat_team: Option<SeatTeamClaim>,
+}
+
+impl PlanClaims {
+    #[cfg(test)]
+    pub fn own(tier: &str) -> Self {
+        Self { tier: tier.to_string(), billing_tier: tier.to_string(), seat_team: None }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid,
@@ -21,15 +40,24 @@ pub struct Claims {
     /// Tells apart two pending sign-ins issued to one account within the same second.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<Uuid>,
+    /// The user's own plan; `tier` may be raised by a team seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_team: Option<SeatTeamClaim>,
 }
 
 impl Claims {
-    pub fn is_pro_active(&self) -> bool {
-        self.tier != "free"
+    pub fn billing_tier(&self) -> &str {
+        self.billing_tier.as_deref().unwrap_or(&self.tier)
     }
 
-    pub fn is_teams_active(&self) -> bool {
-        matches!(self.tier.as_str(), "teams" | "business")
+    pub fn owns_teams_plan(&self) -> bool {
+        matches!(self.billing_tier(), "teams" | "business")
+    }
+
+    pub fn is_pro_active(&self) -> bool {
+        self.tier != "free"
     }
 }
 
@@ -41,7 +69,7 @@ fn secret() -> Vec<u8> {
 
 pub fn create_access_token(
     user_id: Uuid,
-    tier: &str,
+    plan: PlanClaims,
     trial_ends_at: Option<i64>,
     trial_used: bool,
     is_admin: bool,
@@ -54,7 +82,7 @@ pub fn create_access_token(
         iat: now.timestamp(),
         exp: (now + Duration::hours(1)).timestamp(),
         kind: "access".to_string(),
-        tier: tier.to_string(),
+        tier: plan.tier,
         trial_ends_at,
         trial_used,
         is_admin,
@@ -62,6 +90,8 @@ pub fn create_access_token(
         email_verified,
         ver: 0,
         jti: None,
+        billing_tier: Some(plan.billing_tier),
+        seat_team: plan.seat_team,
     };
     encode(
         &Header::default(),
@@ -94,6 +124,8 @@ fn bare_token(
         email_verified: false,
         ver: token_version,
         jti,
+        billing_tier: None,
+        seat_team: None,
     };
     encode(
         &Header::default(),
@@ -179,7 +211,7 @@ pub(crate) mod tests {
         std::env::set_var("JWT_SECRET", "test-secret");
         let user_id = Uuid::new_v4();
 
-        let token = create_access_token(user_id, "pro", None, false, false, false, true).unwrap();
+        let token = create_access_token(user_id, PlanClaims::own("pro"), None, false, false, false, true).unwrap();
         let claims = validate_token(&token, "access").unwrap();
 
         assert!(claims.email_verified);
@@ -228,5 +260,37 @@ pub(crate) mod tests {
         let token = create_refresh_token(Uuid::new_v4(), 7).unwrap();
 
         assert_eq!(validate_token(&token, "refresh").unwrap().ver, 7);
+    }
+
+    #[test]
+    fn old_token_without_seat_claims_falls_back_to_tier() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let claims = validate_token(&legacy_token(Uuid::new_v4(), "access", "test-secret"), "access").unwrap();
+        assert_eq!(claims.seat_team, None);
+        assert_eq!(claims.billing_tier(), "pro");
+    }
+
+    #[test]
+    fn seat_claims_round_trip() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let seat = SeatTeamClaim { id: Uuid::new_v4(), trial: true };
+        let token =
+            create_access_token(
+                Uuid::new_v4(),
+                PlanClaims { tier: "teams".into(), billing_tier: "free".into(), seat_team: Some(seat.clone()) },
+                None,
+                false,
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        let claims = validate_token(&token, "access").unwrap();
+        assert_eq!(claims.tier, "teams");
+        assert_eq!(claims.billing_tier(), "free");
+        assert_eq!(claims.seat_team, Some(seat));
+        assert!(!claims.owns_teams_plan());
     }
 }
