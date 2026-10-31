@@ -13,6 +13,7 @@ pub struct Features {
     pub registration: bool,
     pub team_invites: bool,
     pub handles_from_email: bool,
+    pub device_internet_files: bool,
 }
 
 impl Features {
@@ -21,12 +22,18 @@ impl Features {
             registration: env_flag("REGISTRATION_ENABLED", true),
             team_invites: env_flag("TEAM_INVITES_ENABLED", true),
             handles_from_email: env_flag("HANDLES_FROM_EMAIL", false),
+            device_internet_files: env_flag("DEVICE_INTERNET_FILES", true),
         }
     }
 
     #[cfg(test)]
     pub fn open() -> Self {
-        Self { registration: true, team_invites: true, handles_from_email: false }
+        Self {
+            registration: true,
+            team_invites: true,
+            handles_from_email: false,
+            device_internet_files: true,
+        }
     }
 }
 
@@ -46,10 +53,20 @@ fn parse_flag(value: Option<&str>, default: bool) -> Result<bool, String> {
 }
 
 async fn deny_unless(enabled: bool, code: &'static str, req: Request, next: Next) -> Response {
+    deny_unless_with(enabled, StatusCode::FORBIDDEN, code, req, next).await
+}
+
+async fn deny_unless_with(
+    enabled: bool,
+    status: StatusCode,
+    code: &'static str,
+    req: Request,
+    next: Next,
+) -> Response {
     if enabled {
         return next.run(req).await;
     }
-    (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": code }))).into_response()
+    (status, Json(serde_json::json!({ "error": code }))).into_response()
 }
 
 pub async fn require_registration(
@@ -74,6 +91,21 @@ pub async fn require_handle_self_service(
     next: Next,
 ) -> Response {
     deny_unless(!features.handles_from_email, "HANDLE_MANAGED", req, next).await
+}
+
+pub async fn require_device_internet_files(
+    Extension(features): Extension<Features>,
+    req: Request,
+    next: Next,
+) -> Response {
+    deny_unless_with(
+        features.device_internet_files,
+        StatusCode::NOT_FOUND,
+        "DEVICE_INTERNET_FILES_DISABLED",
+        req,
+        next,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -136,6 +168,16 @@ mod tests {
             call(Features { team_invites: false, ..all }).await,
             (StatusCode::OK, StatusCode::FORBIDDEN)
         );
+    }
+
+    #[tokio::test]
+    async fn device_internet_files_off_answers_404() {
+        let app = Router::new()
+            .route("/x", post(ok_handler))
+            .layer(from_fn(require_device_internet_files))
+            .layer(Extension(Features { device_internet_files: false, ..Features::open() }));
+        let resp = app.oneshot(Request::post("/x").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

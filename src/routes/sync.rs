@@ -328,6 +328,12 @@ pub async fn sync_stream(
             Ok(SyncEvent::SessionEnded { recipient, session_id }) if recipient == user_id => {
                 Some(Ok(Event::default().data(format!("session_ended:{}", session_id))))
             }
+            Ok(SyncEvent::DeviceRendezvous { user_id: uid, rendezvous_id, to_device }) if uid == user_id => {
+                Some(Ok(Event::default().data(format!("device_rendezvous:{}:{}", rendezvous_id, to_device))))
+            }
+            Ok(SyncEvent::DeviceRendezvousAnswer { user_id: uid, rendezvous_id }) if uid == user_id => {
+                Some(Ok(Event::default().data(format!("device_rendezvous_answer:{}", rendezvous_id))))
+            }
             Ok(_) => None,
             // Lagged: we missed some events, tell the client to sync anyway
             Err(_) => Some(Ok(Event::default().data("sync"))),

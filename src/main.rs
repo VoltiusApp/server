@@ -35,7 +35,7 @@ use axum::{
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
     GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
-    RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
+    RedeemRateLimiter, RegisterRateLimiter, RendezvousRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
@@ -191,6 +191,7 @@ async fn main() {
                 team_plan::reconcile_all_teams(&pool, &notifier).await;
                 vault_key_exposure::queue_exposed_key_rotations(&pool, &notifier, None).await;
                 terminal_manager.recheck_sessions(None).await;
+                routes::devices::sweep_expired(&pool).await;
             }
         });
     }
@@ -222,6 +223,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    let rendezvous_per_hour: usize = std::env::var("RENDEZVOUS_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
     let auth_per_minute: usize = std::env::var("AUTH_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -258,6 +263,10 @@ async fn main() {
         GrantMintRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
     let grant_redeem_limiter =
         GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
+    let rendezvous_limiter = RendezvousRateLimiter(RateLimiter::<uuid::Uuid>::new(
+        rendezvous_per_hour,
+        Duration::from_secs(3600),
+    ));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -278,6 +287,7 @@ async fn main() {
         registration = features.registration,
         team_invites = features.team_invites,
         handles_from_email = features.handles_from_email,
+        device_internet_files = features.device_internet_files,
         "Configured features"
     );
     let seed_cipher = two_factor::SeedCipher::from_env();
@@ -426,6 +436,16 @@ async fn main() {
         )
         .route("/v1/sync/devices", get(routes::sync::list_devices))
         .route("/v1/sync/stream", get(routes::sync::sync_stream))
+        .merge(
+            Router::new()
+                .route("/v1/devices/rendezvous", post(routes::devices::create_rendezvous))
+                .route("/v1/devices/rendezvous/:id", get(routes::devices::get_rendezvous))
+                .route(
+                    "/v1/devices/rendezvous/:id/answer",
+                    post(routes::devices::answer_rendezvous),
+                )
+                .layer(middleware::from_fn(features::require_device_internet_files)),
+        )
         .route(
             "/v1/presence/connection-usage",
             get(routes::presence::get_connection_usage),
@@ -734,6 +754,7 @@ async fn main() {
         .layer(Extension(redeem_limiter))
         .layer(Extension(grant_mint_limiter))
         .layer(Extension(grant_redeem_limiter))
+        .layer(Extension(rendezvous_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

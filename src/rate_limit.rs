@@ -216,6 +216,10 @@ pub struct GrantMintRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct GrantRedeemRateLimiter(pub RateLimiter<Uuid>);
 
+/// Device rendezvous creations per user.
+#[derive(Clone)]
+pub struct RendezvousRateLimiter(pub RateLimiter<Uuid>);
+
 /// Register endpoint: N registrations/day per IP.
 pub async fn register_rate_limit(
     axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,
