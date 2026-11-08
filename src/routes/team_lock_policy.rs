@@ -15,7 +15,7 @@ use crate::routes::teams::{notify_team_members_changed, require_vault_manager};
 use crate::sync_notifier::SyncNotifier;
 use crate::team_plan::require_granular;
 
-const LOCK_MINUTES: [i32; 6] = [0, 5, 15, 30, 60, 240];
+pub const LOCK_MINUTES: [i32; 6] = [0, 5, 15, 30, 60, 240];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockPolicy {

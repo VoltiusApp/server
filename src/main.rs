@@ -18,6 +18,7 @@ mod session_grants;
 mod team_authority;
 mod team_join_grants;
 mod team_plan;
+mod team_policy;
 mod vault_key_exposure;
 mod sync_notifier;
 mod terminal_manager;
