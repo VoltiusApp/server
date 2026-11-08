@@ -39,12 +39,32 @@ fn db_error(e: sqlx::Error) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-fn doc_error(e: DocError) -> Response {
-    let mut body = json!({ "error": e.code() });
-    if let Some(key) = e.key() {
-        body["key"] = json!(key);
+pub enum PolicyRefusal {
+    Doc(DocError),
+    RevisionMismatch,
+    Status(StatusCode),
+}
+
+impl From<StatusCode> for PolicyRefusal {
+    fn from(status: StatusCode) -> Self {
+        Self::Status(status)
     }
-    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
+impl IntoResponse for PolicyRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Doc(e) => {
+                let mut body = json!({ "error": e.code() });
+                if let Some(key) = e.key() {
+                    body["key"] = json!(key);
+                }
+                (StatusCode::BAD_REQUEST, Json(body)).into_response()
+            }
+            Self::RevisionMismatch => coded_error(StatusCode::CONFLICT, "POLICY_REVISION_MISMATCH"),
+            Self::Status(status) => status.into_response(),
+        }
+    }
 }
 
 pub(crate) struct LockedPolicy {
@@ -144,13 +164,13 @@ pub async fn put_policy(
     Extension(notifier): Extension<SyncNotifier>,
     Path(team_id): Path<Uuid>,
     Json(body): Json<PutPolicy>,
-) -> axum::response::Result<StatusCode> {
+) -> Result<StatusCode, PolicyRefusal> {
     require_vault_manager(&pool, team_id, auth.0).await?;
-    validate_doc(&body.policy).map_err(doc_error)?;
+    validate_doc(&body.policy).map_err(PolicyRefusal::Doc)?;
     let plan_locked = team_locked(&pool, team_id).await?;
     let locked = LockedPolicy::lock(&pool, team_id).await?;
     if locked.revision != body.revision {
-        return Err(coded_error(StatusCode::CONFLICT, "POLICY_REVISION_MISMATCH").into());
+        return Err(PolicyRefusal::RevisionMismatch);
     }
     if plan_locked && !is_narrowing(locked.doc.as_ref(), &body.policy) {
         return Err(StatusCode::PAYMENT_REQUIRED.into());
