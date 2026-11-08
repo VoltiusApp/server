@@ -421,6 +421,8 @@ pub struct AddMemberRequest {
     pub role: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub role_ids: Option<Vec<Uuid>>,
 }
 
 pub async fn add_member(
@@ -467,8 +469,7 @@ pub async fn add_member(
     let owner_id = team_owner(&pool, team_id).await?;
     ensure_seat_available(&pool, owner_id, Some(invitee_id)).await?;
 
-    let role_name = body.role.as_deref().unwrap_or("member").to_string();
-    require_may_confer_builtin(&pool, team_id, auth.0, &role_name).await?;
+    let roles = invited_roles(&pool, team_id, auth.0, body.role.as_deref(), body.role_ids.as_deref()).await?;
 
     // Already a member — no-op
     let already_member = sqlx::query_scalar::<_, bool>(
@@ -496,13 +497,13 @@ pub async fn add_member(
         team_id,
         user_id: Some(invitee_id),
         email: &invitee_email,
-        role: &role_name,
+        roles: &roles,
         invited_by: auth.0,
         member_name: member_name.as_deref(),
     })
     .await?;
 
-    info!(team_id = %team_id, invitee_id = %invitee_id, role = %role_name, "Pending invitation created for existing user");
+    info!(team_id = %team_id, invitee_id = %invitee_id, role = %roles.name, "Pending invitation created for existing user");
     tokio::spawn(write_audit_event(
         pool.clone(),
         team_id,
@@ -511,7 +512,7 @@ pub async fn add_member(
         Some("user"),
         Some(invitee_id.to_string()),
         Some(invitee_display_name),
-        Some(json!({ "role": role_name, "status": "pending", "name": member_name })),
+        Some(roles.audit(member_name.as_deref())),
     ));
     // Notify the invitee so their client refreshes pending invitations
     notifier.notify_pending_invitations_changed(invitee_id);
@@ -1217,9 +1218,7 @@ pub async fn assign_member_role(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let role = role_authority(&pool, team_id, body.role_id).await?;
-    crate::team_plan::require_granular(&pool, team_id, role.is_builtin).await?;
-    require_covers(&pool, team_id, auth.0, role.authority).await?;
+    require_may_assign_role(&pool, team_id, auth.0, body.role_id).await?;
 
     let target_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
         .bind(target_user_id)
@@ -1537,19 +1536,76 @@ pub(crate) struct PendingInvite<'a> {
     pub team_id: Uuid,
     pub user_id: Option<Uuid>,
     pub email: &'a str,
-    pub role: &'a str,
+    pub roles: &'a InvitedRoles,
     pub invited_by: Uuid,
     pub member_name: Option<&'a str>,
+}
+
+const MAX_INVITED_ROLES: usize = 32;
+
+async fn require_may_assign_role(pool: &PgPool, team_id: Uuid, actor: Uuid, role_id: Uuid) -> Result<(), StatusCode> {
+    let role = role_authority(pool, team_id, role_id).await?;
+    crate::team_plan::require_granular(pool, team_id, role.is_builtin).await?;
+    require_covers(pool, team_id, actor, role.authority).await
+}
+
+/// `ids` empty means an older client named one builtin role; `name` is what invitees see either way.
+pub(crate) struct InvitedRoles {
+    pub name: String,
+    pub ids: Vec<Uuid>,
+}
+
+impl InvitedRoles {
+    fn audit(&self, member_name: Option<&str>) -> serde_json::Value {
+        json!({ "role": self.name, "role_ids": self.ids, "status": "pending", "name": member_name })
+    }
+}
+
+async fn invited_roles(
+    pool: &PgPool,
+    team_id: Uuid,
+    actor: Uuid,
+    role: Option<&str>,
+    role_ids: Option<&[Uuid]>,
+) -> Result<InvitedRoles, StatusCode> {
+    let mut ids = role_ids.unwrap_or_default().to_vec();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        let name = role.unwrap_or("member").to_string();
+        require_may_confer_builtin(pool, team_id, actor, &name).await?;
+        return Ok(InvitedRoles { name, ids });
+    }
+    if ids.len() > MAX_INVITED_ROLES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    for &id in &ids {
+        require_may_assign_role(pool, team_id, actor, id).await.map_err(|status| match status {
+            StatusCode::NOT_FOUND => StatusCode::BAD_REQUEST,
+            other => other,
+        })?;
+    }
+    let name = sqlx::query_scalar::<_, String>("SELECT name FROM team_roles WHERE team_id = $1 AND id = ANY($2) ORDER BY position, name LIMIT 1")
+        .bind(team_id)
+        .bind(&ids)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to name invited roles");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(InvitedRoles { name, ids })
 }
 
 // A name survives a re-send only while the invite is still pending; an accepted row must not revive it.
 pub(crate) async fn upsert_pending_invitation(pool: &PgPool, invite: PendingInvite<'_>) -> Result<String, StatusCode> {
     sqlx::query_scalar(
-        "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by, member_name)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO pending_invitations (team_id, user_id, email, role, invited_by, member_name, role_ids)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (team_id, email) DO UPDATE
            SET user_id = COALESCE(EXCLUDED.user_id, pending_invitations.user_id),
                role = EXCLUDED.role,
+               role_ids = EXCLUDED.role_ids,
                invited_by = EXCLUDED.invited_by,
                member_name = CASE WHEN pending_invitations.accepted_at IS NULL
                                   THEN COALESCE(EXCLUDED.member_name, pending_invitations.member_name)
@@ -1561,9 +1617,10 @@ pub(crate) async fn upsert_pending_invitation(pool: &PgPool, invite: PendingInvi
     .bind(invite.team_id)
     .bind(invite.user_id)
     .bind(invite.email)
-    .bind(invite.role)
+    .bind(&invite.roles.name)
     .bind(invite.invited_by)
     .bind(invite.member_name)
+    .bind(&invite.roles.ids)
     .fetch_one(pool)
     .await
     .map_err(|e| {
@@ -1580,6 +1637,8 @@ pub struct InviteMemberRequest {
     pub role: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub role_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Serialize)]
@@ -1619,8 +1678,7 @@ pub async fn invite_member(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let role = body.role.as_deref().unwrap_or("member").to_string();
-    require_may_confer_builtin(&pool, team_id, auth.0, &role).await?;
+    let roles = invited_roles(&pool, team_id, auth.0, body.role.as_deref(), body.role_ids.as_deref()).await?;
 
     let owner_id = team_owner(&pool, team_id).await?;
 
@@ -1654,13 +1712,13 @@ pub async fn invite_member(
             team_id,
             user_id: Some(user_id),
             email: &email,
-            role: &role,
+            roles: &roles,
             invited_by: auth.0,
             member_name: member_name.as_deref(),
         })
         .await?;
 
-        info!(team_id = %team_id, user_id = %user_id, role = %role, "Pending invitation created for existing user via invite endpoint");
+        info!(team_id = %team_id, user_id = %user_id, role = %roles.name, "Pending invitation created for existing user via invite endpoint");
         let invite_display_name = sqlx::query_scalar::<_, String>("SELECT handle FROM users WHERE id = $1")
             .bind(user_id)
             .fetch_optional(&pool)
@@ -1674,7 +1732,7 @@ pub async fn invite_member(
             Some("user"),
             Some(user_id.to_string()),
             invite_display_name,
-            Some(json!({ "role": role, "status": "pending", "name": member_name })),
+            Some(roles.audit(member_name.as_deref())),
         ));
         notifier.notify_pending_invitations_changed(user_id);
         notify_team_members_changed(&pool, &notifier, team_id).await;
@@ -1698,7 +1756,7 @@ pub async fn invite_member(
         team_id,
         user_id: None,
         email: &email,
-        role: &role,
+        roles: &roles,
         invited_by: auth.0,
         member_name: member_name.as_deref(),
     })
@@ -1723,7 +1781,7 @@ pub async fn invite_member(
         Some("user"),
         None,
         Some(invite_display_name),
-        Some(json!({ "role": role, "status": "pending", "name": member_name })),
+        Some(roles.audit(member_name.as_deref())),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
     Ok(Json(InviteMemberResponse { status: "invited".to_string(), email_sent: Some(email_sent) }))
@@ -1739,6 +1797,8 @@ pub struct PendingInvitation {
     /// no handle, so the server has nothing else to send here.
     pub display_name: String,
     pub role: String,
+    /// Empty for an invite from an older client, which carries only `role`.
+    pub role_ids: Vec<Uuid>,
     pub invited_by_display_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
@@ -1766,8 +1826,8 @@ pub async fn list_pending_invitations(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<String>)>(
-        r#"SELECT pi.id, COALESCE(invitee.handle, pi.email), pi.role, inv.handle, pi.created_at, pi.expires_at, pi.member_name
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<String>, Vec<Uuid>)>(
+        r#"SELECT pi.id, COALESCE(invitee.handle, pi.email), pi.role, inv.handle, pi.created_at, pi.expires_at, pi.member_name, pi.role_ids
            FROM pending_invitations pi
            LEFT JOIN users inv ON inv.id = pi.invited_by
            LEFT JOIN users invitee ON invitee.id = pi.user_id
@@ -1786,8 +1846,8 @@ pub async fn list_pending_invitations(
     let now = chrono::Utc::now();
     Ok(Json(
         rows.into_iter()
-            .map(|(id, display_name, role, invited_by_display_name, created_at, expires_at, member_name)| PendingInvitation {
-                id, display_name, role, invited_by_display_name, created_at, expires_at, member_name,
+            .map(|(id, display_name, role, invited_by_display_name, created_at, expires_at, member_name, role_ids)| PendingInvitation {
+                id, display_name, role, invited_by_display_name, created_at, expires_at, member_name, role_ids,
                 status: if expires_at > now { "pending" } else { "expired" }.to_string(),
             })
             .collect(),
@@ -2087,6 +2147,7 @@ mod authz_tests {
                 email: None,
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -2117,6 +2178,7 @@ mod authz_tests {
                 email: None,
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -2922,6 +2984,7 @@ mod authz_tests {
                 email: None,
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -2953,6 +3016,7 @@ mod authz_tests {
                 email: None,
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -2994,6 +3058,7 @@ mod authz_tests {
                 email: None,
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -3037,6 +3102,7 @@ mod authz_tests {
                 email: None,
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -3066,6 +3132,7 @@ mod authz_tests {
                 email: "newcomer@test.local".to_string(),
                 role: None,
                 name: None,
+                role_ids: None,
             }),
         )
         .await;
@@ -3086,7 +3153,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Path(team),
-            Json(AddMemberRequest { user_id: Some(invitee), email: None, role: None, name: None }),
+            Json(AddMemberRequest { user_id: Some(invitee), email: None, role: None, name: None, role_ids: None }),
         )
         .await?;
         Ok((code, body.status))
@@ -3098,7 +3165,7 @@ mod authz_tests {
             Extension(AuthUser(caller)),
             Extension(SyncNotifier::new()),
             Path(team),
-            Json(InviteMemberRequest { email, role: None, name: None }),
+            Json(InviteMemberRequest { email, role: None, name: None, role_ids: None }),
         )
         .await
         .map(|Json(body)| body)
@@ -4012,7 +4079,7 @@ mod ownership_tests {
                 Extension(AuthUser(actor)),
                 Extension(SyncNotifier::new()),
                 Path(self.id),
-                Json(AddMemberRequest { email: None, user_id: Some(invitee), role: Some(role.into()), name: None }),
+                Json(AddMemberRequest { email: None, user_id: Some(invitee), role: Some(role.into()), name: None, role_ids: None }),
             )
             .await
             .map(|(status, _)| status)
@@ -4126,5 +4193,194 @@ mod ownership_tests {
         .unwrap();
         assert_eq!(t.remove(t.creator, t.creator).await, Ok(StatusCode::NO_CONTENT));
         assert_eq!(team_owner(&t.pool, t.id).await.unwrap(), bob);
+    }
+
+}
+
+#[cfg(test)]
+mod invite_role_tests {
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::permissions::{PERM_INVITE_MEMBERS, PERM_VIEW_SECRETS};
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_pool_or_skip;
+    use crate::test_support::{inviter_with, seed_role, seed_team_with_roles, seed_user, set_user_seats, set_user_tier, BillingMode};
+    use axum::extract::{Path, State};
+    use axum::{Extension, Json};
+
+    async fn builtin_role_id(pool: &PgPool, team: Uuid, name: &str) -> Uuid {
+        sqlx::query_scalar("SELECT id FROM team_roles WHERE team_id = $1 AND name = $2 AND is_builtin")
+            .bind(team).bind(name).fetch_one(pool).await.unwrap()
+    }
+
+    async fn roles_held(pool: &PgPool, team: Uuid, user: Uuid) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = sqlx::query_scalar("SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(user).fetch_all(pool).await.unwrap();
+        ids.sort();
+        ids
+    }
+
+    fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+        ids.sort();
+        ids
+    }
+
+    async fn invite_with_roles(pool: &PgPool, team: Uuid, actor: Uuid, invitee: Uuid, role: Option<&str>, role_ids: Option<Vec<Uuid>>) -> Result<(), StatusCode> {
+        add_member(
+            State(pool.clone()),
+            Extension(AuthUser(actor)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest { user_id: Some(invitee), email: None, role: role.map(str::to_string), name: None, role_ids }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn accept_pending(pool: &PgPool, team: Uuid, invitee: Uuid) {
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM pending_invitations WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(invitee).fetch_one(pool).await.unwrap();
+        let res = crate::routes::invitations::accept_my_pending_invitation(
+            State(pool.clone()), Extension(AuthUser(invitee)), Extension(SyncNotifier::new()), Path(id),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+    }
+
+    async fn pending_count(pool: &PgPool, team: Uuid, invitee: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_invitations WHERE team_id = $1 AND user_id = $2")
+            .bind(team).bind(invitee).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_invite_keeps_every_chosen_role_through_acceptance() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = builtin_role_id(&pool, team, "member").await;
+        let custom = seed_role(&pool, team, "dba", PERM_VIEW_SECRETS).await;
+        let invitee = seed_user(&pool).await;
+
+        invite_with_roles(&pool, team, owner, invitee, None, Some(vec![member, custom])).await.unwrap();
+        accept_pending(&pool, team, invitee).await;
+
+        assert_eq!(roles_held(&pool, team, invitee).await, sorted(vec![member, custom]));
+    }
+
+    #[tokio::test]
+    async fn an_email_invite_keeps_every_chosen_role_too() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let editor = builtin_role_id(&pool, team, "editor").await;
+        let custom = seed_role(&pool, team, "dba", PERM_VIEW_SECRETS).await;
+        let invitee = seed_user(&pool).await;
+
+        invite_member(
+            State(pool.clone()),
+            Extension(AuthUser(owner)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(InviteMemberRequest { email: crate::test_support::test_user_email(invitee), role: None, name: None, role_ids: Some(vec![custom, editor]) }),
+        )
+        .await
+        .map(|_| ())
+        .unwrap();
+        accept_pending(&pool, team, invitee).await;
+
+        assert_eq!(roles_held(&pool, team, invitee).await, sorted(vec![editor, custom]));
+    }
+
+    #[tokio::test]
+    async fn an_invite_names_its_most_senior_role_for_display() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = builtin_role_id(&pool, team, "member").await;
+        let editor = builtin_role_id(&pool, team, "editor").await;
+        let invitee = seed_user(&pool).await;
+
+        invite_with_roles(&pool, team, owner, invitee, Some("connect-only"), Some(vec![member, editor])).await.unwrap();
+
+        let Json(pending) = list_pending_invitations(State(pool.clone()), Extension(AuthUser(owner)), Path(team)).await.unwrap();
+        let row = pending.into_iter().next().unwrap();
+        assert_eq!(row.role, "editor");
+        assert_eq!(sorted(row.role_ids), sorted(vec![member, editor]));
+    }
+
+    #[tokio::test]
+    async fn an_invited_role_from_another_team_is_refused() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let other_team = seed_team_with_roles(&pool, owner).await;
+        let foreign = seed_role(&pool, other_team, "dba", PERM_VIEW_SECRETS).await;
+        let invitee = seed_user(&pool).await;
+
+        assert_eq!(invite_with_roles(&pool, team, owner, invitee, None, Some(vec![foreign])).await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(pending_count(&pool, team, invitee).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_inviter_cannot_invite_into_a_role_above_their_own() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
+        let member = builtin_role_id(&pool, team, "member").await;
+        let manager = builtin_role_id(&pool, team, "manager").await;
+        let invitee = seed_user(&pool).await;
+
+        assert_eq!(invite_with_roles(&pool, team, inviter, invitee, None, Some(vec![member, manager])).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(pending_count(&pool, team, invitee).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_teams_team_may_invite_into_builtin_roles_but_not_custom_ones() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+        set_user_seats(&pool, owner, 10).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = builtin_role_id(&pool, team, "member").await;
+        let custom = seed_role(&pool, team, "dba", PERM_VIEW_SECRETS).await;
+        let (a, b) = (seed_user(&pool).await, seed_user(&pool).await);
+
+        assert_eq!(invite_with_roles(&pool, team, owner, a, None, Some(vec![member])).await, Ok(()));
+        assert_eq!(invite_with_roles(&pool, team, owner, b, None, Some(vec![member, custom])).await, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn a_resent_invite_replaces_its_roles() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = builtin_role_id(&pool, team, "member").await;
+        let connect_only = builtin_role_id(&pool, team, "connect-only").await;
+        let custom = seed_role(&pool, team, "dba", PERM_VIEW_SECRETS).await;
+        let invitee = seed_user(&pool).await;
+
+        invite_with_roles(&pool, team, owner, invitee, None, Some(vec![member, custom])).await.unwrap();
+        invite_with_roles(&pool, team, owner, invitee, Some("connect-only"), None).await.unwrap();
+        accept_pending(&pool, team, invitee).await;
+
+        assert_eq!(roles_held(&pool, team, invitee).await, vec![connect_only]);
+    }
+
+    #[tokio::test]
+    async fn a_role_deleted_before_acceptance_is_skipped() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, owner).await;
+        let member = builtin_role_id(&pool, team, "member").await;
+        let custom = seed_role(&pool, team, "dba", PERM_VIEW_SECRETS).await;
+        let invitee = seed_user(&pool).await;
+
+        invite_with_roles(&pool, team, owner, invitee, None, Some(vec![member, custom])).await.unwrap();
+        sqlx::query("DELETE FROM team_roles WHERE id = $1").bind(custom).execute(&pool).await.unwrap();
+        accept_pending(&pool, team, invitee).await;
+
+        assert_eq!(roles_held(&pool, team, invitee).await, vec![member]);
     }
 }
