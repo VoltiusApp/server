@@ -362,7 +362,7 @@ pub async fn sync_stream(
 #[cfg(test)]
 mod presence_tests {
     use super::*;
-    use dashmap::{DashMap, DashSet};
+    use dashmap::DashMap;
     use std::sync::Arc;
 
     fn maps() -> (PresenceMap, UsageMap) {
@@ -370,7 +370,7 @@ mod presence_tests {
     }
 
     fn announce(usage: &UsageMap, user: Uuid, connection_id: &str) {
-        usage.entry(user).or_insert_with(DashSet::new).insert(connection_id.to_string());
+        usage.entry(user).or_default().insert(connection_id.to_string());
     }
 
     #[test]
