@@ -192,7 +192,7 @@ pub struct TeamWithRole {
     pub role_ids: Vec<Uuid>,
     pub permission_allow: i64,
     pub permission_deny: i64,
-    pub lock_policy: Option<crate::routes::team_lock_policy::LockPolicy>,
+    pub lock_policy: Option<crate::team_policy::LockPolicy>,
 }
 
 pub async fn list_teams(
@@ -286,7 +286,7 @@ async fn teams_for_user(
                     role_ids: role_id.into_iter().collect(),
                     permission_allow,
                     permission_deny,
-                    lock_policy: crate::routes::team_lock_policy::LockPolicy::from_columns(lock_max_minutes, lock_force_vault),
+                    lock_policy: crate::team_policy::LockPolicy::from_columns(lock_max_minutes, lock_force_vault),
                 });
             }
         }

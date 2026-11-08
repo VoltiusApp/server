@@ -3,7 +3,6 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use tracing::error;
@@ -14,23 +13,7 @@ use crate::routes::audit::write_audit_event;
 use crate::routes::teams::{notify_team_members_changed, require_vault_manager};
 use crate::sync_notifier::SyncNotifier;
 use crate::team_plan::require_granular;
-
-pub const LOCK_MINUTES: [i32; 6] = [0, 5, 15, 30, 60, 240];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LockPolicy {
-    pub max_minutes: i32,
-    pub force_vault: bool,
-}
-
-impl LockPolicy {
-    pub fn from_columns(max_minutes: Option<i32>, force_vault: bool) -> Option<Self> {
-        max_minutes.map(|max_minutes| Self {
-            max_minutes,
-            force_vault,
-        })
-    }
-}
+use crate::team_policy::{LockPolicy, LOCK_MINUTES};
 
 pub async fn set_lock_policy(
     State(pool): State<PgPool>,

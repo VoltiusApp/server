@@ -1,8 +1,24 @@
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::routes::team_lock_policy::{LockPolicy, LOCK_MINUTES};
+pub const LOCK_MINUTES: [i32; 6] = [0, 5, 15, 30, 60, 240];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockPolicy {
+    pub max_minutes: i32,
+    pub force_vault: bool,
+}
+
+impl LockPolicy {
+    pub fn from_columns(max_minutes: Option<i32>, force_vault: bool) -> Option<Self> {
+        max_minutes.map(|max_minutes| Self {
+            max_minutes,
+            force_vault,
+        })
+    }
+}
 
 pub const MACHINE_ONLY_KEYS: [&str; 5] = [
     "server.url",
@@ -118,7 +134,7 @@ pub fn with_lock_policy(doc: Option<Value>, lp: Option<LockPolicy>) -> Option<Va
 }
 
 pub fn lock_policy_of(doc: Option<&Value>) -> Option<LockPolicy> {
-    let policy = doc?.get("policy")?;
+    let policy = policy_map(doc)?;
     let max = policy.get(TIMEOUT_KEY)?.get("$range")?.get("max")?.as_f64()?;
     let max_minutes = LOCK_MINUTES
         .iter()
@@ -147,11 +163,10 @@ pub fn is_narrowing(stored: Option<&Value>, new: &Value) -> bool {
 
 pub fn key_diff(old: Option<&Value>, new: Option<&Value>) -> Value {
     let (old, new) = (policy_map(old), policy_map(new));
-    let get = |m: Option<&Map<String, Value>>, k: &str| m.and_then(|m| m.get(k)).cloned();
     let keys: BTreeSet<&String> = old.into_iter().chain(new).flat_map(|m| m.keys()).collect();
     let (mut added, mut changed, mut removed) = (vec![], vec![], vec![]);
     for k in keys {
-        match (get(old, k), get(new, k)) {
+        match (old.and_then(|m| m.get(k)), new.and_then(|m| m.get(k))) {
             (None, Some(_)) => added.push(k),
             (Some(_), None) => removed.push(k),
             (Some(a), Some(b)) if a != b => changed.push(k),
