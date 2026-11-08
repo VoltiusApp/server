@@ -314,6 +314,41 @@ pub async fn inviter_with(pool: &PgPool, team: Uuid, extra: i64) -> Uuid {
     member_with_role(pool, team, member | extra).await
 }
 
+pub fn team_members_told(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::sync_notifier::SyncEvent>,
+    team: Uuid,
+) -> std::collections::HashSet<Uuid> {
+    let want = format!("team_members:{team}");
+    let mut told = std::collections::HashSet::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let crate::sync_notifier::SyncEvent::BlobPushed { user_id, device_id } = ev {
+            if device_id == want {
+                told.insert(user_id);
+            }
+        }
+    }
+    told
+}
+
+pub async fn team_audit_count(pool: &PgPool, team: Uuid, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE team_id = $1 AND action = $2")
+        .bind(team)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("count team audit events")
+}
+
+pub async fn listed_team(pool: &PgPool, team: Uuid, user: Uuid) -> crate::routes::teams::TeamWithRole {
+    let axum::Json(teams) = crate::routes::teams::list_teams(
+        axum::extract::State(pool.clone()),
+        axum::Extension(crate::auth::AuthUser(user)),
+    )
+    .await
+    .expect("list teams");
+    teams.into_iter().find(|t| t.id == team).expect("team listed")
+}
+
 pub async fn set_user_tier(pool: &PgPool, user: Uuid, tier: &str) {
     sqlx::query("UPDATE users SET subscription_tier = $1 WHERE id = $2")
         .bind(tier)

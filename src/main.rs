@@ -458,6 +458,12 @@ async fn main() {
             put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),
         )
         .route(
+            "/v1/teams/:team_id/policy",
+            get(routes::team_policy::get_policy)
+                .put(routes::team_policy::put_policy)
+                .delete(routes::team_policy::delete_policy),
+        )
+        .route(
             "/v1/teams/:team_id/members/:user_id",
             delete(routes::teams::remove_member),
         )
