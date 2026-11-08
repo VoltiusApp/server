@@ -304,11 +304,11 @@ mod tests {
 
     #[test]
     fn migration_contains_backfill() {
-        assert!(include_str!("../migrations/066_team_policy.sql").contains(LOCK_POLICY_BACKFILL));
+        assert!(include_str!("../migrations/067_team_policy.sql").contains(LOCK_POLICY_BACKFILL));
     }
 
     #[tokio::test]
-    async fn backfill_matches_with_lock_policy() {
+    async fn boot_backfill_matches_with_lock_policy() {
         let pool = crate::test_pool_or_skip!();
         let owner = seed_user(&pool).await;
         let team = seed_team_with_roles(&pool, owner).await;
@@ -321,7 +321,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-            sqlx::query(LOCK_POLICY_BACKFILL).execute(&pool).await.unwrap();
+            crate::db::backfill_team_policies(&pool).await;
             let stored: Option<Value> = sqlx::query_scalar("SELECT policy FROM teams WHERE id = $1")
                 .bind(team)
                 .fetch_one(&pool)

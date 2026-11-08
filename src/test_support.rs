@@ -84,7 +84,7 @@ pub async fn test_pool() -> Option<PgPool> {
         .expect("connect to TEST_DATABASE_URL");
     // sqlx's migrator takes a Postgres advisory lock, so concurrent test
     // invocations applying migrations is safe.
-    sqlx::migrate!("./migrations")
+    crate::db::migrator()
         .run(&pool)
         .await
         .expect("run migrations on test database");
