@@ -341,7 +341,7 @@ mod db_tests {
             Extension(AuthUser(actor)),
             Extension(SyncNotifier::new()),
             Path(team),
-            Json(InviteMemberRequest { email: email.into(), role: None, name: name.map(str::to_string) }),
+            Json(InviteMemberRequest { email: email.into(), role: None, name: name.map(str::to_string), role_ids: None }),
         )
         .await
         .map(|_| ())
@@ -403,7 +403,7 @@ mod db_tests {
             Extension(AuthUser(admin)),
             Extension(SyncNotifier::new()),
             Path(team),
-            Json(AddMemberRequest { email: None, user_id: Some(invitee), role: None, name: Some("Eva".into()) }),
+            Json(AddMemberRequest { email: None, user_id: Some(invitee), role: None, name: Some("Eva".into()), role_ids: None }),
         )
         .await
         .expect("invite");
@@ -433,15 +433,15 @@ mod db_tests {
         let user = seed_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
 
-        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", Some("Jan")).await.unwrap();
+        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", &[], Some("Jan")).await.unwrap();
         sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
             .bind(team).bind(user).execute(&pool).await.unwrap();
         assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan"), "name survives departure");
 
-        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", None).await.unwrap();
+        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", &[], None).await.unwrap();
         assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan"));
 
-        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", Some("Jan Nováková")).await.unwrap();
+        crate::routes::invitations::admit_member(&mut conn, team, user, Some(owner), "member", &[], Some("Jan Nováková")).await.unwrap();
         assert_eq!(stored(&pool, team, user).await.as_deref(), Some("Jan Nováková"));
     }
 
@@ -594,7 +594,7 @@ mod db_tests {
             Extension(AuthUser(admin)),
             Extension(SyncNotifier::new()),
             Path(team),
-            Json(AddMemberRequest { email: None, user_id: Some(by_id), role: None, name: Some("ById".into()) }),
+            Json(AddMemberRequest { email: None, user_id: Some(by_id), role: None, name: Some("ById".into()), role_ids: None }),
         )
         .await
         .expect("invite");

@@ -52,7 +52,7 @@ pub async fn get_invitation(
 
 // ─── Admitting a member ───────────────────────────────────────────────────────
 
-/// The membership row plus its builtin role, written the same way by all three
+/// The membership row plus its roles, written the same way by all three
 /// acceptance paths: the link token, the in-app pending invite, and the
 /// auto-accept at registration.
 ///
@@ -66,6 +66,7 @@ pub(crate) async fn admit_member(
     user_id: Uuid,
     invited_by: Option<Uuid>,
     role: &str,
+    role_ids: &[Uuid],
     member_name: Option<&str>,
 ) -> Result<(), StatusCode> {
     sqlx::query(
@@ -86,12 +87,16 @@ pub(crate) async fn admit_member(
     sqlx::query(
         r#"INSERT INTO team_member_roles (team_id, user_id, role_id)
            SELECT $1, $2, tr.id FROM team_roles tr
-           WHERE tr.team_id = $1 AND tr.name = $3 AND tr.is_builtin = TRUE
+           WHERE tr.team_id = $1
+             AND (tr.id = ANY($4)
+                  OR (tr.name = $3 AND tr.is_builtin
+                      AND NOT EXISTS (SELECT 1 FROM team_roles kept WHERE kept.team_id = $1 AND kept.id = ANY($4))))
            ON CONFLICT DO NOTHING"#,
     )
     .bind(team_id)
     .bind(user_id)
     .bind(role)
+    .bind(role_ids)
     .execute(&mut *conn)
     .await
     .map_err(|e| {
@@ -112,11 +117,12 @@ pub(crate) struct PendingInvitation {
     team_id: Uuid,
     email: String,
     role: String,
+    role_ids: Vec<Uuid>,
     invited_by: Option<Uuid>,
     member_name: Option<String>,
 }
 
-pub(crate) const PENDING_INVITATION_COLUMNS: &str = "id, team_id, email, role, invited_by, member_name";
+pub(crate) const PENDING_INVITATION_COLUMNS: &str = "id, team_id, email, role, role_ids, invited_by, member_name";
 
 /// Every acceptance path ends here, so none can skip the audit row or the team fan-out.
 pub(crate) async fn accept_pending_invitation(
@@ -138,6 +144,7 @@ pub(crate) async fn accept_pending_invitation(
         user_id,
         invitation.invited_by,
         &invitation.role,
+        &invitation.role_ids,
         invitation.member_name.as_deref(),
     )
     .await?;
@@ -163,7 +170,7 @@ pub(crate) async fn accept_pending_invitation(
         invitation.team_id,
         user_id,
         user_email,
-        json!({ "role": invitation.role, "via": via }),
+        json!({ "role": invitation.role, "role_ids": invitation.role_ids, "via": via }),
     )
     .await;
     Ok(())
@@ -682,7 +689,7 @@ mod admit_tests {
         let invitee = seed_user(&pool).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        admit_member(&mut conn, team, invitee, Some(owner), "member", None)
+        admit_member(&mut conn, team, invitee, Some(owner), "member", &[], None)
             .await
             .unwrap();
         drop(conn);
@@ -714,18 +721,18 @@ mod admit_tests {
 
         let mut conn = pool.acquire().await.unwrap();
         // A link-only invite carries no inviter; a later accept fills it in.
-        admit_member(&mut conn, team, invitee, None, "member", None)
+        admit_member(&mut conn, team, invitee, None, "member", &[], None)
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, None);
 
-        admit_member(&mut conn, team, invitee, Some(owner), "member", None)
+        admit_member(&mut conn, team, invitee, Some(owner), "member", &[], None)
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
 
         // …and a second invitation cannot claim credit for a member already in.
-        admit_member(&mut conn, team, invitee, Some(other), "member", None)
+        admit_member(&mut conn, team, invitee, Some(other), "member", &[], None)
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
