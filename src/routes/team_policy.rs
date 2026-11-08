@@ -17,7 +17,7 @@ use crate::routes::audit::write_audit_event;
 use crate::routes::coded_error;
 use crate::routes::teams::{notify_team_members_changed, require_vault_manager};
 use crate::sync_notifier::SyncNotifier;
-use crate::team_plan::require_granular;
+use crate::team_plan::team_locked;
 use crate::team_policy::{is_narrowing, key_diff, lock_policy_of, validate_doc, DocError};
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -147,16 +147,14 @@ pub async fn put_policy(
 ) -> axum::response::Result<StatusCode> {
     require_vault_manager(&pool, team_id, auth.0).await?;
     validate_doc(&body.policy).map_err(doc_error)?;
+    let plan_locked = team_locked(&pool, team_id).await?;
     let locked = LockedPolicy::lock(&pool, team_id).await?;
     if locked.revision != body.revision {
         return Err(coded_error(StatusCode::CONFLICT, "POLICY_REVISION_MISMATCH").into());
     }
-    require_granular(
-        &pool,
-        team_id,
-        is_narrowing(locked.doc.as_ref(), &body.policy),
-    )
-    .await?;
+    if plan_locked && !is_narrowing(locked.doc.as_ref(), &body.policy) {
+        return Err(StatusCode::PAYMENT_REQUIRED.into());
+    }
     let diff = key_diff(locked.doc.as_ref(), Some(&body.policy));
     let revision = locked.replace(auth.0, Some(&body.policy)).await?;
     let metadata = json!({ "diff": diff, "revision": revision });
@@ -179,10 +177,11 @@ pub async fn delete_policy(
     Path(team_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     require_vault_manager(&pool, team_id, auth.0).await?;
-    LockedPolicy::lock(&pool, team_id)
-        .await?
-        .replace(auth.0, None)
-        .await?;
+    let locked = LockedPolicy::lock(&pool, team_id).await?;
+    if locked.doc.is_none() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    locked.replace(auth.0, None).await?;
     announce(
         &pool,
         &notifier,
@@ -498,10 +497,15 @@ mod tests {
         assert_eq!(audit_count(&pool, team, "team.policy_removed").await, 1);
         let told = team_members_told(&mut rx, team);
         assert!(told.contains(&owner) && told.contains(&member));
+        assert_eq!(get(&pool, team, owner).await.unwrap()["revision"], 2);
+
         assert_eq!(
             delete(&pool, &notifier, team, owner).await,
             Ok(StatusCode::NO_CONTENT)
         );
+        assert_eq!(audit_count(&pool, team, "team.policy_removed").await, 1);
+        assert!(team_members_told(&mut rx, team).is_empty());
+        assert_eq!(get(&pool, team, owner).await.unwrap()["revision"], 2);
     }
 
     #[tokio::test]
