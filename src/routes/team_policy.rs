@@ -571,10 +571,14 @@ mod tests {
             return;
         };
         let policy = doc(json!({"security.lockTimeoutMinutes": {"$range": {"max": 20}}}));
-        assert_eq!(
-            put_status(&pool, team, owner, policy, 0).await,
-            StatusCode::NO_CONTENT
-        );
+        sqlx::query(
+            "UPDATE teams SET policy = $2, lock_max_minutes = 60, lock_force_vault = TRUE WHERE id = $1",
+        )
+        .bind(team)
+        .bind(&policy)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let t = listed(&pool, team, owner).await;
         assert_eq!(
@@ -583,6 +587,11 @@ mod tests {
                 max_minutes: 15,
                 force_vault: false
             })
+        );
+
+        assert_eq!(
+            put_status(&pool, team, owner, policy, 0).await,
+            StatusCode::NO_CONTENT
         );
         assert_eq!(lock_columns(&pool, team).await, (Some(15), false));
     }
