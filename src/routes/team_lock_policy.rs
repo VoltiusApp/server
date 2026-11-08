@@ -3,34 +3,16 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
-use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::routes::audit::write_audit_event;
-use crate::routes::teams::{notify_team_members_changed, require_vault_manager};
+use crate::routes::team_policy::{announce, LockedPolicy};
+use crate::routes::teams::require_vault_manager;
 use crate::sync_notifier::SyncNotifier;
 use crate::team_plan::require_granular;
-
-const LOCK_MINUTES: [i32; 6] = [0, 5, 15, 30, 60, 240];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LockPolicy {
-    pub max_minutes: i32,
-    pub force_vault: bool,
-}
-
-impl LockPolicy {
-    pub fn from_columns(max_minutes: Option<i32>, force_vault: bool) -> Option<Self> {
-        max_minutes.map(|max_minutes| Self {
-            max_minutes,
-            force_vault,
-        })
-    }
-}
+use crate::team_policy::{with_lock_policy, LockPolicy, LOCK_MINUTES};
 
 pub async fn set_lock_policy(
     State(pool): State<PgPool>,
@@ -65,54 +47,28 @@ async fn write_policy(
     actor: Uuid,
     policy: Option<LockPolicy>,
 ) -> Result<StatusCode, StatusCode> {
-    sqlx::query("UPDATE teams SET lock_max_minutes = $2, lock_force_vault = $3 WHERE id = $1")
-        .bind(team_id)
-        .bind(policy.map(|p| p.max_minutes))
-        .bind(policy.is_some_and(|p| p.force_vault))
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, team_id = %team_id, "Failed to write team lock policy");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut locked = LockedPolicy::lock(pool, team_id).await?;
+    let doc = with_lock_policy(locked.doc.take(), policy);
+    locked.replace(actor, doc.as_ref()).await?;
     let (action, metadata) = match policy {
         Some(p) => ("team.lock_policy_set", Some(json!(p))),
         None => ("team.lock_policy_removed", None),
     };
-    write_audit_event(
-        pool.clone(),
-        team_id,
-        actor,
-        action,
-        Some("team"),
-        Some(team_id.to_string()),
-        None,
-        metadata,
-    )
-    .await;
-    notify_team_members_changed(pool, notifier, team_id).await;
+    announce(pool, notifier, team_id, actor, action, metadata).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::permissions::{PERM_MANAGE_MEMBERS, PERM_MANAGE_VAULT};
-    use crate::routes::teams::list_teams;
-    use crate::sync_notifier::SyncEvent;
     use crate::test_support::{
-        member_with_role, seed_team_with_roles, seed_user, set_user_tier, BillingMode,
+        listed_team, member_with_role, seed_team_with_roles, seed_user, set_user_tier,
+        team_audit_count as audit_count, team_members_told, BillingMode,
     };
 
     async fn listed(pool: &PgPool, team: Uuid, user: Uuid) -> Option<LockPolicy> {
-        let Json(teams) = list_teams(State(pool.clone()), Extension(AuthUser(user)))
-            .await
-            .unwrap();
-        teams
-            .into_iter()
-            .find(|t| t.id == team)
-            .unwrap()
-            .lock_policy
+        listed_team(pool, team, user).await.lock_policy
     }
 
     #[tokio::test]
@@ -139,7 +95,7 @@ mod tests {
         );
     }
 
-    async fn put(
+    pub(crate) async fn put(
         pool: &PgPool,
         team: Uuid,
         user: Uuid,
@@ -159,7 +115,7 @@ mod tests {
         .await
     }
 
-    async fn clear(pool: &PgPool, team: Uuid, user: Uuid) -> Result<StatusCode, StatusCode> {
+    pub(crate) async fn clear(pool: &PgPool, team: Uuid, user: Uuid) -> Result<StatusCode, StatusCode> {
         clear_lock_policy(
             State(pool.clone()),
             Extension(AuthUser(user)),
@@ -167,15 +123,6 @@ mod tests {
             Path(team),
         )
         .await
-    }
-
-    async fn audit_count(pool: &PgPool, team: Uuid, action: &str) -> i64 {
-        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE team_id = $1 AND action = $2")
-            .bind(team)
-            .bind(action)
-            .fetch_one(pool)
-            .await
-            .unwrap()
     }
 
     #[tokio::test]
@@ -328,15 +275,7 @@ mod tests {
         .await
         .unwrap();
 
-        let want = format!("team_members:{team}");
-        let mut told = std::collections::HashSet::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let SyncEvent::BlobPushed { user_id, device_id } = ev {
-                if device_id == want {
-                    told.insert(user_id);
-                }
-            }
-        }
+        let told = team_members_told(&mut rx, team);
         assert!(told.contains(&owner) && told.contains(&member));
     }
 }

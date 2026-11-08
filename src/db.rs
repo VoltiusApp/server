@@ -1,6 +1,14 @@
+use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::{error, info};
+
+/// Ignores applied versions this build lacks, so a rollback to an older image still boots.
+pub(crate) fn migrator() -> Migrator {
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator
+}
 
 pub async fn create_pool() -> PgPool {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -18,7 +26,7 @@ pub async fn create_pool() -> PgPool {
 
     info!("PostgreSQL connection pool is ready");
 
-    sqlx::migrate!("./migrations")
+    migrator()
         .run(&pool)
         .await
         .unwrap_or_else(|err| {
@@ -28,8 +36,19 @@ pub async fn create_pool() -> PgPool {
     info!("Migrations applied successfully");
 
     reconcile_legacy_grants(&pool).await;
+    backfill_team_policies(&pool).await;
 
     pool
+}
+
+pub(crate) async fn backfill_team_policies(pool: &PgPool) {
+    match sqlx::query(crate::team_policy::LOCK_POLICY_BACKFILL)
+        .execute(pool)
+        .await
+    {
+        Ok(res) => info!(filled = res.rows_affected(), "Backfilled team policy documents"),
+        Err(err) => error!(error = %err, "Failed to backfill team policy documents"),
+    }
 }
 
 /// Migration 037's backfill is one-shot: a rollback-then-forward-again cycle
@@ -119,5 +138,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1, "second run must insert nothing new");
+    }
+
+    #[tokio::test]
+    async fn migrator_boots_past_versions_this_build_lacks() {
+        let pool = test_pool_or_skip!();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (9000000000000000000, 'from a newer image', TRUE, '\\x00'::bytea, 0)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let mut strict = sqlx::migrate!("./migrations");
+        strict.set_locking(false);
+        assert!(matches!(
+            strict.run(&mut *tx).await,
+            Err(sqlx::migrate::MigrateError::VersionMissing(9000000000000000000))
+        ));
+        let mut lenient = migrator();
+        lenient.set_locking(false);
+        lenient.run(&mut *tx).await.unwrap();
+        tx.rollback().await.unwrap();
     }
 }

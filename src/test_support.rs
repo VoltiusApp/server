@@ -84,7 +84,7 @@ pub async fn test_pool() -> Option<PgPool> {
         .expect("connect to TEST_DATABASE_URL");
     // sqlx's migrator takes a Postgres advisory lock, so concurrent test
     // invocations applying migrations is safe.
-    sqlx::migrate!("./migrations")
+    crate::db::migrator()
         .run(&pool)
         .await
         .expect("run migrations on test database");
@@ -312,6 +312,41 @@ pub async fn inviter_with(pool: &PgPool, team: Uuid, extra: i64) -> Uuid {
     seed_builtin_roles(pool, team).await;
     let (_, member, _) = crate::permissions::BUILTIN_ROLES.iter().find(|(name, _, _)| *name == "member").expect("member role");
     member_with_role(pool, team, member | extra).await
+}
+
+pub fn team_members_told(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::sync_notifier::SyncEvent>,
+    team: Uuid,
+) -> std::collections::HashSet<Uuid> {
+    let want = format!("team_members:{team}");
+    let mut told = std::collections::HashSet::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let crate::sync_notifier::SyncEvent::BlobPushed { user_id, device_id } = ev {
+            if device_id == want {
+                told.insert(user_id);
+            }
+        }
+    }
+    told
+}
+
+pub async fn team_audit_count(pool: &PgPool, team: Uuid, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE team_id = $1 AND action = $2")
+        .bind(team)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("count team audit events")
+}
+
+pub async fn listed_team(pool: &PgPool, team: Uuid, user: Uuid) -> crate::routes::teams::TeamWithRole {
+    let axum::Json(teams) = crate::routes::teams::list_teams(
+        axum::extract::State(pool.clone()),
+        axum::Extension(crate::auth::AuthUser(user)),
+    )
+    .await
+    .expect("list teams");
+    teams.into_iter().find(|t| t.id == team).expect("team listed")
 }
 
 pub async fn set_user_tier(pool: &PgPool, user: Uuid, tier: &str) {
