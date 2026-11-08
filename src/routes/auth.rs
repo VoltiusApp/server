@@ -321,17 +321,13 @@ async fn insert_user_with_handle_fallback(
     }
 }
 
-fn email_delivery_configured() -> bool {
-    !std::env::var("RESEND_API_KEY").unwrap_or_default().is_empty()
-}
-
 pub async fn register(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
-    register_with(pool, &notifier, features, email_delivery_configured(), body).await
+    register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await
 }
 
 async fn register_with(

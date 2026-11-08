@@ -292,23 +292,9 @@ pub async fn redeem_grant(
         return Ok(Json(response));
     }
 
-    // A link must not be a way around the owner's seat cap. Membership in any
-    // other team of the same owner already occupies the seat, so those users
-    // are exempt.
+    // A link must not be a way around the owner's seat cap.
     let owner_id = team_owner(&pool, locked.team_id).await?;
-    let holds_a_seat = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM team_members tm JOIN teams t ON t.id = tm.team_id \
-         WHERE t.owner_id = $1 AND tm.user_id = $2)",
-    )
-    .bind(owner_id)
-    .bind(auth.0)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to check seat occupancy"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if !holds_a_seat {
-        ensure_seat_available(&pool, owner_id).await?;
-    }
+    ensure_seat_available(&pool, owner_id, Some(auth.0)).await?;
 
     // Validity and consumption are the same statement. Losing this race means
     // another redeemer took the last use between the lock and here, which the

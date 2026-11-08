@@ -64,10 +64,25 @@ pub(crate) async fn owner_seats_used(pool: &PgPool, owner_id: Uuid) -> Result<i6
 /// Reject with 402 when the owner has no seat left. The single enforcement
 /// point for every path that adds a member; `/subscription-info` reports the
 /// same cap as `effective_seats` so the client pre-check matches this one.
-pub(crate) async fn ensure_seat_available(pool: &PgPool, owner_id: Uuid) -> Result<(), StatusCode> {
+/// An `invitee` already in any of this owner's teams holds a seat and passes.
+pub(crate) async fn ensure_seat_available(pool: &PgPool, owner_id: Uuid, invitee: Option<Uuid>) -> Result<(), StatusCode> {
     let Some(effective_cap) = owner_seat_cap(pool, owner_id).await? else {
         return Ok(());
     };
+    if let Some(user_id) = invitee {
+        let holds_a_seat = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM team_members tm JOIN teams t ON t.id = tm.team_id \
+             WHERE t.owner_id = $1 AND tm.user_id = $2)",
+        )
+        .bind(owner_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| { error!(error = %e, "Failed to check seat occupancy"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        if holds_a_seat {
+            return Ok(());
+        }
+    }
     let used = owner_seats_used(pool, owner_id).await?;
     if used >= effective_cap {
         warn!(owner_id = %owner_id, effective_cap, used, "Seat limit reached");
@@ -450,7 +465,7 @@ pub async fn add_member(
     }
 
     let owner_id = team_owner(&pool, team_id).await?;
-    ensure_seat_available(&pool, owner_id).await?;
+    ensure_seat_available(&pool, owner_id, Some(invitee_id)).await?;
 
     let role_name = body.role.as_deref().unwrap_or("member").to_string();
     require_may_confer_builtin(&pool, team_id, auth.0, &role_name).await?;
@@ -466,7 +481,7 @@ pub async fn add_member(
     .map_err(|e| { error!(error = %e, "Failed to check existing membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if already_member {
-        return Ok((StatusCode::OK, Json(InviteMemberResponse { status: "already_member".to_string() })));
+        return Ok((StatusCode::OK, Json(InviteMemberResponse::status("already_member"))));
     }
 
     let (invitee_email, invitee_display_name) = sqlx::query_as::<_, (String, String)>(
@@ -501,7 +516,7 @@ pub async fn add_member(
     // Notify the invitee so their client refreshes pending invitations
     notifier.notify_pending_invitations_changed(invitee_id);
     notify_team_members_changed(&pool, &notifier, team_id).await;
-    Ok((StatusCode::CREATED, Json(InviteMemberResponse { status: "pending".to_string() })))
+    Ok((StatusCode::CREATED, Json(InviteMemberResponse::status("pending"))))
 }
 
 pub(crate) async fn request_team_rotation(
@@ -1570,6 +1585,15 @@ pub struct InviteMemberRequest {
 #[derive(Serialize)]
 pub struct InviteMemberResponse {
     pub status: String,
+    /// Set only when the invite depends on an email reaching someone with no account yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_sent: Option<bool>,
+}
+
+impl InviteMemberResponse {
+    fn status(status: &str) -> Self {
+        Self { status: status.to_string(), email_sent: None }
+    }
 }
 
 pub async fn invite_member(
@@ -1600,13 +1624,13 @@ pub async fn invite_member(
 
     let owner_id = team_owner(&pool, team_id).await?;
 
-    ensure_seat_available(&pool, owner_id).await?;
-
     let existing_user = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM users WHERE email = $1")
         .bind(&email)
         .fetch_optional(&pool)
         .await
         .map_err(|e| { error!(error = %e, "Failed to look up user by email"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    ensure_seat_available(&pool, owner_id, existing_user.map(|(id,)| id)).await?;
 
     if let Some((user_id,)) = existing_user {
         if user_id == auth.0 {
@@ -1623,7 +1647,7 @@ pub async fn invite_member(
         .map_err(|e| { error!(error = %e, "Failed to check existing membership"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
         if already_member {
-            return Ok(Json(InviteMemberResponse { status: "already_member".to_string() }));
+            return Ok(Json(InviteMemberResponse::status("already_member")));
         }
 
         upsert_pending_invitation(&pool, PendingInvite {
@@ -1654,7 +1678,7 @@ pub async fn invite_member(
         ));
         notifier.notify_pending_invitations_changed(user_id);
         notify_team_members_changed(&pool, &notifier, team_id).await;
-        return Ok(Json(InviteMemberResponse { status: "invited".to_string() }));
+        return Ok(Json(InviteMemberResponse::status("invited")));
     }
 
     // User doesn't exist — create pending invitation and send email
@@ -1680,9 +1704,14 @@ pub async fn invite_member(
     })
     .await?;
 
-    if let Err(e) = crate::email::send_team_invitation(&email, &team_name, &inviter_email, &token).await {
-        error!(error = %e, "Failed to send invitation email");
-    }
+    let email_sent = crate::email::delivery_configured()
+        && match crate::email::send_team_invitation(&email, &team_name, &inviter_email, &token).await {
+            Ok(()) => true,
+            Err(e) => {
+                error!(error = %e, "Failed to send invitation email");
+                false
+            }
+        };
 
     info!(team_id = %team_id, email = %email, "Pending invitation created");
     let invite_display_name = email.split('@').next().unwrap_or(&email).to_string();
@@ -1697,7 +1726,7 @@ pub async fn invite_member(
         Some(json!({ "role": role, "status": "pending", "name": member_name })),
     ));
     notify_team_members_changed(&pool, &notifier, team_id).await;
-    Ok(Json(InviteMemberResponse { status: "invited".to_string() }))
+    Ok(Json(InviteMemberResponse { status: "invited".to_string(), email_sent: Some(email_sent) }))
 }
 
 // ─── List pending invitations ─────────────────────────────────────────────────
@@ -3045,6 +3074,76 @@ mod authz_tests {
             Err(status) => assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED),
             Ok(_) => panic!("expected PAYMENT_REQUIRED (trial clamp), got Ok"),
         }
+    }
+
+    async fn user_email(pool: &sqlx::PgPool, user: Uuid) -> String {
+        sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(user).fetch_one(pool).await.unwrap()
+    }
+
+    async fn call_add(pool: &sqlx::PgPool, team: Uuid, caller: Uuid, invitee: Uuid) -> Result<(StatusCode, String), StatusCode> {
+        let (code, Json(body)) = add_member(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(AddMemberRequest { user_id: Some(invitee), email: None, role: None, name: None }),
+        )
+        .await?;
+        Ok((code, body.status))
+    }
+
+    async fn call_invite(pool: &sqlx::PgPool, team: Uuid, caller: Uuid, email: String) -> Result<InviteMemberResponse, StatusCode> {
+        invite_member(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(SyncNotifier::new()),
+            Path(team),
+            Json(InviteMemberRequest { email, role: None, name: None }),
+        )
+        .await
+        .map(|Json(body)| body)
+    }
+
+    #[tokio::test]
+    async fn re_adding_a_member_is_a_no_op_when_seats_are_full() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_seats(&pool, owner, 2).await;
+        let team = seed_team(&pool, owner).await;
+        let inviter = fill_seats(&pool, team, 1).await;
+        let member = member_with_role(&pool, team, 0).await;
+
+        assert_eq!(call_add(&pool, team, inviter, member).await, Ok((StatusCode::OK, "already_member".to_string())));
+        let email = user_email(&pool, member).await;
+        assert_eq!(call_invite(&pool, team, inviter, email).await.map(|r| r.status), Ok("already_member".to_string()));
+    }
+
+    #[tokio::test]
+    async fn inviting_someone_from_another_of_the_owners_teams_needs_no_new_seat() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_seats(&pool, owner, 2).await;
+        let team = seed_team(&pool, owner).await;
+        let inviter = fill_seats(&pool, team, 1).await;
+        let elsewhere = member_with_role(&pool, seed_team(&pool, owner).await, 0).await;
+        let stranger = seed_user(&pool).await;
+
+        assert_eq!(call_add(&pool, team, inviter, elsewhere).await, Ok((StatusCode::CREATED, "pending".to_string())));
+        assert_eq!(call_add(&pool, team, inviter, stranger).await, Err(StatusCode::PAYMENT_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn email_invite_reports_when_the_email_was_not_sent() {
+        let pool = test_pool_or_skip!();
+        if crate::email::delivery_configured() {
+            return;
+        }
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
+
+        let res = call_invite(&pool, team, inviter, format!("{}@nobody.test", Uuid::new_v4())).await.unwrap();
+        assert_eq!((res.status.as_str(), res.email_sent), ("invited", Some(false)));
     }
 
     #[tokio::test]
