@@ -46,7 +46,8 @@ use sync_notifier::SyncNotifier;
 use terminal_manager::TerminalManager;
 use uuid::Uuid;
 
-pub type PresenceMap = Arc<DashMap<Uuid, ()>>;
+/// Open SSE streams per user; a user is online while their count is above zero.
+pub type PresenceMap = Arc<DashMap<Uuid, usize>>;
 /// Per-user set of connection IDs the user is currently broadcasting as "in use".
 /// Connection IDs are stored as strings to match team_vault_objects.object_id (TEXT).
 pub type UsageMap = Arc<DashMap<Uuid, DashSet<String>>>;

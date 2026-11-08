@@ -225,15 +225,33 @@ struct PresenceGuard {
     pool: PgPool,
 }
 
+fn presence_join(presence: &PresenceMap, user_id: Uuid) {
+    *presence.entry(user_id).or_insert(0) += 1;
+}
+
+/// `Some(stale connection ids)` only when this was the user's last open stream.
+/// Usage is cleared under the presence entry lock so a concurrent join can't lose its announcements.
+fn presence_leave(presence: &PresenceMap, usage: &UsageMap, user_id: Uuid) -> Option<Vec<String>> {
+    let dashmap::mapref::entry::Entry::Occupied(mut entry) = presence.entry(user_id) else {
+        return None;
+    };
+    if *entry.get() > 1 {
+        *entry.get_mut() -= 1;
+        return None;
+    }
+    let stale = usage
+        .remove(&user_id)
+        .map(|(_, set)| set.iter().map(|s| s.clone()).collect())
+        .unwrap_or_default();
+    entry.remove();
+    Some(stale)
+}
+
 impl Drop for PresenceGuard {
     fn drop(&mut self) {
-        self.presence.remove(&self.user_id);
-        // Snapshot and clear any in-flight connection-usage entries before fan-out.
-        let stale_connections: Vec<String> = self
-            .usage
-            .remove(&self.user_id)
-            .map(|(_, set)| set.iter().map(|s| s.clone()).collect())
-            .unwrap_or_default();
+        let Some(stale_connections) = presence_leave(&self.presence, &self.usage, self.user_id) else {
+            return;
+        };
         let (notifier, pool, user_id) = (self.notifier.clone(), self.pool.clone(), self.user_id);
         tokio::spawn(async move {
             let teammates: Vec<Uuid> = sqlx::query_scalar(TEAMMATES_SQL)
@@ -280,7 +298,8 @@ pub async fn sync_stream(
     crate::last_seen::touch(&pool, user_id);
 
     // Register as online and fan-out to teammates.
-    presence.insert(user_id, ());
+    presence_join(&presence, user_id);
+    let guard = PresenceGuard { user_id, presence, usage, notifier: notifier.clone(), pool: pool.clone() };
     let teammates: Vec<Uuid> = sqlx::query_scalar(TEAMMATES_SQL)
         .bind(user_id)
         .fetch_all(&pool)
@@ -291,7 +310,6 @@ pub async fn sync_stream(
     }
 
     let rx = notifier.subscribe();
-    let guard = PresenceGuard { user_id, presence, usage, notifier: notifier.clone(), pool };
 
     let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         let _guard = &guard;
@@ -339,6 +357,71 @@ pub async fn sync_stream(
             .interval(Duration::from_secs(30))
             .text("heartbeat"),
     )
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+
+    fn maps() -> (PresenceMap, UsageMap) {
+        (Arc::new(DashMap::new()), Arc::new(DashMap::new()))
+    }
+
+    fn announce(usage: &UsageMap, user: Uuid, connection_id: &str) {
+        usage.entry(user).or_default().insert(connection_id.to_string());
+    }
+
+    #[test]
+    fn closing_one_of_two_streams_keeps_user_online_and_usage() {
+        let (presence, usage) = maps();
+        let user = Uuid::new_v4();
+        presence_join(&presence, user);
+        presence_join(&presence, user);
+        announce(&usage, user, "conn-1");
+
+        assert_eq!(presence_leave(&presence, &usage, user), None);
+        assert!(presence.contains_key(&user));
+        assert!(usage.get(&user).is_some_and(|s| s.contains("conn-1")));
+    }
+
+    #[test]
+    fn closing_last_stream_goes_offline_and_returns_stale_usage() {
+        let (presence, usage) = maps();
+        let user = Uuid::new_v4();
+        presence_join(&presence, user);
+        presence_join(&presence, user);
+        announce(&usage, user, "conn-1");
+
+        assert_eq!(presence_leave(&presence, &usage, user), None);
+        assert_eq!(presence_leave(&presence, &usage, user), Some(vec!["conn-1".to_string()]));
+        assert!(!presence.contains_key(&user));
+        assert!(usage.get(&user).is_none());
+    }
+
+    #[test]
+    fn leave_without_join_is_a_no_op() {
+        let (presence, usage) = maps();
+        let user = Uuid::new_v4();
+        announce(&usage, user, "conn-1");
+
+        assert_eq!(presence_leave(&presence, &usage, user), None);
+        assert!(usage.get(&user).is_some());
+    }
+
+    #[test]
+    fn other_users_are_untouched() {
+        let (presence, usage) = maps();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        presence_join(&presence, a);
+        presence_join(&presence, b);
+        announce(&usage, b, "conn-b");
+
+        assert_eq!(presence_leave(&presence, &usage, a), Some(vec![]));
+        assert!(presence.contains_key(&b));
+        assert!(usage.get(&b).is_some());
+    }
 }
 
 #[cfg(test)]

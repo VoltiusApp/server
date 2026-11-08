@@ -117,6 +117,10 @@ pub(crate) fn app_url() -> String {
     std::env::var("VOLTIUS_APP_URL").unwrap_or_else(|_| "https://app.voltius.app".to_string())
 }
 
+pub fn delivery_configured() -> bool {
+    !std::env::var("RESEND_API_KEY").unwrap_or_default().is_empty()
+}
+
 async fn send_via_resend(
     to: &str,
     subject: &str,
