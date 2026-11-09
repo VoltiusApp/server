@@ -27,6 +27,8 @@ pub struct MetaResponse {
     pub wrapped_secrets_cas: bool,
     /// Only Owners confer the Owner role, and `PUT /v1/teams/:id/billing-owner` exists.
     pub multi_owner: bool,
+    /// The server can send email; without it registration auto-verifies and approval-gated enrolment is unavailable.
+    pub email_delivery: bool,
 }
 
 pub async fn get_meta(
@@ -34,8 +36,12 @@ pub async fn get_meta(
     Extension(cipher): Extension<SeedCipher>,
     Extension(passkeys): Extension<Passkeys>,
 ) -> Json<MetaResponse> {
+    Json(meta_response(&features, &cipher, &passkeys, crate::email::delivery_configured()))
+}
+
+fn meta_response(features: &Features, cipher: &SeedCipher, passkeys: &Passkeys, email_delivery: bool) -> MetaResponse {
     let self_hosted = self_host::is_self_hosted();
-    Json(MetaResponse {
+    MetaResponse {
         self_hosted,
         billing_enabled: !self_hosted,
         registration_enabled: features.registration,
@@ -47,7 +53,8 @@ pub async fn get_meta(
         passkeys: passkeys.available(),
         wrapped_secrets_cas: true,
         multi_owner: true,
-    })
+        email_delivery,
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +104,14 @@ mod tests {
     async fn meta_advertises_wrapped_secrets_cas() {
         let Json(meta) = get_meta(Extension(Features::open()), Extension(SeedCipher::for_tests()), Extension(Passkeys::for_tests())).await;
         assert_eq!(serde_json::to_value(&meta).unwrap()["wrapped_secrets_cas"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn meta_reports_email_delivery() {
+        for configured in [true, false] {
+            let meta = meta_response(&Features::open(), &SeedCipher::for_tests(), &Passkeys::for_tests(), configured);
+            assert_eq!(serde_json::to_value(&meta).unwrap()["email_delivery"], serde_json::json!(configured));
+        }
     }
 
     #[tokio::test]

@@ -14,9 +14,7 @@
 //! [`crate::session_grants`] — a code minted for one purpose being redeemable
 //! on another path is exactly the bug that produced that rule.
 
-use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
-use rand::RngCore;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -38,14 +36,6 @@ pub const GRANTABLE_ROLES: &[&str] = &["manager", "editor", "member", "connect-o
 
 pub fn is_grantable_role(role: &str) -> bool {
     GRANTABLE_ROLES.contains(&role)
-}
-
-/// 256 bits of URL-safe randomness. Longer than the session-grant token
-/// because this one travels in a shareable link with a multi-day life.
-pub fn generate_secret() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Clamp a requested TTL into `[60, MAX_TTL_SECS]`, defaulting when absent.
@@ -79,7 +69,7 @@ pub async fn create(
     ttl: Duration,
     created_by: Uuid,
 ) -> Result<(GrantRow, String), sqlx::Error> {
-    let secret = generate_secret();
+    let secret = crate::enrollment::mint_secret();
     let expires_at = Utc::now() + ttl;
 
     let (id, created_at_role): (Uuid, String) = sqlx::query_as(

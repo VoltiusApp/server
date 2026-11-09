@@ -704,7 +704,8 @@ pub async fn verify_email(
            RETURNING user_id
          )
          UPDATE users
-         SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now())
+         SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now()),
+             email_proven_at = COALESCE(email_proven_at, now())
          FROM consumed
          WHERE users.id = consumed.user_id
          RETURNING users.email, users.id, users.handle, users.handle_is_custom",
@@ -778,8 +779,8 @@ pub async fn resend_verification_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (email, verified, undeliverable) = sqlx::query_as::<_, (String, bool, bool)>(
-        "SELECT email, email_verified, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
+    let (email, proven, undeliverable) = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT email, email_proven_at IS NOT NULL, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(auth.0)
     .fetch_one(&mut *tx)
@@ -789,7 +790,7 @@ pub async fn resend_verification_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if verified {
+    if proven {
         return Ok(StatusCode::OK.into_response());
     }
     if undeliverable {
@@ -1956,6 +1957,80 @@ mod handler_tests {
         let (generated, _) = handle_row(&pool, off_id).await;
         verify(&pool, false, off_token).await;
         assert_eq!(handle_row(&pool, off_id).await, (generated, false));
+    }
+
+    async fn proven_at(pool: &PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT email_proven_at FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_email_sets_email_proven_at() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (id, token) = registered_unverified(&pool, false, &format!("{}@corp.test", unique_handle("pv"))).await;
+        assert!(proven_at(&pool, id).await.is_none());
+        verify(&pool, false, token).await;
+        assert!(proven_at(&pool, id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn register_auto_verify_leaves_email_proven_at_null() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let email = format!("{}@corp.test", unique_handle("av"));
+        let (_, Json(resp)) = register_with(pool.clone(), &SyncNotifier::new(), features(false).0, false, register_req(&email, Uuid::new_v4(), None))
+            .await
+            .unwrap();
+        let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+            .bind(resp.user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(verified);
+        assert!(proven_at(&pool, resp.user_id).await.is_none());
+    }
+
+    async fn verification_token_count(pool: &PgPool, id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM email_verification_tokens WHERE user_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn resend(pool: &PgPool, id: Uuid) -> StatusCode {
+        resend_verification_email(State(pool.clone()), Extension(AuthUser(id))).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn resend_sends_when_verified_but_not_proven() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(verification_token_count(&pool, id).await, 0);
+        assert_eq!(resend(&pool, id).await, StatusCode::OK);
+        assert_eq!(verification_token_count(&pool, id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn resend_is_a_no_op_once_proven() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_verified = TRUE, email_proven_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(resend(&pool, id).await, StatusCode::OK);
+        assert_eq!(verification_token_count(&pool, id).await, 0);
     }
 
     async fn stored_wrapped(pool: &PgPool, id: Uuid) -> Option<String> {

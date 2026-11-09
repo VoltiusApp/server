@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod email;
+mod enrollment;
 mod entitlement;
 mod features;
 mod handles;

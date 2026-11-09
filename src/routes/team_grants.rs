@@ -1110,9 +1110,9 @@ mod tests {
 
     #[test]
     fn generated_secrets_are_url_safe_and_high_entropy() {
-        let secret = grants::generate_secret();
+        let secret = crate::enrollment::mint_secret();
         assert_eq!(secret.len(), 43, "43 base64url characters is 256 bits");
         assert!(secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-        assert_ne!(secret, grants::generate_secret());
+        assert_ne!(secret, crate::enrollment::mint_secret());
     }
 }
