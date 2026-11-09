@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::enrollment::{
     audit_request, decide_pending, mint_secret, normalize_domains, notify_join_requests_changed, redeem_for, try_admit,
-    Guard, RedeemOutcome, role_or_default,
+    Guard, RedeemOutcome, RedeemResponse, role_or_default,
 };
 use crate::rate_limit::{check_budget, ClientIp, EnrollmentRedeemRateLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter};
 use crate::routes::audit::write_audit_event;
@@ -260,7 +260,7 @@ impl From<StatusCode> for EnrollError {
 impl From<EnrollError> for ApiError {
     fn from(err: EnrollError) -> Self {
         match err {
-            EnrollError::NotFound => StatusCode::NOT_FOUND.into(),
+            EnrollError::NotFound => ApiError::coded(StatusCode::NOT_FOUND, "ENROLLMENT_NOT_FOUND"),
             EnrollError::Gone => StatusCode::GONE.into(),
             EnrollError::Unavailable => ApiError::coded(StatusCode::PAYMENT_REQUIRED, "ENROLLMENT_UNAVAILABLE"),
             EnrollError::DomainMismatch => ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"),
@@ -318,6 +318,7 @@ pub async fn resolve(
         "allowed_domains": token.allowed_domains,
         "require_approval": token.require_approval,
         "registration_open": true,
+        "team_id": token.team_id,
     })))
 }
 
@@ -334,11 +335,12 @@ pub async fn redeem(
     Extension(notifier): Extension<SyncNotifier>,
     Extension(EnrollmentRedeemRateLimiter(limiter)): Extension<EnrollmentRedeemRateLimiter>,
     Json(body): Json<RedeemRequest>,
-) -> Result<Json<RedeemOutcome>, ApiError> {
+) -> Result<Json<RedeemResponse>, ApiError> {
     check_budget(&limiter, auth.0, "enrollment_redeem").await?;
     validate_public_key(body.public_key.as_deref())?;
     let token = load_live_token(&pool, body.id, &body.secret).await?;
-    Ok(Json(redeem_for(&pool, &notifier, &token, auth.0, body.public_key.as_deref()).await?))
+    let outcome = redeem_for(&pool, &notifier, &token, auth.0, body.public_key.as_deref()).await?;
+    Ok(Json(RedeemResponse { outcome, team_id: token.team_id }))
 }
 
 #[derive(Deserialize)]
@@ -901,8 +903,35 @@ mod tests {
                 "allowed_domains": ["acme.com"],
                 "require_approval": true,
                 "registration_open": true,
+                "team_id": team,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_token_is_coded_not_found() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let token = created(&pool, team, manager, body("member", &[], true)).await;
+
+        let expected = (StatusCode::NOT_FOUND, json!({ "error": "ENROLLMENT_NOT_FOUND" }));
+        assert_eq!(app.resolve("10.0.0.3", Uuid::new_v4(), &token.secret).await, expected);
+        assert_eq!(app.resolve("10.0.0.3", token.id, "wrong-secret").await, expected);
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_team_id() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let token = created(&pool, team, manager, body("member", &[], true)).await;
+
+        let (status, value) = app.resolve("10.0.0.4", token.id, &token.secret).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["team_id"], json!(team));
     }
 
     #[tokio::test]
@@ -1146,6 +1175,19 @@ mod tests {
         secret: &str,
         public_key: Option<&str>,
     ) -> Result<serde_json::Value, ApiError> {
+        let mut value = redeem_full(pool, notifier, user, id, secret, public_key).await?;
+        value.as_object_mut().unwrap().remove("team_id");
+        Ok(value)
+    }
+
+    async fn redeem_full(
+        pool: &PgPool,
+        notifier: &SyncNotifier,
+        user: Uuid,
+        id: Uuid,
+        secret: &str,
+        public_key: Option<&str>,
+    ) -> Result<serde_json::Value, ApiError> {
         let Json(outcome) = redeem(
             State(pool.clone()),
             Extension(AuthUser(user)),
@@ -1212,6 +1254,20 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn redeem_returns_team_id() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let notifier = SyncNotifier::new();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let (id, secret) = insert_token(&pool, team, manager, "member", &["acme.com"], true).await;
+        let user = user_at(&pool, &fresh_email("acme.com"), true).await;
+
+        let outcome = redeem_full(&pool, &notifier, user, id, &secret, None).await.unwrap();
+
+        assert_eq!(outcome, json!({ "status": "pending", "reason": "approval", "team_id": team }));
     }
 
     #[tokio::test]
@@ -1682,7 +1738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_with_token_redeems_in_the_same_call() {
+    async fn register_with_token_returns_team_id_and_redeems_in_the_same_call() {
         let _env = DeliveryGuard::off(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let app = signup_app(&pool, Features::open(), 5);
@@ -1693,7 +1749,7 @@ mod tests {
         let (status, value) = app.register("10.0.3.1", &email, Some((token.id, &token.secret))).await;
 
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(value["enrollment"], json!({ "status": "pending", "reason": "approval" }));
+        assert_eq!(value["enrollment"], json!({ "status": "pending", "reason": "approval", "team_id": team }));
         assert!(value["jwt_token"].is_string());
         let user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&pool).await.unwrap();
         assert_eq!(pending_request(&pool, team, user).await.1, Some("approval".to_string()));

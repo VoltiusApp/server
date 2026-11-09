@@ -115,6 +115,13 @@ impl Serialize for RedeemOutcome {
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct RedeemResponse {
+    #[serde(flatten)]
+    pub outcome: RedeemOutcome,
+    pub team_id: Uuid,
+}
+
 #[derive(sqlx::FromRow)]
 struct PendingRequest {
     user_id: Uuid,
