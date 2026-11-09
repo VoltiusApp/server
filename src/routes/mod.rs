@@ -14,6 +14,7 @@ pub mod presence;
 pub mod resend_webhook;
 pub mod session_codes;
 pub mod sync;
+pub mod team_enrollment;
 pub mod team_grants;
 pub mod team_lock_policy;
 pub mod team_policy;
@@ -50,4 +51,28 @@ pub(crate) fn email_undeliverable_response() -> Response {
 
 pub(crate) fn coded_error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(serde_json::json!({ "error": code }))).into_response()
+}
+
+#[derive(Debug)]
+pub(crate) struct ApiError(pub StatusCode, pub Option<&'static str>);
+
+impl ApiError {
+    pub(crate) fn coded(status: StatusCode, code: &'static str) -> Self {
+        ApiError(status, Some(code))
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        ApiError(status, None)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self.1 {
+            Some(code) => coded_error(self.0, code),
+            None => self.0.into_response(),
+        }
+    }
 }

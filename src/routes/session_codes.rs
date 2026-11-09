@@ -8,7 +8,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::rate_limit::{check_user_budget, RedeemRateLimiter, SessionCodeRateLimiter};
+use crate::rate_limit::{check_budget, RedeemRateLimiter, SessionCodeRateLimiter};
 use crate::session_grants;
 
 #[derive(Debug, Serialize)]
@@ -34,7 +34,7 @@ pub async fn create_code(
     Extension(SessionCodeRateLimiter(limiter)): Extension<SessionCodeRateLimiter>,
     Path(session_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<CreateCodeResponse>), StatusCode> {
-    check_user_budget(&limiter, auth.0, "session_code_mint").await?;
+    check_budget(&limiter, auth.0, "session_code_mint").await?;
     crate::routes::terminal::require_active_session_host(&pool, session_id, auth.0).await?;
 
     // Only invite_link sessions admit through the short-code/grant path
@@ -68,7 +68,7 @@ pub async fn redeem_code(
     Extension(RedeemRateLimiter(limiter)): Extension<RedeemRateLimiter>,
     Json(body): Json<RedeemRequest>,
 ) -> Result<Json<RedeemResponse>, StatusCode> {
-    check_user_budget(&limiter, auth.0, "session_code_redeem").await?;
+    check_budget(&limiter, auth.0, "session_code_redeem").await?;
 
     // Unknown, malformed, expired and revoked all answer 404: no response
     // distinguishes a real code from a wrong one.

@@ -21,8 +21,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::enrollment::role_or_default;
 use crate::permissions::{require_all_team_permissions, PERM_INVITE_MEMBERS};
-use crate::rate_limit::{check_user_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
+use crate::rate_limit::{check_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
 use crate::routes::audit::write_audit_event;
 use crate::routes::invitations::{admit_member, announce_member_joined};
 use crate::routes::teams::{ensure_seat_available, notify_team_members_changed, team_owner};
@@ -36,8 +37,73 @@ const MAX_PUBLIC_KEY_LEN: usize = 256;
 /// The create/list/revoke gate, in one place: the same permission bit that
 /// guards `POST /v1/teams/:team_id/invite`. Preview and redeem are deliberately
 /// not gated on it — they are authenticated as whoever holds the link.
-async fn require_grant_admin(pool: &PgPool, team_id: Uuid, user: Uuid) -> Result<(), StatusCode> {
+pub(crate) async fn require_grant_admin(pool: &PgPool, team_id: Uuid, user: Uuid) -> Result<(), StatusCode> {
     require_all_team_permissions(pool, team_id, user, &[PERM_INVITE_MEMBERS]).await
+}
+
+/// Link-borne roles are the built-in ones below owner, and the actor may not confer more than they hold.
+pub(crate) async fn require_grantable_role(
+    pool: &PgPool,
+    team_id: Uuid,
+    actor: Uuid,
+    role: &str,
+) -> Result<(), StatusCode> {
+    if !grants::is_grantable_role(role) {
+        warn!(team_id = %team_id, user_id = %actor, role = %role, "Rejected non-grantable role");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    crate::team_authority::require_may_confer_builtin(pool, team_id, actor, role).await
+}
+
+pub(crate) fn validate_public_key(key: Option<&str>) -> Result<(), StatusCode> {
+    match key {
+        Some(key) if key.trim().is_empty() || key.len() > MAX_PUBLIC_KEY_LEN => Err(StatusCode::BAD_REQUEST),
+        _ => Ok(()),
+    }
+}
+
+/// Overwriting a published key would orphan every vault key already wrapped to it; rotation is PUT /v1/auth/public-key.
+async fn store_public_key_if_empty(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    key: Option<&str>,
+) -> Result<(), StatusCode> {
+    let Some(key) = key else { return Ok(()) };
+    sqlx::query(
+        "UPDATE users SET public_key = $1, updated_at = now() \
+         WHERE id = $2 AND (public_key IS NULL OR public_key = '')",
+    )
+    .bind(key)
+    .bind(user_id)
+    .execute(conn)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to record redeemer public key");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(())
+}
+
+/// Without a key on the roster row no key-holder can wrap for the member, so the join is refused.
+pub(crate) async fn ensure_public_key(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    key: Option<&str>,
+) -> Result<(), StatusCode> {
+    store_public_key_if_empty(&mut *conn, user_id, key).await?;
+    let has_key = sqlx::query_scalar::<_, bool>("SELECT public_key IS NOT NULL AND public_key <> '' FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to verify redeemer public key");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if !has_key {
+        warn!(user_id = %user_id, "Join without a public key");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
 }
 
 fn reject(rejection: GrantRejection) -> StatusCode {
@@ -98,15 +164,11 @@ pub async fn create_grant(
     Path(team_id): Path<Uuid>,
     Json(body): Json<CreateGrantRequest>,
 ) -> Result<(StatusCode, Json<CreateGrantResponse>), StatusCode> {
-    check_user_budget(&limiter, auth.0, "team_grant_mint").await?;
+    check_budget(&limiter, auth.0, "team_grant_mint").await?;
     require_grant_admin(&pool, team_id, auth.0).await?;
 
-    let role = body.role.as_deref().unwrap_or("member").to_string();
-    if !grants::is_grantable_role(&role) {
-        warn!(team_id = %team_id, user_id = %auth.0, role = %role, "Rejected non-grantable role");
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    crate::team_authority::require_may_confer_builtin(&pool, team_id, auth.0, &role).await?;
+    let role = role_or_default(body.role.as_deref()).to_string();
+    require_grantable_role(&pool, team_id, auth.0, &role).await?;
 
     let max_uses = grants::clamp_max_uses(body.max_uses);
     let ttl = grants::clamp_ttl(body.expires_in_secs);
@@ -219,7 +281,7 @@ pub async fn preview_grant(
     Path(grant_id): Path<Uuid>,
     Json(body): Json<SecretRequest>,
 ) -> Result<Json<PreviewResponse>, StatusCode> {
-    check_user_budget(&limiter, auth.0, "team_grant_preview").await?;
+    check_budget(&limiter, auth.0, "team_grant_preview").await?;
 
     let preview = grants::preview(&pool, grant_id, &body.secret)
         .await
@@ -258,13 +320,9 @@ pub async fn redeem_grant(
     Path(grant_id): Path<Uuid>,
     Json(body): Json<RedeemGrantRequest>,
 ) -> Result<Json<RedeemGrantResponse>, StatusCode> {
-    check_user_budget(&limiter, auth.0, "team_grant_redeem").await?;
+    check_budget(&limiter, auth.0, "team_grant_redeem").await?;
 
-    if let Some(key) = body.public_key.as_deref() {
-        if key.trim().is_empty() || key.len() > MAX_PUBLIC_KEY_LEN {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
+    validate_public_key(body.public_key.as_deref())?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for grant redemption");
@@ -311,39 +369,7 @@ pub async fn redeem_grant(
     // to whoever minted the link.
     admit_member(&mut tx, locked.team_id, auth.0, Some(locked.created_by), &locked.role, &[], None).await?;
 
-    // Fill a missing key only. Overwriting a key a user already published
-    // would orphan every vault key already wrapped to it, in this team and
-    // every other; rotation belongs to PUT /v1/auth/public-key.
-    if let Some(key) = body.public_key.as_deref() {
-        sqlx::query(
-            "UPDATE users SET public_key = $1, updated_at = now() \
-             WHERE id = $2 AND (public_key IS NULL OR public_key = '')",
-        )
-        .bind(key)
-        .bind(auth.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to record redeemer public key");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
-
-    // Without a key on the roster row, no key-holder can wrap for this member
-    // and the joiner lands in a vault that can never fill. Refuse the join
-    // rather than create that state.
-    let has_key = sqlx::query_scalar::<_, bool>(
-        "SELECT public_key IS NOT NULL AND public_key <> '' FROM users WHERE id = $1",
-    )
-    .bind(auth.0)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to verify redeemer public key"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if !has_key {
-        warn!(user_id = %auth.0, "Join grant redemption without a public key");
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    ensure_public_key(&mut tx, auth.0, body.public_key.as_deref()).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit grant redemption");
@@ -1110,9 +1136,9 @@ mod tests {
 
     #[test]
     fn generated_secrets_are_url_safe_and_high_entropy() {
-        let secret = grants::generate_secret();
+        let secret = crate::enrollment::mint_secret();
         assert_eq!(secret.len(), 43, "43 base64url characters is 256 bits");
         assert!(secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-        assert_ne!(secret, grants::generate_secret());
+        assert_ne!(secret, crate::enrollment::mint_secret());
     }
 }

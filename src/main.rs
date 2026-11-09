@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod email;
+mod enrollment;
 mod entitlement;
 mod features;
 mod handles;
@@ -35,8 +36,8 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
-    RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
+    EnrollmentRedeemRateLimiter, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
+    RedeemRateLimiter, RegisterRateLimiter, ResendVerificationRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
@@ -57,6 +58,42 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
+
+fn signup_routes(
+    notifier: sync_notifier::SyncNotifier,
+    auth_limiter: RateLimiter,
+    register_limiter: RegisterRateLimiter,
+    resolve_limiter: EnrollmentResolveLimiter,
+    token_limiter: EnrollmentRegisterLimiter,
+) -> Router<sqlx::PgPool> {
+    Router::new()
+        .route("/v1/auth/register", post(routes::auth::register))
+        .route(
+            "/v1/enrollment/resolve",
+            post(routes::team_enrollment::resolve).layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .layer(Extension(notifier))
+        .layer(Extension(auth_limiter))
+        .layer(Extension(register_limiter))
+        .layer(Extension(resolve_limiter))
+        .layer(Extension(token_limiter))
+        .layer(middleware::from_fn(rate_limit::attach_client_ip))
+}
+
+fn enrollment_routes() -> Router<sqlx::PgPool> {
+    Router::new()
+        .route(
+            "/v1/teams/:team_id/enrollment-token",
+            post(routes::team_enrollment::create_token)
+                .get(routes::team_enrollment::get_token)
+                .delete(routes::team_enrollment::revoke_token),
+        )
+        .route("/v1/enrollment/redeem", post(routes::team_enrollment::redeem))
+        .route("/v1/teams/:team_id/join-requests", get(routes::team_enrollment::list_requests))
+        .route("/v1/teams/:team_id/join-requests/:request_id/approve", post(routes::team_enrollment::approve))
+        .route("/v1/teams/:team_id/join-requests/:request_id/deny", post(routes::team_enrollment::deny))
+        .route_layer(middleware::from_fn(features::require_team_invites))
+}
 
 // Merged routers keep the last one's fallback, layers included; without this an
 // unknown path would run whatever middleware the last merged router carries.
@@ -234,6 +271,10 @@ async fn main() {
         register_per_day,
         Duration::from_secs(86400),
     ));
+    let enrollment_resolve_limiter =
+        EnrollmentResolveLimiter(RateLimiter::<std::net::IpAddr>::new(60, Duration::from_secs(60)));
+    let enrollment_register_limiter =
+        EnrollmentRegisterLimiter(RateLimiter::<uuid::Uuid>::new(500, Duration::from_secs(86400)));
     let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(
         invite_per_hour,
         Duration::from_secs(3600),
@@ -260,6 +301,10 @@ async fn main() {
         GrantMintRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
     let grant_redeem_limiter =
         GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
+    let enrollment_redeem_limiter =
+        EnrollmentRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
+    let resend_verification_limiter =
+        ResendVerificationRateLimiter(RateLimiter::<uuid::Uuid>::new(5, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -290,15 +335,13 @@ async fn main() {
         "Configured two-factor authentication"
     );
 
-    // Register — stricter limit: 5/day per IP on top of the general auth 10/min
-    let register_route = Router::new()
-        .route("/v1/auth/register", post(routes::auth::register))
-        .layer(Extension(notifier.clone()))
-        .layer(middleware::from_fn(rate_limit::register_rate_limit))
-        .layer(Extension(register_limiter))
-        .layer(middleware::from_fn(rate_limit::auth_rate_limit))
-        .layer(Extension(auth_limiter.clone()))
-        .layer(middleware::from_fn(features::require_registration));
+    let register_route = signup_routes(
+        notifier.clone(),
+        auth_limiter.clone(),
+        register_limiter,
+        enrollment_resolve_limiter,
+        enrollment_register_limiter,
+    );
 
     // Public auth + public invitation lookup — rate limited at 10/min per IP
     let public = Router::new()
@@ -312,7 +355,8 @@ async fn main() {
             get(routes::invitations::get_invitation),
         )
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
-        .layer(Extension(auth_limiter));
+        .layer(Extension(auth_limiter))
+        .layer(Extension(notifier.clone()));
 
     // A revoked session retries refresh every few seconds, and a passkey ceremony runs in the
     // browser beside the sign-in it completes; neither may spend the sign-in budget.
@@ -453,6 +497,7 @@ async fn main() {
         )
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route("/v1/teams/:team_id/billing-owner", put(routes::team_ownership::transfer_billing_owner))
+        .merge(enrollment_routes())
         .route(
             "/v1/teams/:team_id/lock-policy",
             put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),
@@ -742,6 +787,8 @@ async fn main() {
         .layer(Extension(redeem_limiter))
         .layer(Extension(grant_mint_limiter))
         .layer(Extension(grant_redeem_limiter))
+        .layer(Extension(enrollment_redeem_limiter))
+        .layer(Extension(resend_verification_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

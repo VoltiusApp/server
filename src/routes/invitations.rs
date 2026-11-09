@@ -196,6 +196,10 @@ pub(crate) async fn announce_member_joined(
         Some(metadata),
     )
     .await;
+    notify_member_added(pool, notifier, team_id, user_id).await;
+}
+
+pub(crate) async fn notify_member_added(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid, user_id: Uuid) {
     notifier.notify_membership_changed(user_id, team_id, true);
     notify_team_members_changed(pool, notifier, team_id).await;
 }

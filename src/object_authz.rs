@@ -64,6 +64,12 @@ pub struct MemberRow {
     pub role_ids: Vec<Uuid>,
 }
 
+impl MemberContext {
+    pub fn effective(&self) -> i64 {
+        crate::permissions::with_dependencies(self.base)
+    }
+}
+
 impl MemberRow {
     pub fn context(&self, locked: bool) -> MemberContext {
         let base = if locked {

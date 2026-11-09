@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{warn, Instrument};
 use uuid::Uuid;
 
 /// Per-key sliding window rate limiter. Key is typically IpAddr or Uuid.
@@ -216,29 +216,39 @@ pub struct GrantMintRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct GrantRedeemRateLimiter(pub RateLimiter<Uuid>);
 
-/// Register endpoint: N registrations/day per IP.
-pub async fn register_rate_limit(
-    axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
+/// Enrolment-token redemptions per user, so a leaked token cannot be probed through one account.
+#[derive(Clone)]
+pub struct EnrollmentRedeemRateLimiter(pub RateLimiter<Uuid>);
+
+/// Handlers that charge IP limiters themselves read the address from here.
+#[derive(Clone, Copy)]
+pub struct ClientIp(pub IpAddr);
+
+pub async fn attach_client_ip(mut req: Request, next: Next) -> Response {
     let ip = extract_ip(&req);
-    if !limiter.check(ip).await {
-        warn!(%ip, "Register rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(next.run(req).await)
+    req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
 }
 
-/// Checks a per-user limiter, warning and returning 429 on exhaustion. The
-/// one place this shape is expressed; middlewares and handlers alike call it.
-pub async fn check_user_budget(
-    limiter: &RateLimiter<Uuid>,
-    user: Uuid,
+/// Public token lookups (resolve, and the token branch of register), per IP.
+#[derive(Clone)]
+pub struct EnrollmentResolveLimiter(pub RateLimiter<IpAddr>);
+
+/// Sign-ups through one enrolment token, so a fleet rollout behind one NAT is not capped per IP.
+#[derive(Clone)]
+pub struct EnrollmentRegisterLimiter(pub RateLimiter<Uuid>);
+
+#[derive(Clone)]
+pub struct ResendVerificationRateLimiter(pub RateLimiter<Uuid>);
+
+pub async fn check_budget<K: Eq + Hash + Send + std::fmt::Display + 'static>(
+    limiter: &RateLimiter<K>,
+    key: K,
     label: &str,
 ) -> Result<(), StatusCode> {
-    if !limiter.check(user).await {
-        warn!(user_id = %user, limiter = label, "Rate limit exceeded");
+    let shown = format!("{key}");
+    if !limiter.check(key).await {
+        warn!(key = %shown, limiter = label, "Rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(())
@@ -253,7 +263,7 @@ async fn user_keyed_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    check_user_budget(limiter, user, label).await?;
+    check_budget(limiter, user, label).await?;
     Ok(next.run(req).await)
 }
 
@@ -283,13 +293,8 @@ pub async fn auth_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = extract_ip(&req);
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    if !limiter.check(ip).await {
-        warn!(%ip, method = %method, path = %path, "Auth rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    let span = tracing::warn_span!("auth_request", method = %req.method(), path = %req.uri().path());
+    check_budget(&limiter, extract_ip(&req), "auth").instrument(span).await?;
     Ok(next.run(req).await)
 }
 
@@ -299,11 +304,7 @@ pub async fn waitlist_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = extract_ip(&req);
-    if !limiter.check(ip).await {
-        warn!(%ip, "Waitlist rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    check_budget(&limiter, extract_ip(&req), "waitlist").await?;
     Ok(next.run(req).await)
 }
 

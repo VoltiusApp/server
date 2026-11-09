@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -18,6 +18,13 @@ use crate::auth::{
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
+use crate::enrollment::{admit_verified_requests, domain_allowed, redeem_for, RedeemOutcome};
+use crate::rate_limit::{
+    check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
+    ResendVerificationRateLimiter,
+};
+use crate::routes::team_enrollment::load_live_token;
+use crate::routes::ApiError;
 use crate::email::{send_password_changed_email, send_verification_email};
 use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
@@ -255,6 +262,22 @@ pub struct RegisterRequest {
     pub wrapped_user_secrets: Option<String>,
     #[serde(default)]
     pub machine_fingerprint: Option<String>,
+    #[serde(default)]
+    pub enrollment: Option<EnrollmentCredential>,
+}
+
+#[derive(Deserialize)]
+pub struct EnrollmentCredential {
+    pub id: Uuid,
+    pub secret: String,
+}
+
+#[derive(Serialize)]
+pub struct RegisterResponse {
+    #[serde(flatten)]
+    session: AuthResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrollment: Option<RedeemOutcome>,
 }
 
 #[derive(Serialize)]
@@ -321,13 +344,78 @@ async fn insert_user_with_handle_fallback(
     }
 }
 
+async fn charge_ip_gates(
+    auth: &RateLimiter,
+    register: &RateLimiter,
+    ip: std::net::IpAddr,
+) -> Result<(), StatusCode> {
+    check_budget(auth, ip, "auth").await?;
+    check_budget(register, ip, "register").await
+}
+
+async fn charge_untokened_gates(
+    features: &crate::features::Features,
+    auth: &RateLimiter,
+    register: &RateLimiter,
+    ip: std::net::IpAddr,
+) -> Result<(), ApiError> {
+    features.registration_open()?;
+    Ok(charge_ip_gates(auth, register, ip).await?)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn register(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
-    Json(body): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
-    register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await
+    axum::Extension(ClientIp(ip)): axum::Extension<ClientIp>,
+    axum::Extension(auth_limiter): axum::Extension<RateLimiter>,
+    axum::Extension(RegisterRateLimiter(register_limiter)): axum::Extension<RegisterRateLimiter>,
+    axum::Extension(EnrollmentResolveLimiter(resolve_limiter)): axum::Extension<EnrollmentResolveLimiter>,
+    axum::Extension(EnrollmentRegisterLimiter(token_limiter)): axum::Extension<EnrollmentRegisterLimiter>,
+    body: Result<Json<RegisterRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?;
+            return Err(rejection.status().into());
+        }
+    };
+    let credential = body.enrollment.as_ref().filter(|_| features.team_invites);
+    let token = match credential {
+        Some(credential) => match load_live_token(&pool, credential.id, &credential.secret).await {
+            Ok(token) => {
+                check_budget(&token_limiter, token.id, "enrollment_register").await?;
+                Some(token)
+            }
+            Err(err) => {
+                check_budget(&resolve_limiter, ip, "enrollment_resolve").await?;
+                charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
+                return Err(err.into());
+            }
+        },
+        None => {
+            charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?;
+            None
+        }
+    };
+    if let Some(token) = &token {
+        if !domain_allowed(&token.guard(), &crate::email::normalize(&body.email)) {
+            return Err(ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"));
+        }
+    }
+    let public_key = body.public_key.clone();
+    let (status, Json(session)) =
+        register_with(pool.clone(), &notifier, features, crate::email::delivery_configured(), body).await?;
+    let enrollment = match &token {
+        Some(token) => redeem_for(&pool, &notifier, token, session.user_id, public_key.as_deref())
+            .await
+            .map_err(|err| warn!(?err, user_id = %session.user_id, "Enrolment redeem after registration failed"))
+            .ok(),
+        None => None,
+    };
+    Ok((status, Json(RegisterResponse { session, enrollment })))
 }
 
 async fn register_with(
@@ -687,6 +775,7 @@ async fn derive_handle_on_verify(tx: &mut sqlx::PgConnection, user_id: Uuid, ema
 pub async fn verify_email(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     Json(body): Json<VerifyEmailRequest>,
 ) -> Result<Json<VerifyEmailResponse>, StatusCode> {
     let db_err = |what: &'static str| {
@@ -704,7 +793,8 @@ pub async fn verify_email(
            RETURNING user_id
          )
          UPDATE users
-         SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now())
+         SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, now()),
+             email_proven_at = COALESCE(email_proven_at, now())
          FROM consumed
          WHERE users.id = consumed.user_id
          RETURNING users.email, users.id, users.handle, users.handle_is_custom",
@@ -720,6 +810,7 @@ pub async fn verify_email(
         }
         tx.commit().await.map_err(db_err("Failed to commit email verification"))?;
         info!(email = %email, "User email verified");
+        admit_verified_requests(&pool, &notifier, user_id).await;
         return Ok(Json(VerifyEmailResponse { email, user_id }));
     }
     drop(tx);
@@ -772,14 +863,15 @@ async fn issue_verification_token(conn: &mut sqlx::PgConnection, user_id: Uuid) 
 pub async fn resend_verification_email(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(ResendVerificationRateLimiter(limiter)): axum::Extension<ResendVerificationRateLimiter>,
 ) -> Result<Response, StatusCode> {
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin verification resend transaction");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (email, verified, undeliverable) = sqlx::query_as::<_, (String, bool, bool)>(
-        "SELECT email, email_verified, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
+    let (email, proven, undeliverable) = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT email, email_proven_at IS NOT NULL, email_undeliverable_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(auth.0)
     .fetch_one(&mut *tx)
@@ -789,12 +881,13 @@ pub async fn resend_verification_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if verified {
+    if proven {
         return Ok(StatusCode::OK.into_response());
     }
     if undeliverable {
         return Ok(email_undeliverable_response());
     }
+    check_budget(&limiter, auth.0, "resend_verification").await?;
 
     let token = issue_verification_token(&mut tx, auth.0).await?;
 
@@ -1052,7 +1145,8 @@ mod handler_tests {
     use crate::auth::jwt::validate_token;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial,
+        add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial, BillingMode,
+        DeliveryGuard,
     };
     use axum::extract::State;
     use axum::Extension;
@@ -1071,6 +1165,15 @@ mod handler_tests {
         }
     }
 
+    async fn register(
+        State(pool): State<PgPool>,
+        Extension(features): Extension<Features>,
+        Extension(notifier): Extension<SyncNotifier>,
+        Json(body): Json<RegisterRequest>,
+    ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+        register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await
+    }
+
     fn register_req(email: &str, account_id: Uuid, fp: Option<&str>) -> RegisterRequest {
         RegisterRequest {
             email: email.to_string(),
@@ -1079,6 +1182,7 @@ mod handler_tests {
             public_key: None,
             wrapped_user_secrets: None,
             machine_fingerprint: fp.map(str::to_string),
+            enrollment: None,
         }
     }
 
@@ -1919,7 +2023,7 @@ mod handler_tests {
     }
 
     async fn verify(pool: &PgPool, switch: bool, token: String) {
-        let _ = verify_email(State(pool.clone()), features(switch), Json(VerifyEmailRequest { token })).await.unwrap();
+        let _ = verify_email(State(pool.clone()), features(switch), Extension(SyncNotifier::new()), Json(VerifyEmailRequest { token })).await.unwrap();
     }
 
     #[tokio::test]
@@ -1956,6 +2060,150 @@ mod handler_tests {
         let (generated, _) = handle_row(&pool, off_id).await;
         verify(&pool, false, off_token).await;
         assert_eq!(handle_row(&pool, off_id).await, (generated, false));
+    }
+
+    async fn proven_at(pool: &PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT email_proven_at FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_email_sets_email_proven_at() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (id, token) = registered_unverified(&pool, false, &format!("{}@corp.test", unique_handle("pv"))).await;
+        assert!(proven_at(&pool, id).await.is_none());
+        verify(&pool, false, token).await;
+        assert!(proven_at(&pool, id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn register_auto_verify_leaves_email_proven_at_null() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let email = format!("{}@corp.test", unique_handle("av"));
+        let (_, Json(resp)) = register_with(pool.clone(), &SyncNotifier::new(), features(false).0, false, register_req(&email, Uuid::new_v4(), None))
+            .await
+            .unwrap();
+        let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+            .bind(resp.user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(verified);
+        assert!(proven_at(&pool, resp.user_id).await.is_none());
+    }
+
+    async fn verification_token_count(pool: &PgPool, id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM email_verification_tokens WHERE user_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn resend_with(pool: &PgPool, id: Uuid, budget: &ResendVerificationRateLimiter) -> StatusCode {
+        match resend_verification_email(State(pool.clone()), Extension(AuthUser(id)), Extension(budget.clone())).await {
+            Ok(response) => response.status(),
+            Err(status) => status,
+        }
+    }
+
+    async fn resend(pool: &PgPool, id: Uuid) -> StatusCode {
+        resend_with(pool, id, &crate::test_support::default_resend_limiter()).await
+    }
+
+    #[tokio::test]
+    async fn resend_is_capped_at_five_an_hour_per_user() {
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
+        let pool = test_pool_or_skip!();
+        let budget = crate::test_support::default_resend_limiter();
+        let (id, other) = (seed_user(&pool).await, seed_user(&pool).await);
+        for _ in 0..5 {
+            assert_eq!(resend_with(&pool, id, &budget).await, StatusCode::OK);
+        }
+        assert_eq!(resend_with(&pool, id, &budget).await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resend_with(&pool, other, &budget).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn resend_sends_when_verified_but_not_proven() {
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(verification_token_count(&pool, id).await, 0);
+        assert_eq!(resend(&pool, id).await, StatusCode::OK);
+        assert_eq!(verification_token_count(&pool, id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn changing_email_clears_the_proven_address_and_resend_issues_a_link() {
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let id = crate::test_support::seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        sqlx::query("UPDATE users SET email_verified = TRUE, email_proven_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status = update_email(
+            State(pool.clone()),
+            Extension(AuthUser(id)),
+            Json(UpdateEmailRequest {
+                new_email: format!("{}@moved.test", unique_handle("nm")),
+                auth_key: "auth-key-secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(proven_at(&pool, id).await.is_none());
+        let after_change = verification_token_count(&pool, id).await;
+        assert_eq!(resend(&pool, id).await, StatusCode::OK);
+        assert_eq!(verification_token_count(&pool, id).await, after_change + 1);
+    }
+
+    #[tokio::test]
+    async fn any_email_change_clears_the_proof() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_proven_at = now() WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET email = email, handle_is_custom = handle_is_custom WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(proven_at(&pool, id).await.is_some());
+
+        sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
+            .bind(format!("{}@moved.test", unique_handle("tr")))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(proven_at(&pool, id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resend_is_a_no_op_once_proven() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_verified = TRUE, email_proven_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(resend(&pool, id).await, StatusCode::OK);
+        assert_eq!(verification_token_count(&pool, id).await, 0);
     }
 
     async fn stored_wrapped(pool: &PgPool, id: Uuid) -> Option<String> {

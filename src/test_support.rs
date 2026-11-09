@@ -41,11 +41,7 @@ impl BillingMode {
 
     fn set(key: Option<&str>) -> Self {
         let lock = env_lock();
-        let prev = std::env::var("LEMONSQUEEZY_API_KEY").ok();
-        match key {
-            Some(k) => std::env::set_var("LEMONSQUEEZY_API_KEY", k),
-            None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
-        }
+        let prev = swap_env("LEMONSQUEEZY_API_KEY", key);
         let prev_mode = crate::self_host::set_test_billing_mode(Some(key.is_none()));
         BillingMode(lock, prev, prev_mode)
     }
@@ -53,11 +49,42 @@ impl BillingMode {
 
 impl Drop for BillingMode {
     fn drop(&mut self) {
-        match &self.1 {
-            Some(v) => std::env::set_var("LEMONSQUEEZY_API_KEY", v),
-            None => std::env::remove_var("LEMONSQUEEZY_API_KEY"),
-        }
+        swap_env("LEMONSQUEEZY_API_KEY", self.1.as_deref());
         crate::self_host::set_test_billing_mode(self.2);
+    }
+}
+
+fn swap_env(name: &str, value: Option<&str>) -> Option<String> {
+    let prev = std::env::var(name).ok();
+    match value {
+        Some(v) => std::env::set_var(name, v),
+        None => std::env::remove_var(name),
+    }
+    prev
+}
+
+/// Email delivery on or off for the test, under the env lock the billing mode holds.
+#[allow(dead_code)]
+pub struct DeliveryGuard(BillingMode, Option<String>);
+
+impl DeliveryGuard {
+    pub fn on(billing: BillingMode) -> Self {
+        Self::set(billing, Some("test-key"))
+    }
+
+    pub fn off(billing: BillingMode) -> Self {
+        Self::set(billing, None)
+    }
+
+    fn set(billing: BillingMode, key: Option<&str>) -> Self {
+        let prev = swap_env("RESEND_API_KEY", key);
+        DeliveryGuard(billing, prev)
+    }
+}
+
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        swap_env("RESEND_API_KEY", self.1.as_deref());
     }
 }
 
@@ -120,6 +147,13 @@ macro_rules! test_pool_or_skip {
 pub fn default_knock_limiter() -> crate::rate_limit::KnockRateLimiter {
     crate::rate_limit::KnockRateLimiter(crate::rate_limit::RateLimiter::new(
         20,
+        std::time::Duration::from_secs(3600),
+    ))
+}
+
+pub fn default_resend_limiter() -> crate::rate_limit::ResendVerificationRateLimiter {
+    crate::rate_limit::ResendVerificationRateLimiter(crate::rate_limit::RateLimiter::new(
+        5,
         std::time::Duration::from_secs(3600),
     ))
 }
@@ -318,11 +352,17 @@ pub fn team_members_told(
     rx: &mut tokio::sync::broadcast::Receiver<crate::sync_notifier::SyncEvent>,
     team: Uuid,
 ) -> std::collections::HashSet<Uuid> {
-    let want = format!("team_members:{team}");
+    told(rx, &format!("team_members:{team}"))
+}
+
+pub fn told(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::sync_notifier::SyncEvent>,
+    payload: &str,
+) -> std::collections::HashSet<Uuid> {
     let mut told = std::collections::HashSet::new();
     while let Ok(ev) = rx.try_recv() {
         if let crate::sync_notifier::SyncEvent::BlobPushed { user_id, device_id } = ev {
-            if device_id == want {
+            if device_id == payload {
                 told.insert(user_id);
             }
         }

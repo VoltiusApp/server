@@ -163,4 +163,17 @@ mod tests {
         lenient.run(&mut *tx).await.unwrap();
         tx.rollback().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn every_foreign_key_to_users_has_a_delete_rule() {
+        let pool = test_pool_or_skip!();
+        let without_rule: Vec<String> = sqlx::query_scalar(
+            "SELECT conrelid::regclass::text || '.' || conname FROM pg_constraint \
+             WHERE contype = 'f' AND confrelid = 'users'::regclass AND confdeltype = 'a' ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(without_rule, Vec::<String>::new());
+    }
 }

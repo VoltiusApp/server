@@ -253,6 +253,7 @@ mod tests {
         let resend = crate::routes::auth::resend_verification_email(
             State(pool.clone()),
             axum::Extension(crate::auth::AuthUser(unverified)),
+            axum::Extension(crate::test_support::default_resend_limiter()),
         )
         .await
         .unwrap();

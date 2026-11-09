@@ -161,6 +161,19 @@ pub async fn notify_team(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid, 
     .await;
 }
 
+pub async fn notify_team_permission_holders(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    team_id: Uuid,
+    perm: i64,
+    payload: String,
+) {
+    let members = crate::object_authz::member_contexts(pool, team_id, None).await.unwrap_or_default();
+    for member in members.iter().filter(|m| m.effective() & perm != 0) {
+        notifier.notify(member.user_id, payload.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

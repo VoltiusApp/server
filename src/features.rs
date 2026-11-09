@@ -4,8 +4,8 @@ use axum::{
     extract::Request,
     http::StatusCode,
     middleware::Next,
-    response::{IntoResponse, Response},
-    Extension, Json,
+    response::Response,
+    Extension,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,13 @@ impl Features {
             team_invites: env_flag("TEAM_INVITES_ENABLED", true),
             handles_from_email: env_flag("HANDLES_FROM_EMAIL", false),
         }
+    }
+
+    pub(crate) fn registration_open(&self) -> Result<(), crate::routes::ApiError> {
+        if self.registration {
+            return Ok(());
+        }
+        Err(crate::routes::ApiError::coded(StatusCode::FORBIDDEN, "REGISTRATION_DISABLED"))
     }
 
     #[cfg(test)]
@@ -49,15 +56,7 @@ async fn deny_unless(enabled: bool, code: &'static str, req: Request, next: Next
     if enabled {
         return next.run(req).await;
     }
-    (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": code }))).into_response()
-}
-
-pub async fn require_registration(
-    Extension(features): Extension<Features>,
-    req: Request,
-    next: Next,
-) -> Response {
-    deny_unless(features.registration, "REGISTRATION_DISABLED", req, next).await
+    crate::routes::coded_error(StatusCode::FORBIDDEN, code)
 }
 
 pub async fn require_team_invites(
@@ -86,9 +85,16 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn register_handler(
+        Extension(features): Extension<Features>,
+    ) -> Result<StatusCode, crate::routes::ApiError> {
+        features.registration_open()?;
+        Ok(StatusCode::OK)
+    }
+
     async fn call(features: Features) -> (StatusCode, StatusCode) {
         let app = Router::new()
-            .route("/register", post(ok_handler).layer(from_fn(require_registration)))
+            .route("/register", post(register_handler))
             .route("/invite", post(ok_handler).layer(from_fn(require_team_invites)))
             .layer(Extension(features));
         let mut statuses = Vec::new();
@@ -141,8 +147,7 @@ mod tests {
     #[tokio::test]
     async fn refusal_names_the_disabled_feature() {
         let app = Router::new()
-            .route("/register", post(ok_handler))
-            .layer(from_fn(require_registration))
+            .route("/register", post(register_handler))
             .layer(Extension(Features { registration: false, ..Features::open() }));
         let resp = app
             .oneshot(Request::post("/register").body(Body::empty()).unwrap())
