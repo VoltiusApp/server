@@ -21,6 +21,7 @@ use crate::auth::{
 use crate::enrollment::{admit_verified_requests, domain_allowed, redeem_for, RedeemOutcome};
 use crate::rate_limit::{
     check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
+    ResendVerificationRateLimiter,
 };
 use crate::routes::team_enrollment::load_live_token;
 use crate::routes::ApiError;
@@ -383,19 +384,17 @@ pub async fn register(
     };
     let credential = body.enrollment.as_ref().filter(|_| features.team_invites);
     let token = match credential {
-        Some(credential) => {
-            check_budget(&resolve_limiter, ip, "enrollment_resolve").await?;
-            match load_live_token(&pool, credential.id, &credential.secret).await {
-                Ok(token) => {
-                    check_budget(&token_limiter, token.id, "enrollment_register").await?;
-                    Some(token)
-                }
-                Err(err) => {
-                    charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
-                    return Err(err.into());
-                }
+        Some(credential) => match load_live_token(&pool, credential.id, &credential.secret).await {
+            Ok(token) => {
+                check_budget(&token_limiter, token.id, "enrollment_register").await?;
+                Some(token)
             }
-        }
+            Err(err) => {
+                check_budget(&resolve_limiter, ip, "enrollment_resolve").await?;
+                charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
+                return Err(err.into());
+            }
+        },
         None => {
             charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?;
             None
@@ -864,6 +863,7 @@ async fn issue_verification_token(conn: &mut sqlx::PgConnection, user_id: Uuid) 
 pub async fn resend_verification_email(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(ResendVerificationRateLimiter(limiter)): axum::Extension<ResendVerificationRateLimiter>,
 ) -> Result<Response, StatusCode> {
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin verification resend transaction");
@@ -887,6 +887,7 @@ pub async fn resend_verification_email(
     if undeliverable {
         return Ok(email_undeliverable_response());
     }
+    check_budget(&limiter, auth.0, "resend_verification").await?;
 
     let token = issue_verification_token(&mut tx, auth.0).await?;
 
@@ -993,7 +994,7 @@ pub async fn update_email(
     })?;
 
     sqlx::query(
-        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, email_proven_at = NULL, email_undeliverable_at = NULL, updated_at = now() WHERE id = $2",
+        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, email_undeliverable_at = NULL, updated_at = now() WHERE id = $2",
     )
     .bind(&new_email)
     .bind(auth.0)
@@ -1144,7 +1145,8 @@ mod handler_tests {
     use crate::auth::jwt::validate_token;
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial,
+        add_member, seed_team, seed_user, seed_user_with_credentials, set_user_tier, set_user_trial, BillingMode,
+        DeliveryGuard,
     };
     use axum::extract::State;
     use axum::Extension;
@@ -2103,12 +2105,33 @@ mod handler_tests {
             .unwrap()
     }
 
+    async fn resend_with(pool: &PgPool, id: Uuid, budget: &ResendVerificationRateLimiter) -> StatusCode {
+        match resend_verification_email(State(pool.clone()), Extension(AuthUser(id)), Extension(budget.clone())).await {
+            Ok(response) => response.status(),
+            Err(status) => status,
+        }
+    }
+
     async fn resend(pool: &PgPool, id: Uuid) -> StatusCode {
-        resend_verification_email(State(pool.clone()), Extension(AuthUser(id))).await.unwrap().status()
+        resend_with(pool, id, &crate::test_support::default_resend_limiter()).await
+    }
+
+    #[tokio::test]
+    async fn resend_is_capped_at_five_an_hour_per_user() {
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
+        let pool = test_pool_or_skip!();
+        let budget = crate::test_support::default_resend_limiter();
+        let (id, other) = (seed_user(&pool).await, seed_user(&pool).await);
+        for _ in 0..5 {
+            assert_eq!(resend_with(&pool, id, &budget).await, StatusCode::OK);
+        }
+        assert_eq!(resend_with(&pool, id, &budget).await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resend_with(&pool, other, &budget).await, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn resend_sends_when_verified_but_not_proven() {
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let id = crate::test_support::seed_user(&pool).await;
         sqlx::query("UPDATE users SET email_verified = TRUE, email_verified_at = now() WHERE id = $1")
@@ -2123,6 +2146,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn changing_email_clears_the_proven_address_and_resend_issues_a_link() {
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let account_id = Uuid::new_v4();
         let id = crate::test_support::seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
@@ -2146,6 +2170,27 @@ mod handler_tests {
         let after_change = verification_token_count(&pool, id).await;
         assert_eq!(resend(&pool, id).await, StatusCode::OK);
         assert_eq!(verification_token_count(&pool, id).await, after_change + 1);
+    }
+
+    #[tokio::test]
+    async fn any_email_change_clears_the_proof() {
+        let pool = test_pool_or_skip!();
+        let id = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET email_proven_at = now() WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET email = email, handle_is_custom = handle_is_custom WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(proven_at(&pool, id).await.is_some());
+
+        sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
+            .bind(format!("{}@moved.test", unique_handle("tr")))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(proven_at(&pool, id).await.is_none());
     }
 
     #[tokio::test]

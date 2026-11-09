@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::enrollment::role_or_default;
 use crate::permissions::{require_all_team_permissions, PERM_INVITE_MEMBERS};
 use crate::rate_limit::{check_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
 use crate::routes::audit::write_audit_event;
@@ -166,7 +167,7 @@ pub async fn create_grant(
     check_budget(&limiter, auth.0, "team_grant_mint").await?;
     require_grant_admin(&pool, team_id, auth.0).await?;
 
-    let role = body.role.as_deref().unwrap_or("member").to_string();
+    let role = role_or_default(body.role.as_deref()).to_string();
     require_grantable_role(&pool, team_id, auth.0, &role).await?;
 
     let max_uses = grants::clamp_max_uses(body.max_uses);

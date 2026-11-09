@@ -55,7 +55,7 @@ async fn audit(pool: &PgPool, team_id: Uuid, actor: Uuid, action: &str, token_id
 
 #[derive(Deserialize)]
 pub struct CreateTokenRequest {
-    pub role: String,
+    pub role: Option<String>,
     pub allowed_domains: Vec<String>,
     pub require_approval: bool,
     pub expires_at: Option<DateTime<Utc>>,
@@ -86,7 +86,12 @@ impl std::fmt::Debug for CreateTokenResponse {
     }
 }
 
+const MAX_DOMAINS: usize = 50;
+
 fn validated_domains(body: &CreateTokenRequest) -> Result<Vec<String>, ApiError> {
+    if body.allowed_domains.len() > MAX_DOMAINS {
+        return Err(StatusCode::BAD_REQUEST.into());
+    }
     let domains = normalize_domains(&body.allowed_domains).map_err(|()| ApiError::from(StatusCode::BAD_REQUEST))?;
     if domains.is_empty() && !body.require_approval {
         return Err(ApiError::coded(StatusCode::BAD_REQUEST, "ENROLLMENT_NEEDS_GUARD"));
@@ -109,7 +114,8 @@ pub async fn create_token(
 ) -> Result<(StatusCode, Json<CreateTokenResponse>), ApiError> {
     check_budget(&limiter, auth.0, "enrollment_token_mint").await?;
     require_grant_admin(&pool, team_id, auth.0).await?;
-    require_grantable_role(&pool, team_id, auth.0, &body.role).await?;
+    let role = role_or_default(body.role.as_deref()).to_string();
+    require_grantable_role(&pool, team_id, auth.0, &role).await?;
     let domains = validated_domains(&body)?;
     require_granular(&pool, team_id, false).await?;
 
@@ -124,7 +130,7 @@ pub async fn create_token(
     )
     .bind(team_id)
     .bind(hash_secret(&secret))
-    .bind(&body.role)
+    .bind(&role)
     .bind(&domains)
     .bind(body.require_approval)
     .bind(body.expires_at)
@@ -137,7 +143,7 @@ pub async fn create_token(
     info!(team_id = %team_id, token_id = %id, rotated = replaced.is_some(), "Enrollment token created");
     let action = if replaced.is_some() { "enrollment_token.rotated" } else { "enrollment_token.created" };
     let metadata = json!({
-        "role": body.role,
+        "role": role,
         "allowed_domains": domains,
         "require_approval": body.require_approval,
         "expires_at": body.expires_at,
@@ -149,7 +155,7 @@ pub async fn create_token(
         Json(CreateTokenResponse {
             id,
             secret,
-            role: body.role,
+            role,
             allowed_domains: domains,
             require_approval: body.require_approval,
             expires_at: body.expires_at,
@@ -235,21 +241,19 @@ pub(crate) enum EnrollError {
     Unavailable,
     DomainMismatch,
     NoSeat,
-    MissingKey,
-    Internal,
+    Status(StatusCode),
 }
 
 impl From<sqlx::Error> for EnrollError {
     fn from(e: sqlx::Error) -> Self {
         error!(error = %e, "Enrollment query failed");
-        EnrollError::Internal
+        EnrollError::Status(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
 
 impl From<StatusCode> for EnrollError {
     fn from(status: StatusCode) -> Self {
-        error!(%status, "Enrollment dependency failed");
-        EnrollError::Internal
+        EnrollError::Status(status)
     }
 }
 
@@ -261,8 +265,7 @@ impl From<EnrollError> for ApiError {
             EnrollError::Unavailable => ApiError::coded(StatusCode::PAYMENT_REQUIRED, "ENROLLMENT_UNAVAILABLE"),
             EnrollError::DomainMismatch => ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"),
             EnrollError::NoSeat => StatusCode::PAYMENT_REQUIRED.into(),
-            EnrollError::MissingKey => StatusCode::BAD_REQUEST.into(),
-            EnrollError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into(),
+            EnrollError::Status(status) => status.into(),
         }
     }
 }
@@ -285,20 +288,15 @@ pub(crate) async fn load_live_token(pool: &PgPool, id: Uuid, secret: &str) -> Re
     .bind(id)
     .bind(hash_secret(secret))
     .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to load enrollment token");
-        EnrollError::Internal
-    })?
+    .await?
     .ok_or(EnrollError::NotFound)?;
     if found.revoked || found.expired {
         return Err(EnrollError::Gone);
     }
-    match team_locked(pool, found.row.team_id).await {
-        Ok(false) => Ok(found.row),
-        Ok(true) => Err(EnrollError::Unavailable),
-        Err(_) => Err(EnrollError::Internal),
+    if team_locked(pool, found.row.team_id).await? {
+        return Err(EnrollError::Unavailable);
     }
+    Ok(found.row)
 }
 
 #[derive(Deserialize)]
@@ -434,7 +432,7 @@ mod tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{
         add_member, grant_builtin_role, member_with_role, seed_team_with_roles, seed_user, set_user_tier,
-        team_audit_count, BillingMode,
+        team_audit_count, told, BillingMode, DeliveryGuard,
     };
     use axum::body::Body;
     use axum::http::Request;
@@ -457,7 +455,7 @@ mod tests {
 
     fn body(role: &str, domains: &[&str], approval: bool) -> CreateTokenRequest {
         CreateTokenRequest {
-            role: role.to_string(),
+            role: Some(role.to_string()),
             allowed_domains: domains.iter().map(|d| d.to_string()).collect(),
             require_approval: approval,
             expires_at: None,
@@ -571,18 +569,13 @@ mod tests {
 
     #[tokio::test]
     async fn create_without_approval_on_server_without_email_is_400_needs_approval() {
-        let _billing = BillingMode::self_hosted();
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let (team, _owner, manager) = team_with_manager(&pool).await;
-        let previous = std::env::var("RESEND_API_KEY").ok();
-        std::env::remove_var("RESEND_API_KEY");
 
         let without = create(&pool, team, manager, body("member", &["example.com"], false)).await;
         let with = create(&pool, team, manager, body("member", &["example.com"], true)).await;
 
-        if let Some(v) = previous {
-            std::env::set_var("RESEND_API_KEY", v);
-        }
         assert_eq!(
             error_code(without.unwrap_err()),
             (StatusCode::BAD_REQUEST, Some("ENROLLMENT_NEEDS_APPROVAL"))
@@ -592,19 +585,31 @@ mod tests {
 
     #[tokio::test]
     async fn domains_without_approval_are_allowed_when_email_is_configured() {
+        let _env = DeliveryGuard::on(BillingMode::self_hosted());
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        assert!(create(&pool, team, manager, body("member", &["example.com"], false)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_without_role_defaults_to_member() {
         let _billing = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let (team, _owner, manager) = team_with_manager(&pool).await;
-        let previous = std::env::var("RESEND_API_KEY").ok();
-        std::env::set_var("RESEND_API_KEY", "test-key");
+        let token = created(&pool, team, manager, CreateTokenRequest { role: None, ..body("member", &[], true) }).await;
+        assert_eq!(token.role, "member");
+        assert_eq!(fetch(&pool, team, manager).await["token"]["role"], "member");
+    }
 
-        let result = create(&pool, team, manager, body("member", &["example.com"], false)).await;
-
-        match previous {
-            Some(v) => std::env::set_var("RESEND_API_KEY", v),
-            None => std::env::remove_var("RESEND_API_KEY"),
-        }
-        assert!(result.is_ok());
+    #[tokio::test]
+    async fn more_than_fifty_domains_is_400() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let domains: Vec<String> = (0..51).map(|i| format!("d{i}.example")).collect();
+        let domains: Vec<&str> = domains.iter().map(String::as_str).collect();
+        assert_eq!(create(&pool, team, manager, body("member", &domains, true)).await.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(create(&pool, team, manager, body("member", &domains[..50], true)).await.is_ok());
     }
 
     #[tokio::test]
@@ -714,30 +719,28 @@ mod tests {
 
     #[tokio::test]
     async fn team_invites_disabled_blocks_all_routes() {
-        let app = axum::Router::new()
-            .route(
-                "/v1/teams/:team_id/enrollment-token",
-                axum::routing::post(create_token)
-                    .get(get_token)
-                    .delete(revoke_token)
-                    .layer(axum::middleware::from_fn(crate::features::require_team_invites)),
-            )
+        let app = crate::enrollment_routes()
             .layer(Extension(Features { team_invites: false, ..Features::open() }))
             .with_state(crate::test_support::dead_pool().await);
+        let (team, request) = (Uuid::new_v4(), Uuid::new_v4());
+        let token = format!("/v1/teams/{team}/enrollment-token");
+        let requests = format!("/v1/teams/{team}/join-requests");
 
-        for method in ["POST", "GET", "DELETE"] {
+        for (method, uri) in [
+            ("POST", token.clone()),
+            ("GET", token.clone()),
+            ("DELETE", token),
+            ("POST", "/v1/enrollment/redeem".to_string()),
+            ("GET", requests.clone()),
+            ("POST", format!("{requests}/{request}/approve")),
+            ("POST", format!("{requests}/{request}/deny")),
+        ] {
             let resp = app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(format!("/v1/teams/{}/enrollment-token", Uuid::new_v4()))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(Request::builder().method(method).uri(&uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
         }
     }
 
@@ -1047,6 +1050,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fifty_machines_resolve_and_register_from_one_ip() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let token = acme_token(&pool).await;
+        for machine in 0..50 {
+            assert_eq!(app.resolve("10.0.2.3", token.id, &token.secret).await.0, StatusCode::OK, "resolve {machine}");
+            let (status, _) = app.register("10.0.2.3", &fresh_email("acme.com"), Some((token.id, &token.secret))).await;
+            assert_eq!(status, StatusCode::CREATED, "register {machine}");
+        }
+    }
+
+    #[tokio::test]
     async fn token_budget_is_keyed_on_the_token() {
         let _billing = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
@@ -1108,8 +1124,8 @@ mod tests {
 
     async fn user_at(pool: &PgPool, email: &str, proven: bool) -> Uuid {
         let user = seed_user(pool).await;
-        sqlx::query("UPDATE users SET email = $1, email_proven_at = CASE WHEN $2 THEN now() END WHERE id = $3")
-            .bind(email)
+        sqlx::query("UPDATE users SET email = $1 WHERE id = $2").bind(email).bind(user).execute(pool).await.unwrap();
+        sqlx::query("UPDATE users SET email_proven_at = CASE WHEN $1 THEN now() END WHERE id = $2")
             .bind(proven)
             .bind(user)
             .execute(pool)
@@ -1167,17 +1183,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unset, 0);
-    }
-
-    async fn with_delivery<T>(f: impl std::future::Future<Output = T>) -> T {
-        let previous = std::env::var("RESEND_API_KEY").ok();
-        std::env::set_var("RESEND_API_KEY", "test-key");
-        let out = f.await;
-        match previous {
-            Some(v) => std::env::set_var("RESEND_API_KEY", v),
-            None => std::env::remove_var("RESEND_API_KEY"),
-        }
-        out
     }
 
     async fn request_count(pool: &PgPool, team: Uuid, user: Uuid) -> i64 {
@@ -1240,7 +1245,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((status.as_str(), reason), ("approved", None));
-        assert_eq!(team_audit_count(&pool, team, "join_request.created").await, 1);
+        assert_eq!(team_audit_count(&pool, team, "join_request.created").await, 0);
         assert_eq!(team_audit_count(&pool, team, "member.admitted").await, 1);
         let via: serde_json::Value =
             sqlx::query_scalar("SELECT metadata FROM audit_logs WHERE team_id = $1 AND action = 'member.admitted'")
@@ -1353,6 +1358,93 @@ mod tests {
 
         crate::test_support::set_user_seats(&pool, owner, 5).await;
         assert_eq!(approve_as(&pool, &notifier, manager, team, request).await.unwrap(), json!({ "status": "admitted" }));
+    }
+
+    #[tokio::test]
+    async fn approve_that_parks_on_the_seat_limit_notifies_holders() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let notifier = SyncNotifier::new();
+        let (team, owner, manager) = team_with_manager(&pool).await;
+        crate::test_support::set_user_seats(&pool, owner, 1).await;
+        let (id, secret) = insert_token(&pool, team, manager, "member", &[], true).await;
+        let user = user_at(&pool, &fresh_email("acme.com"), true).await;
+        redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
+        let (request, _) = pending_request(&pool, team, user).await;
+        let mut rx = notifier.subscribe();
+
+        assert_eq!(approve_as(&pool, &notifier, manager, team, request).await.unwrap_err().0, StatusCode::PAYMENT_REQUIRED);
+
+        assert!(told(&mut rx, &format!("join_requests:{team}")).contains(&manager));
+    }
+
+    #[tokio::test]
+    async fn re_redeem_that_changes_the_reason_notifies_holders() {
+        let _env = DeliveryGuard::on(BillingMode::self_hosted());
+        let pool = test_pool_or_skip!();
+        let notifier = SyncNotifier::new();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let (id, secret) = insert_token(&pool, team, manager, "member", &["acme.com"], true).await;
+        let user = user_at(&pool, &fresh_email("acme.com"), false).await;
+        let first = redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
+        assert_eq!(first, json!({ "status": "pending", "reason": "email_unverified" }));
+        sqlx::query("UPDATE users SET email_proven_at = now() WHERE id = $1").bind(user).execute(&pool).await.unwrap();
+        let mut rx = notifier.subscribe();
+
+        let second = redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
+
+        assert_eq!(second, json!({ "status": "pending", "reason": "approval" }));
+        assert!(told(&mut rx, &format!("join_requests:{team}")).contains(&manager));
+        assert_eq!(request_count(&pool, team, user).await, 1);
+        assert_eq!(team_audit_count(&pool, team, "join_request.created").await, 1);
+    }
+
+    #[tokio::test]
+    async fn one_user_redeeming_twice_at_once_never_sees_not_found() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let notifier = SyncNotifier::new();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let (id, secret) = insert_token(&pool, team, manager, "member", &["acme.com"], false).await;
+        let user = user_at(&pool, &fresh_email("acme.com"), true).await;
+
+        let mut gate = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM teams WHERE id = $1 FOR NO KEY UPDATE").bind(team).fetch_one(&mut *gate).await.unwrap();
+        let racers = [(); 2].map(|()| {
+            let (pool, notifier, secret) = (pool.clone(), notifier.clone(), secret.clone());
+            tokio::spawn(async move { redeem_as(&pool, &notifier, user, id, &secret).await.map_err(error_code) })
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        gate.commit().await.unwrap();
+        let mut outcomes = Vec::new();
+        for racer in racers {
+            outcomes.push(racer.await.unwrap().unwrap()["status"].clone());
+        }
+        outcomes.sort_by_key(|status| status.to_string());
+
+        assert_eq!(outcomes, vec![json!("admitted"), json!("member")]);
+        assert_eq!(membership_count(&pool, team, user).await, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_token_creator_keeps_the_token_admitting() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let notifier = SyncNotifier::new();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let (id, secret) = insert_token(&pool, team, manager, "member", &["acme.com"], false).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(manager).execute(&pool).await.unwrap();
+
+        let creator: Option<Uuid> = sqlx::query_scalar("SELECT created_by FROM team_enrollment_tokens WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(creator, None);
+        let user = user_at(&pool, &fresh_email("acme.com"), true).await;
+        assert_eq!(redeem_as(&pool, &notifier, user, id, &secret).await.unwrap(), json!({ "status": "admitted" }));
+        assert_eq!(membership_count(&pool, team, user).await, 1);
     }
 
     #[tokio::test]
@@ -1505,15 +1597,7 @@ mod tests {
 
         redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
 
-        let want = format!("join_requests:{team}");
-        let mut told = std::collections::HashSet::new();
-        while let Ok(event) = rx.try_recv() {
-            if let SyncEvent::BlobPushed { user_id, device_id } = event {
-                if device_id == want {
-                    told.insert(user_id);
-                }
-            }
-        }
+        let told = told(&mut rx, &format!("join_requests:{team}"));
         assert!(told.contains(&manager) && told.contains(&inviter));
         assert!(!told.contains(&plain) && !told.contains(&user));
     }
@@ -1599,7 +1683,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_with_token_redeems_in_the_same_call() {
-        let _billing = BillingMode::self_hosted();
+        let _env = DeliveryGuard::off(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let app = signup_app(&pool, Features::open(), 5);
         let (team, _owner, manager) = team_with_manager(&pool).await;
@@ -1638,19 +1722,16 @@ mod tests {
 
     #[tokio::test]
     async fn both_guard_token_with_unproven_email_waits_for_verification_not_approval() {
-        let _billing = BillingMode::self_hosted();
+        let _env = DeliveryGuard::on(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let notifier = SyncNotifier::new();
         let (team, _owner, manager) = team_with_manager(&pool).await;
         let (id, secret) = insert_token(&pool, team, manager, "member", &["acme.com"], true).await;
         let user = user_at(&pool, &fresh_email("acme.com"), false).await;
 
-        let (redeemed, approved) = with_delivery(async {
-            let redeemed = redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
-            let (request, _) = pending_request(&pool, team, user).await;
-            (redeemed, approve_as(&pool, &notifier, manager, team, request).await.unwrap())
-        })
-        .await;
+        let redeemed = redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
+        let (request, _) = pending_request(&pool, team, user).await;
+        let approved = approve_as(&pool, &notifier, manager, team, request).await.unwrap();
 
         let pending = json!({ "status": "pending", "reason": "email_unverified" });
         assert_eq!((redeemed, approved), (pending.clone(), pending));
@@ -1660,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn domain_only_unproven_approve_stays_pending() {
-        let _billing = BillingMode::self_hosted();
+        let _env = DeliveryGuard::on(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let notifier = SyncNotifier::new();
         let (team, _owner, manager) = team_with_manager(&pool).await;
@@ -1669,7 +1750,7 @@ mod tests {
         redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
         let (request, _) = pending_request(&pool, team, user).await;
 
-        let approved = with_delivery(async { approve_as(&pool, &notifier, manager, team, request).await.unwrap() }).await;
+        let approved = approve_as(&pool, &notifier, manager, team, request).await.unwrap();
 
         assert_eq!(approved, json!({ "status": "pending", "reason": "email_unverified" }));
         assert_eq!(membership_count(&pool, team, user).await, 0);
@@ -1677,7 +1758,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_only_token_with_unproven_email_is_admitted_on_approve() {
-        let _billing = BillingMode::self_hosted();
+        let _env = DeliveryGuard::on(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
         let notifier = SyncNotifier::new();
         let (team, _owner, manager) = team_with_manager(&pool).await;
@@ -1687,7 +1768,7 @@ mod tests {
         let (request, reason) = pending_request(&pool, team, user).await;
         assert_eq!(reason, Some("approval".to_string()));
 
-        let approved = with_delivery(async { approve_as(&pool, &notifier, manager, team, request).await.unwrap() }).await;
+        let approved = approve_as(&pool, &notifier, manager, team, request).await.unwrap();
 
         assert_eq!(approved, json!({ "status": "admitted" }));
         assert_eq!(membership_count(&pool, team, user).await, 1);
@@ -1708,11 +1789,6 @@ mod tests {
 
         assert_eq!(try_admit(&pool, &notifier, request, Some(manager)).await.unwrap(), RedeemOutcome::Member);
 
-        let want = format!("join_requests:{team}");
-        let mut told = false;
-        while let Ok(event) = rx.try_recv() {
-            told |= matches!(event, SyncEvent::BlobPushed { user_id, device_id } if user_id == manager && device_id == want);
-        }
-        assert!(told);
+        assert!(told(&mut rx, &format!("join_requests:{team}")).contains(&manager));
     }
 }

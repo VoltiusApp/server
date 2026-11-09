@@ -27,7 +27,7 @@ pub struct MetaResponse {
     pub wrapped_secrets_cas: bool,
     /// Only Owners confer the Owner role, and `PUT /v1/teams/:id/billing-owner` exists.
     pub multi_owner: bool,
-    /// The server can send email; without it registration auto-verifies and approval-gated enrolment is unavailable.
+    /// The server can send email; without it registration auto-verifies and enrolment tokens must require approval.
     pub email_delivery: bool,
 }
 

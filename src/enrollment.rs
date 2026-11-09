@@ -44,6 +44,12 @@ impl PendingReason {
             PendingReason::SeatLimit => "seat_limit",
         }
     }
+
+    fn from_db(value: &str) -> Option<Self> {
+        [PendingReason::Approval, PendingReason::EmailUnverified, PendingReason::SeatLimit]
+            .into_iter()
+            .find(|reason| reason.as_str() == value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +126,7 @@ struct TokenState {
     role: String,
     allowed_domains: Vec<String>,
     require_approval: bool,
-    created_by: Uuid,
+    created_by: Option<Uuid>,
     live: bool,
 }
 
@@ -207,15 +213,13 @@ pub(crate) async fn redeem_for(
         Admission::Pending(reason) => reason,
         Admission::Admit => PendingReason::Approval,
     };
-    ensure_public_key(&mut conn, user_id, public_key).await.map_err(|status| match status {
-        StatusCode::BAD_REQUEST => EnrollError::MissingKey,
-        other => other.into(),
-    })?;
-    let (request_id, inserted) = sqlx::query_as::<_, (Uuid, bool)>(
-        "INSERT INTO team_join_requests (team_id, user_id, token_id, status, reason) VALUES ($1, $2, $3, 'pending', $4) \
+    ensure_public_key(&mut conn, user_id, public_key).await?;
+    let (request_id, inserted, prior) = sqlx::query_as::<_, (Uuid, bool, Option<String>)>(
+        "WITH prior AS (SELECT reason FROM team_join_requests WHERE team_id = $1 AND user_id = $2 AND status = 'pending') \
+         INSERT INTO team_join_requests (team_id, user_id, token_id, status, reason) VALUES ($1, $2, $3, 'pending', $4) \
          ON CONFLICT (team_id, user_id) WHERE status = 'pending' \
          DO UPDATE SET reason = EXCLUDED.reason, token_id = EXCLUDED.token_id \
-         RETURNING id, (xmax = 0)",
+         RETURNING id, (xmax = 0), (SELECT reason FROM prior)",
     )
     .bind(token.team_id)
     .bind(user_id)
@@ -229,14 +233,42 @@ pub(crate) async fn redeem_for(
         .await?;
     drop(conn);
 
-    if inserted {
-        audit_request(pool, token.team_id, user_id, "join_request.created", request_id, user_id).await;
-        notify_join_requests_changed(pool, notifier, token.team_id).await;
+    let outcome = match first {
+        Admission::Pending(reason) => RedeemOutcome::Pending(reason),
+        _ => match try_admit(pool, notifier, request_id, None).await {
+            Err(EnrollError::NotFound) => settled_state(pool, token.team_id, user_id).await?,
+            other => other?,
+        },
+    };
+    if let RedeemOutcome::Pending(reason) = outcome {
+        if inserted {
+            audit_request(pool, token.team_id, user_id, "join_request.created", request_id, user_id).await;
+        }
+        if prior.as_deref() != Some(reason.as_str()) {
+            notify_join_requests_changed(pool, notifier, token.team_id).await;
+        }
     }
-    match first {
-        Admission::Pending(reason) => Ok(RedeemOutcome::Pending(reason)),
-        _ => try_admit(pool, notifier, request_id, None).await,
+    Ok(outcome)
+}
+
+async fn settled_state(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<RedeemOutcome, EnrollError> {
+    let mut conn = pool.acquire().await?;
+    if is_member(&mut conn, team_id, user_id).await? {
+        return Ok(RedeemOutcome::Member);
     }
+    let reason = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT reason FROM team_join_requests WHERE team_id = $1 AND user_id = $2 AND status = 'pending'",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    reason
+        .flatten()
+        .as_deref()
+        .and_then(PendingReason::from_db)
+        .map(RedeemOutcome::Pending)
+        .ok_or(EnrollError::NotFound)
 }
 
 pub(crate) async fn try_admit(
@@ -251,10 +283,7 @@ pub(crate) async fn try_admit(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(EnrollError::NotFound)?;
-    let owner_id = lock_billing_owner(&mut tx, team_id).await.map_err(|status| match status {
-        StatusCode::NOT_FOUND => EnrollError::NotFound,
-        other => other.into(),
-    })?;
+    let owner_id = lock_billing_owner(&mut tx, team_id).await?;
     let PendingRequest { user_id, token_id } = sqlx::query_as::<_, PendingRequest>(
         "SELECT user_id, token_id FROM team_join_requests WHERE id = $1 AND team_id = $2 AND status = 'pending' FOR UPDATE",
     )
@@ -318,7 +347,7 @@ pub(crate) async fn try_admit(
         }
         Admission::Admit => {
             let role = role_or_default(token.as_ref().map(|t| t.role.as_str()));
-            admit_member(&mut tx, team_id, user_id, token.as_ref().map(|t| t.created_by), role, &[], None).await?;
+            admit_member(&mut tx, team_id, user_id, token.as_ref().and_then(|t| t.created_by), role, &[], None).await?;
             decide_pending(&mut tx, request_id, team_id, "approved", approved_by).await?;
             tx.commit().await?;
 
@@ -433,9 +462,15 @@ mod tests {
 
     #[test]
     fn pending_reasons_match_the_database_values() {
-        assert_eq!(PendingReason::Approval.as_str(), "approval");
-        assert_eq!(PendingReason::EmailUnverified.as_str(), "email_unverified");
-        assert_eq!(PendingReason::SeatLimit.as_str(), "seat_limit");
+        for (reason, value) in [
+            (PendingReason::Approval, "approval"),
+            (PendingReason::EmailUnverified, "email_unverified"),
+            (PendingReason::SeatLimit, "seat_limit"),
+        ] {
+            assert_eq!(reason.as_str(), value);
+            assert_eq!(PendingReason::from_db(value), Some(reason));
+        }
+        assert_eq!(PendingReason::from_db("other"), None);
     }
 
     #[test]

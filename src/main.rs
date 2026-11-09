@@ -37,7 +37,7 @@ use axum::{
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
     EnrollmentRedeemRateLimiter, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
-    RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
+    RedeemRateLimiter, RegisterRateLimiter, ResendVerificationRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
@@ -78,6 +78,21 @@ fn signup_routes(
         .layer(Extension(resolve_limiter))
         .layer(Extension(token_limiter))
         .layer(middleware::from_fn(rate_limit::attach_client_ip))
+}
+
+fn enrollment_routes() -> Router<sqlx::PgPool> {
+    Router::new()
+        .route(
+            "/v1/teams/:team_id/enrollment-token",
+            post(routes::team_enrollment::create_token)
+                .get(routes::team_enrollment::get_token)
+                .delete(routes::team_enrollment::revoke_token),
+        )
+        .route("/v1/enrollment/redeem", post(routes::team_enrollment::redeem))
+        .route("/v1/teams/:team_id/join-requests", get(routes::team_enrollment::list_requests))
+        .route("/v1/teams/:team_id/join-requests/:request_id/approve", post(routes::team_enrollment::approve))
+        .route("/v1/teams/:team_id/join-requests/:request_id/deny", post(routes::team_enrollment::deny))
+        .route_layer(middleware::from_fn(features::require_team_invites))
 }
 
 // Merged routers keep the last one's fallback, layers included; without this an
@@ -288,6 +303,8 @@ async fn main() {
         GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
     let enrollment_redeem_limiter =
         EnrollmentRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
+    let resend_verification_limiter =
+        ResendVerificationRateLimiter(RateLimiter::<uuid::Uuid>::new(5, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -480,29 +497,7 @@ async fn main() {
         )
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route("/v1/teams/:team_id/billing-owner", put(routes::team_ownership::transfer_billing_owner))
-        .route(
-            "/v1/teams/:team_id/enrollment-token",
-            post(routes::team_enrollment::create_token)
-                .get(routes::team_enrollment::get_token)
-                .delete(routes::team_enrollment::revoke_token)
-                .layer(middleware::from_fn(features::require_team_invites)),
-        )
-        .route(
-            "/v1/enrollment/redeem",
-            post(routes::team_enrollment::redeem).layer(middleware::from_fn(features::require_team_invites)),
-        )
-        .route(
-            "/v1/teams/:team_id/join-requests",
-            get(routes::team_enrollment::list_requests).layer(middleware::from_fn(features::require_team_invites)),
-        )
-        .route(
-            "/v1/teams/:team_id/join-requests/:request_id/approve",
-            post(routes::team_enrollment::approve).layer(middleware::from_fn(features::require_team_invites)),
-        )
-        .route(
-            "/v1/teams/:team_id/join-requests/:request_id/deny",
-            post(routes::team_enrollment::deny).layer(middleware::from_fn(features::require_team_invites)),
-        )
+        .merge(enrollment_routes())
         .route(
             "/v1/teams/:team_id/lock-policy",
             put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),
@@ -793,6 +788,7 @@ async fn main() {
         .layer(Extension(grant_mint_limiter))
         .layer(Extension(grant_redeem_limiter))
         .layer(Extension(enrollment_redeem_limiter))
+        .layer(Extension(resend_verification_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

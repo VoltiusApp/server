@@ -238,7 +238,9 @@ pub struct EnrollmentResolveLimiter(pub RateLimiter<IpAddr>);
 #[derive(Clone)]
 pub struct EnrollmentRegisterLimiter(pub RateLimiter<Uuid>);
 
-/// Warns and returns 429 when the key's budget is spent.
+#[derive(Clone)]
+pub struct ResendVerificationRateLimiter(pub RateLimiter<Uuid>);
+
 pub async fn check_budget<K: Eq + Hash + Send + std::fmt::Display + 'static>(
     limiter: &RateLimiter<K>,
     key: K,

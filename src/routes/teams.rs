@@ -3216,10 +3216,8 @@ mod authz_tests {
 
     #[tokio::test]
     async fn email_invite_reports_when_the_email_was_not_sent() {
+        let _env = crate::test_support::DeliveryGuard::off(BillingMode::self_hosted());
         let pool = test_pool_or_skip!();
-        if crate::email::delivery_configured() {
-            return;
-        }
         let owner = seed_user(&pool).await;
         let team = seed_team(&pool, owner).await;
         let inviter = inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;

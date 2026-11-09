@@ -91,7 +91,7 @@ pub async fn effective_permissions(
     Ok(crate::object_authz::member_contexts(pool, team_id, Some(user_id))
         .await?
         .pop()
-        .map_or(0, |m| with_dependencies(m.base)))
+        .map_or(0, |m| m.effective()))
 }
 
 /// Returns true if any of (team_id, user_id)'s roles grant `permission`.
