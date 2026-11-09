@@ -62,7 +62,7 @@ pub(crate) fn validate_public_key(key: Option<&str>) -> Result<(), StatusCode> {
 }
 
 /// Overwriting a published key would orphan every vault key already wrapped to it; rotation is PUT /v1/auth/public-key.
-pub(crate) async fn store_public_key_if_empty(
+async fn store_public_key_if_empty(
     conn: &mut sqlx::PgConnection,
     user_id: Uuid,
     key: Option<&str>,
@@ -80,6 +80,28 @@ pub(crate) async fn store_public_key_if_empty(
         error!(error = %e, "Failed to record redeemer public key");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    Ok(())
+}
+
+/// Without a key on the roster row no key-holder can wrap for the member, so the join is refused.
+pub(crate) async fn ensure_public_key(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    key: Option<&str>,
+) -> Result<(), StatusCode> {
+    store_public_key_if_empty(&mut *conn, user_id, key).await?;
+    let has_key = sqlx::query_scalar::<_, bool>("SELECT public_key IS NOT NULL AND public_key <> '' FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to verify redeemer public key");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if !has_key {
+        warn!(user_id = %user_id, "Join without a public key");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     Ok(())
 }
 
@@ -346,23 +368,7 @@ pub async fn redeem_grant(
     // to whoever minted the link.
     admit_member(&mut tx, locked.team_id, auth.0, Some(locked.created_by), &locked.role, &[], None).await?;
 
-    store_public_key_if_empty(&mut tx, auth.0, body.public_key.as_deref()).await?;
-
-    // Without a key on the roster row, no key-holder can wrap for this member
-    // and the joiner lands in a vault that can never fill. Refuse the join
-    // rather than create that state.
-    let has_key = sqlx::query_scalar::<_, bool>(
-        "SELECT public_key IS NOT NULL AND public_key <> '' FROM users WHERE id = $1",
-    )
-    .bind(auth.0)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| { error!(error = %e, "Failed to verify redeemer public key"); StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if !has_key {
-        warn!(user_id = %auth.0, "Join grant redemption without a public key");
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    ensure_public_key(&mut tx, auth.0, body.public_key.as_deref()).await?;
 
     tx.commit().await.map_err(|e| {
         error!(error = %e, "Failed to commit grant redemption");

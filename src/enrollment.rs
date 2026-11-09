@@ -1,22 +1,27 @@
+use axum::http::StatusCode;
 use base64::Engine;
 use rand::RngCore;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::json;
 use sqlx::{PgConnection, PgPool};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::permissions::PERM_INVITE_MEMBERS;
 use crate::routes::audit::write_audit_event;
 use crate::routes::invitations::{admit_member, notify_member_added};
 use crate::routes::team_enrollment::{EnrollError, TokenRow};
-use crate::routes::team_grants::store_public_key_if_empty;
-use crate::routes::teams::{ensure_seat_available};
+use crate::routes::team_grants::ensure_public_key;
+use crate::routes::teams::ensure_seat_available;
 use crate::sync_notifier::{notify_team_permission_holders, SyncNotifier};
 use crate::team_authority::lock_billing_owner;
 use crate::team_plan::team_locked;
 
-pub(crate) const DEFAULT_ROLE: &str = "member";
+const DEFAULT_ROLE: &str = "member";
+
+pub(crate) fn role_or_default(role: Option<&str>) -> &str {
+    role.unwrap_or(DEFAULT_ROLE)
+}
 
 pub fn mint_secret() -> String {
     let mut bytes = [0u8; 32];
@@ -69,7 +74,8 @@ pub fn admission(guard: &Guard, email: &str, email_proven: bool, seat_available:
         return Admission::DomainMismatch;
     }
     if guard.require_approval {
-        return Admission::Pending(PendingReason::Approval);
+        let proof_missing = !guard.allowed_domains.is_empty() && !email_proven;
+        return Admission::Pending(if proof_missing { PendingReason::EmailUnverified } else { PendingReason::Approval });
     }
     if !email_proven {
         return Admission::Pending(PendingReason::EmailUnverified);
@@ -105,7 +111,6 @@ impl Serialize for RedeemOutcome {
 
 #[derive(sqlx::FromRow)]
 struct PendingRequest {
-    team_id: Uuid,
     user_id: Uuid,
     token_id: Option<Uuid>,
 }
@@ -174,9 +179,13 @@ async fn user_identity(conn: &mut PgConnection, user_id: Uuid) -> Result<(String
 async fn seat_available(pool: &PgPool, owner_id: Uuid, user_id: Uuid) -> Result<bool, EnrollError> {
     match ensure_seat_available(pool, owner_id, Some(user_id)).await {
         Ok(()) => Ok(true),
-        Err(axum::http::StatusCode::PAYMENT_REQUIRED) => Ok(false),
+        Err(StatusCode::PAYMENT_REQUIRED) => Ok(false),
         Err(status) => Err(status.into()),
     }
+}
+
+fn proof_available(guard: &Guard, proven: bool) -> bool {
+    proven || (guard.require_approval && !crate::email::delivery_configured())
 }
 
 pub(crate) async fn redeem_for(
@@ -191,13 +200,17 @@ pub(crate) async fn redeem_for(
         return Ok(RedeemOutcome::Member);
     }
     let (email, proven) = user_identity(&mut conn, user_id).await?;
-    let first = admission(&token.guard(), &email, proven, true);
+    let guard = token.guard();
+    let first = admission(&guard, &email, proof_available(&guard, proven), true);
     let reason = match first {
         Admission::DomainMismatch => return Err(EnrollError::DomainMismatch),
-        Admission::Pending(reason) => Some(reason.as_str()),
-        Admission::Admit => None,
+        Admission::Pending(reason) => reason,
+        Admission::Admit => PendingReason::Approval,
     };
-    store_public_key_if_empty(&mut conn, user_id, public_key).await?;
+    ensure_public_key(&mut conn, user_id, public_key).await.map_err(|status| match status {
+        StatusCode::BAD_REQUEST => EnrollError::MissingKey,
+        other => other.into(),
+    })?;
     let (request_id, inserted) = sqlx::query_as::<_, (Uuid, bool)>(
         "INSERT INTO team_join_requests (team_id, user_id, token_id, status, reason) VALUES ($1, $2, $3, 'pending', $4) \
          ON CONFLICT (team_id, user_id) WHERE status = 'pending' \
@@ -207,7 +220,7 @@ pub(crate) async fn redeem_for(
     .bind(token.team_id)
     .bind(user_id)
     .bind(token.id)
-    .bind(reason)
+    .bind(reason.as_str())
     .fetch_one(&mut *conn)
     .await?;
     sqlx::query("UPDATE team_enrollment_tokens SET last_used_at = now() WHERE id = $1")
@@ -233,15 +246,23 @@ pub(crate) async fn try_admit(
     approved_by: Option<Uuid>,
 ) -> Result<RedeemOutcome, EnrollError> {
     let mut tx = pool.begin().await?;
-    let request = sqlx::query_as::<_, PendingRequest>(
-        "SELECT team_id, user_id, token_id FROM team_join_requests WHERE id = $1 AND status = 'pending' FOR UPDATE",
+    let team_id = sqlx::query_scalar::<_, Uuid>("SELECT team_id FROM team_join_requests WHERE id = $1 AND status = 'pending'")
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(EnrollError::NotFound)?;
+    let owner_id = lock_billing_owner(&mut tx, team_id).await.map_err(|status| match status {
+        StatusCode::NOT_FOUND => EnrollError::NotFound,
+        other => other.into(),
+    })?;
+    let PendingRequest { user_id, token_id } = sqlx::query_as::<_, PendingRequest>(
+        "SELECT user_id, token_id FROM team_join_requests WHERE id = $1 AND team_id = $2 AND status = 'pending' FOR UPDATE",
     )
     .bind(request_id)
+    .bind(team_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(EnrollError::NotFound)?;
-    let PendingRequest { team_id, user_id, token_id } = request;
-    let owner_id = lock_billing_owner(&mut tx, team_id).await?;
     if team_locked(pool, team_id).await? {
         return Err(EnrollError::Unavailable);
     }
@@ -249,6 +270,7 @@ pub(crate) async fn try_admit(
     if is_member(&mut tx, team_id, user_id).await? {
         decide_pending(&mut tx, request_id, team_id, "approved", approved_by).await?;
         tx.commit().await?;
+        notify_join_requests_changed(pool, notifier, team_id).await;
         return Ok(RedeemOutcome::Member);
     }
 
@@ -262,30 +284,40 @@ pub(crate) async fn try_admit(
     .await?;
     let (email, proven) = user_identity(&mut tx, user_id).await?;
     let (guard, proven) = match (&token, approved_by) {
-        (token, Some(_)) => (
-            Guard { allowed_domains: token.as_ref().map(|t| t.allowed_domains.clone()).unwrap_or_default(), require_approval: false },
-            true,
-        ),
-        (Some(token), None) if token.live => (Guard { allowed_domains: token.allowed_domains.clone(), require_approval: token.require_approval }, proven),
+        (token, Some(_)) => {
+            let allowed_domains = token.as_ref().map(|t| t.allowed_domains.clone()).unwrap_or_default();
+            let needs_proof = !allowed_domains.is_empty() && crate::email::delivery_configured();
+            (Guard { allowed_domains, require_approval: false }, proven || !needs_proof)
+        }
+        (Some(token), None) if token.live => {
+            let guard = Guard { allowed_domains: token.allowed_domains.clone(), require_approval: token.require_approval };
+            let proven = proof_available(&guard, proven);
+            (guard, proven)
+        }
         (_, None) => (Guard { allowed_domains: Vec::new(), require_approval: true }, proven),
     };
 
     match admission(&guard, &email, proven, seat_available(pool, owner_id, user_id).await?) {
         Admission::DomainMismatch => Err(EnrollError::DomainMismatch),
         Admission::Pending(reason) => {
-            sqlx::query("UPDATE team_join_requests SET reason = $2 WHERE id = $1")
+            let changed = sqlx::query("UPDATE team_join_requests SET reason = $2 WHERE id = $1 AND reason IS DISTINCT FROM $2")
                 .bind(request_id)
                 .bind(reason.as_str())
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected()
+                > 0;
             tx.commit().await?;
+            if changed {
+                notify_join_requests_changed(pool, notifier, team_id).await;
+            }
             if approved_by.is_some() && reason == PendingReason::SeatLimit {
                 return Err(EnrollError::NoSeat);
             }
             Ok(RedeemOutcome::Pending(reason))
         }
         Admission::Admit => {
-            let role = token.as_ref().map_or(DEFAULT_ROLE, |t| t.role.as_str());
+            let role = role_or_default(token.as_ref().map(|t| t.role.as_str()));
             admit_member(&mut tx, team_id, user_id, token.as_ref().map(|t| t.created_by), role, &[], None).await?;
             decide_pending(&mut tx, request_id, team_id, "approved", approved_by).await?;
             tx.commit().await?;
@@ -323,8 +355,12 @@ pub(crate) async fn admit_verified_requests(pool: &PgPool, notifier: &SyncNotifi
         Vec::new()
     });
     for request_id in requests {
-        if let Err(err) = try_admit(pool, notifier, request_id, None).await {
-            error!(?err, request_id = %request_id, "Failed to admit a join request after email verification");
+        match try_admit(pool, notifier, request_id, None).await {
+            Ok(_) => {}
+            Err(err @ (EnrollError::DomainMismatch | EnrollError::NotFound | EnrollError::Unavailable)) => {
+                warn!(?err, request_id = %request_id, "Join request not admitted after email verification");
+            }
+            Err(err) => error!(?err, request_id = %request_id, "Failed to admit a join request after email verification"),
         }
     }
 }
@@ -392,6 +428,7 @@ mod tests {
         let g = guard(&["acme.com"], true);
         assert_eq!(admission(&g, "a@gmail.com", true, true), Admission::DomainMismatch);
         assert_eq!(admission(&g, "a@acme.com", true, true), Admission::Pending(PendingReason::Approval));
+        assert_eq!(admission(&g, "a@acme.com", false, true), Admission::Pending(PendingReason::EmailUnverified));
     }
 
     #[test]
