@@ -160,7 +160,7 @@ fn client_ip(peer: Option<IpAddr>, forwarded_for: Option<&str>, trusted: &[Trust
         .unwrap_or(peer)
 }
 
-fn extract_ip(req: &Request) -> IpAddr {
+pub(crate) fn extract_ip(req: &Request) -> IpAddr {
     client_ip(
         req.extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -216,32 +216,45 @@ pub struct GrantMintRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct GrantRedeemRateLimiter(pub RateLimiter<Uuid>);
 
-/// Register endpoint: N registrations/day per IP.
-pub async fn register_rate_limit(
-    axum::Extension(RegisterRateLimiter(limiter)): axum::Extension<RegisterRateLimiter>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
+/// Handlers that charge IP limiters themselves read the address from here.
+#[derive(Clone, Copy)]
+pub struct ClientIp(pub IpAddr);
+
+pub async fn attach_client_ip(mut req: Request, next: Next) -> Response {
     let ip = extract_ip(&req);
-    if !limiter.check(ip).await {
-        warn!(%ip, "Register rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(next.run(req).await)
+    req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
 }
 
-/// Checks a per-user limiter, warning and returning 429 on exhaustion. The
-/// one place this shape is expressed; middlewares and handlers alike call it.
+/// Public token lookups (resolve, and the token branch of register), per IP.
+#[derive(Clone)]
+pub struct EnrollmentResolveLimiter(pub RateLimiter<IpAddr>);
+
+/// Sign-ups through one enrolment token, so a fleet rollout behind one NAT is not capped per IP.
+#[derive(Clone)]
+pub struct EnrollmentRegisterLimiter(pub RateLimiter<Uuid>);
+
+/// Checks a limiter, warning and returning 429 on exhaustion. The one place
+/// this shape is expressed; middlewares and handlers alike call it.
+pub async fn check_budget<K: Eq + Hash + Send + std::fmt::Display + 'static>(
+    limiter: &RateLimiter<K>,
+    key: K,
+    label: &str,
+) -> Result<(), StatusCode> {
+    let shown = key.to_string();
+    if !limiter.check(key).await {
+        warn!(key = %shown, limiter = label, "Rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(())
+}
+
 pub async fn check_user_budget(
     limiter: &RateLimiter<Uuid>,
     user: Uuid,
     label: &str,
 ) -> Result<(), StatusCode> {
-    if !limiter.check(user).await {
-        warn!(user_id = %user, limiter = label, "Rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(())
+    check_budget(limiter, user, label).await
 }
 
 /// Shared body for the per-user middlewares below: check the limiter keyed on
@@ -283,13 +296,7 @@ pub async fn auth_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = extract_ip(&req);
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    if !limiter.check(ip).await {
-        warn!(%ip, method = %method, path = %path, "Auth rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    check_budget(&limiter, extract_ip(&req), "auth").await?;
     Ok(next.run(req).await)
 }
 
@@ -299,11 +306,7 @@ pub async fn waitlist_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = extract_ip(&req);
-    if !limiter.check(ip).await {
-        warn!(%ip, "Waitlist rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
+    check_budget(&limiter, extract_ip(&req), "waitlist").await?;
     Ok(next.run(req).await)
 }
 

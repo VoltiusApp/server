@@ -39,12 +39,19 @@ pub struct Guard {
     pub require_approval: bool,
 }
 
+pub fn domain_allowed(guard: &Guard, email: &str) -> bool {
+    if guard.allowed_domains.is_empty() {
+        return true;
+    }
+    email
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_lowercase())
+        .is_some_and(|d| guard.allowed_domains.contains(&d))
+}
+
 pub fn admission(guard: &Guard, email: &str, email_proven: bool, seat_available: bool) -> Admission {
-    if !guard.allowed_domains.is_empty() {
-        let domain = email.rsplit_once('@').map(|(_, d)| d.to_lowercase());
-        if !domain.is_some_and(|d| guard.allowed_domains.contains(&d)) {
-            return Admission::DomainMismatch;
-        }
+    if !domain_allowed(guard, email) {
+        return Admission::DomainMismatch;
     }
     if guard.require_approval {
         return Admission::Pending(PendingReason::Approval);

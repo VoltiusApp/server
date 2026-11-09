@@ -9,14 +9,14 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::enrollment::{mint_secret, normalize_domains};
-use crate::rate_limit::{check_user_budget, GrantMintRateLimiter};
+use crate::enrollment::{mint_secret, normalize_domains, Guard};
+use crate::rate_limit::{check_budget, check_user_budget, ClientIp, EnrollmentResolveLimiter, GrantMintRateLimiter};
 use crate::routes::audit::write_audit_event;
 use crate::routes::ApiError;
 use crate::routes::team_grants::{require_grant_admin, require_grantable_role};
 use crate::session_grants::hash_secret;
 use crate::team_authority::lock_billing_owner;
-use crate::team_plan::require_granular;
+use crate::team_plan::{require_granular, team_locked};
 
 fn internal(what: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
     move |e| {
@@ -207,6 +207,98 @@ pub async fn revoke_token(
         audit(&pool, team_id, auth.0, "enrollment_token.revoked", id, None).await;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct TokenRow {
+    pub id: Uuid,
+    pub team_id: Uuid,
+    pub team_name: String,
+    #[allow(dead_code)]
+    pub role: String,
+    pub allowed_domains: Vec<String>,
+    pub require_approval: bool,
+}
+
+impl TokenRow {
+    pub(crate) fn guard(&self) -> Guard {
+        Guard { allowed_domains: self.allowed_domains.clone(), require_approval: self.require_approval }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum EnrollError {
+    NotFound,
+    Gone,
+    Unavailable,
+    Internal,
+}
+
+impl From<EnrollError> for ApiError {
+    fn from(err: EnrollError) -> Self {
+        match err {
+            EnrollError::NotFound => StatusCode::NOT_FOUND.into(),
+            EnrollError::Gone => StatusCode::GONE.into(),
+            EnrollError::Unavailable => ApiError::coded(StatusCode::PAYMENT_REQUIRED, "ENROLLMENT_UNAVAILABLE"),
+            EnrollError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into(),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveTokenLookup {
+    #[sqlx(flatten)]
+    row: TokenRow,
+    revoked: bool,
+    expired: bool,
+}
+
+pub(crate) async fn load_live_token(pool: &PgPool, id: Uuid, secret: &str) -> Result<TokenRow, EnrollError> {
+    let found = sqlx::query_as::<_, LiveTokenLookup>(
+        "SELECT t.id, t.team_id, tm.name AS team_name, t.role, t.allowed_domains, t.require_approval, \
+                t.revoked_at IS NOT NULL AS revoked, COALESCE(t.expires_at <= now(), false) AS expired \
+         FROM team_enrollment_tokens t JOIN teams tm ON tm.id = t.team_id \
+         WHERE t.id = $1 AND t.secret_hash = $2",
+    )
+    .bind(id)
+    .bind(hash_secret(secret))
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to load enrollment token");
+        EnrollError::Internal
+    })?
+    .ok_or(EnrollError::NotFound)?;
+    if found.revoked || found.expired {
+        return Err(EnrollError::Gone);
+    }
+    match team_locked(pool, found.row.team_id).await {
+        Ok(false) => Ok(found.row),
+        Ok(true) => Err(EnrollError::Unavailable),
+        Err(_) => Err(EnrollError::Internal),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ResolveRequest {
+    pub id: Uuid,
+    pub secret: String,
+}
+
+pub async fn resolve(
+    State(pool): State<PgPool>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+    Extension(EnrollmentResolveLimiter(limiter)): Extension<EnrollmentResolveLimiter>,
+    Json(body): Json<ResolveRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_budget(&limiter, ip, "enrollment_resolve").await?;
+    let token = load_live_token(&pool, body.id, &body.secret).await?;
+    Ok(Json(json!({
+        "team_name": token.team_name,
+        "allowed_domains": token.allowed_domains,
+        "require_approval": token.require_approval,
+        "registration_open": true,
+    })))
 }
 
 #[cfg(test)]
@@ -574,5 +666,227 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(live, 1);
+    }
+
+    use crate::rate_limit::{EnrollmentRegisterLimiter, RegisterRateLimiter};
+    use std::net::SocketAddr;
+
+    struct SignupApp {
+        app: axum::Router,
+        pool: PgPool,
+    }
+
+    fn signup_app(pool: &PgPool, features: Features, register_per_day: usize) -> SignupApp {
+        std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let auth_limiter = RateLimiter::new(10, Duration::from_secs(60));
+        let app = crate::signup_routes(
+            crate::sync_notifier::SyncNotifier::new(),
+            auth_limiter.clone(),
+            RegisterRateLimiter(RateLimiter::new(register_per_day, Duration::from_secs(86400))),
+            EnrollmentResolveLimiter(RateLimiter::new(60, Duration::from_secs(60))),
+            EnrollmentRegisterLimiter(RateLimiter::new(500, Duration::from_secs(86400))),
+        )
+        .merge(
+            axum::Router::new()
+                .route("/v1/auth/login", axum::routing::post(|| async { StatusCode::OK }))
+                .layer(axum::middleware::from_fn(crate::rate_limit::auth_rate_limit))
+                .layer(Extension(auth_limiter)),
+        )
+        .layer(Extension(features))
+        .with_state(pool.clone());
+        SignupApp { app, pool: pool.clone() }
+    }
+
+    impl SignupApp {
+        async fn post(&self, uri: &str, ip: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let addr = SocketAddr::new(ip.parse().unwrap(), 4000);
+            req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+            let resp = self.app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+
+        async fn resolve(&self, ip: &str, id: Uuid, secret: &str) -> (StatusCode, serde_json::Value) {
+            self.post("/v1/enrollment/resolve", ip, json!({ "id": id, "secret": secret })).await
+        }
+
+        async fn register(&self, ip: &str, email: &str, enrollment: Option<(Uuid, &str)>) -> (StatusCode, serde_json::Value) {
+            let mut body = json!({ "email": email, "account_id": Uuid::new_v4(), "auth_key": "auth-key-secret" });
+            if let Some((id, secret)) = enrollment {
+                body["enrollment"] = json!({ "id": id, "secret": secret });
+            }
+            self.post("/v1/auth/register", ip, body).await
+        }
+
+        async fn user_exists(&self, email: &str) -> bool {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)")
+                .bind(email)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap()
+        }
+    }
+
+    fn fresh_email(domain: &str) -> String {
+        format!("u{}@{domain}", Uuid::new_v4().simple())
+    }
+
+    async fn acme_token(pool: &PgPool) -> CreateTokenResponse {
+        let (team, _owner, manager) = team_with_manager(pool).await;
+        created(pool, team, manager, body("member", &["acme.com"], true)).await
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_team_name_and_guards() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let token = created(&pool, team, manager, body("member", &["acme.com"], true)).await;
+        let name: String = sqlx::query_scalar("SELECT name FROM teams WHERE id = $1").bind(team).fetch_one(&pool).await.unwrap();
+
+        let (status, value) = app.resolve("10.0.0.1", token.id, &token.secret).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value,
+            json!({
+                "team_name": name,
+                "allowed_domains": ["acme.com"],
+                "require_approval": true,
+                "registration_open": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_404_revoked_410_expired_410_lapsed_402() {
+        let _billing = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, owner, manager) = business_team(&pool).await;
+        let token = created(&pool, team, manager, body("member", &[], true)).await;
+
+        assert_eq!(app.resolve("10.0.0.2", Uuid::new_v4(), &token.secret).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(app.resolve("10.0.0.2", token.id, "wrong-secret").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(app.resolve("10.0.0.2", token.id, &token.secret).await.0, StatusCode::OK);
+
+        sqlx::query("UPDATE team_enrollment_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1")
+            .bind(token.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(app.resolve("10.0.0.2", token.id, &token.secret).await.0, StatusCode::GONE);
+
+        let fresh = created(&pool, team, manager, body("member", &[], true)).await;
+        set_user_tier(&pool, owner, "free").await;
+        let (status, value) = app.resolve("10.0.0.2", fresh.id, &fresh.secret).await;
+        assert_eq!((status, value), (StatusCode::PAYMENT_REQUIRED, json!({ "error": "ENROLLMENT_UNAVAILABLE" })));
+
+        set_user_tier(&pool, owner, "business").await;
+        revoke(&pool, team, manager).await.unwrap();
+        assert_eq!(app.resolve("10.0.0.2", fresh.id, &fresh.secret).await.0, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn resolve_has_own_ip_bucket() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        for _ in 0..60 {
+            assert_eq!(app.resolve("10.0.0.3", Uuid::new_v4(), "x").await.0, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(app.resolve("10.0.0.3", Uuid::new_v4(), "x").await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(app.post("/v1/auth/login", "10.0.0.3", json!({})).await.0, StatusCode::OK);
+        assert_eq!(app.resolve("10.0.0.4", Uuid::new_v4(), "x").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn register_with_token_works_when_registration_disabled() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 5);
+        let token = acme_token(&pool).await;
+        let email = fresh_email("acme.com");
+        let (status, _) = app.register("10.0.1.1", &email, Some((token.id, &token.secret))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(app.user_exists(&email).await);
+    }
+
+    #[tokio::test]
+    async fn register_without_token_still_blocked_when_disabled() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 5);
+        let email = fresh_email("acme.com");
+        let (status, value) = app.register("10.0.1.2", &email, None).await;
+        assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "REGISTRATION_DISABLED" })));
+        assert!(!app.user_exists(&email).await);
+    }
+
+    #[tokio::test]
+    async fn register_with_token_skips_ip_daily_limit() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let token = acme_token(&pool).await;
+        for _ in 0..6 {
+            let (status, _) = app.register("10.0.1.3", &fresh_email("acme.com"), Some((token.id, &token.secret))).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        assert_eq!(app.register("10.0.1.3", &fresh_email("acme.com"), None).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn register_with_token_skips_shared_auth_bucket() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let token = acme_token(&pool).await;
+        for _ in 0..11 {
+            let (status, _) = app.register("10.0.1.4", &fresh_email("acme.com"), Some((token.id, &token.secret))).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        assert_eq!(app.post("/v1/auth/login", "10.0.1.4", json!({})).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn register_domain_mismatch_creates_no_user() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let token = acme_token(&pool).await;
+        let email = fresh_email("gmail.com");
+        let (status, value) = app.register("10.0.1.5", &email, Some((token.id, &token.secret))).await;
+        assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "ENROLLMENT_DOMAIN_MISMATCH" })));
+        assert!(!app.user_exists(&email).await);
+    }
+
+    #[tokio::test]
+    async fn register_with_bad_token_counts_against_ip_limit() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        for _ in 0..5 {
+            let (status, _) = app.register("10.0.1.6", &fresh_email("acme.com"), Some((Uuid::new_v4(), "nope"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(app.register("10.0.1.6", &fresh_email("acme.com"), None).await.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn register_ignores_the_token_when_team_invites_are_off() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { team_invites: false, registration: false, ..Features::open() }, 5);
+        let token = acme_token(&pool).await;
+        let (status, value) = app.register("10.0.1.7", &fresh_email("acme.com"), Some((token.id, &token.secret))).await;
+        assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "REGISTRATION_DISABLED" })));
     }
 }

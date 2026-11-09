@@ -18,6 +18,12 @@ use crate::auth::{
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
+use crate::enrollment::domain_allowed;
+use crate::rate_limit::{
+    check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
+};
+use crate::routes::team_enrollment::load_live_token;
+use crate::routes::ApiError;
 use crate::email::{send_password_changed_email, send_verification_email};
 use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
@@ -255,6 +261,14 @@ pub struct RegisterRequest {
     pub wrapped_user_secrets: Option<String>,
     #[serde(default)]
     pub machine_fingerprint: Option<String>,
+    #[serde(default)]
+    pub enrollment: Option<EnrollmentCredential>,
+}
+
+#[derive(Deserialize)]
+pub struct EnrollmentCredential {
+    pub id: Uuid,
+    pub secret: String,
 }
 
 #[derive(Serialize)]
@@ -321,13 +335,54 @@ async fn insert_user_with_handle_fallback(
     }
 }
 
+async fn charge_ip_gates(
+    auth: &RateLimiter,
+    register: &RateLimiter,
+    ip: std::net::IpAddr,
+) -> Result<(), StatusCode> {
+    check_budget(auth, ip, "auth").await?;
+    check_budget(register, ip, "register").await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn register(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::Extension(ClientIp(ip)): axum::Extension<ClientIp>,
+    axum::Extension(auth_limiter): axum::Extension<RateLimiter>,
+    axum::Extension(RegisterRateLimiter(register_limiter)): axum::Extension<RegisterRateLimiter>,
+    axum::Extension(EnrollmentResolveLimiter(resolve_limiter)): axum::Extension<EnrollmentResolveLimiter>,
+    axum::Extension(EnrollmentRegisterLimiter(token_limiter)): axum::Extension<EnrollmentRegisterLimiter>,
     Json(body): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
-    register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await
+) -> Result<(StatusCode, Json<AuthResponse>), ApiError> {
+    let credential = body.enrollment.as_ref().filter(|_| features.team_invites);
+    let token = match credential {
+        Some(credential) => {
+            check_budget(&resolve_limiter, ip, "enrollment_resolve").await?;
+            match load_live_token(&pool, credential.id, &credential.secret).await {
+                Ok(token) => {
+                    check_budget(&token_limiter, token.id, "enrollment_register").await?;
+                    Some(token)
+                }
+                Err(err) => {
+                    charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
+                    return Err(err.into());
+                }
+            }
+        }
+        None => {
+            features.registration_open()?;
+            charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
+            None
+        }
+    };
+    if let Some(token) = &token {
+        if !domain_allowed(&token.guard(), &crate::email::normalize(&body.email)) {
+            return Err(ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"));
+        }
+    }
+    Ok(register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await?)
 }
 
 async fn register_with(
@@ -1072,6 +1127,15 @@ mod handler_tests {
         }
     }
 
+    async fn register(
+        State(pool): State<PgPool>,
+        Extension(features): Extension<Features>,
+        Extension(notifier): Extension<SyncNotifier>,
+        Json(body): Json<RegisterRequest>,
+    ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+        register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await
+    }
+
     fn register_req(email: &str, account_id: Uuid, fp: Option<&str>) -> RegisterRequest {
         RegisterRequest {
             email: email.to_string(),
@@ -1080,6 +1144,7 @@ mod handler_tests {
             public_key: None,
             wrapped_user_secrets: None,
             machine_fingerprint: fp.map(str::to_string),
+            enrollment: None,
         }
     }
 

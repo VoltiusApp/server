@@ -36,7 +36,7 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
+    EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
     RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
@@ -58,6 +58,27 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
+
+fn signup_routes(
+    notifier: sync_notifier::SyncNotifier,
+    auth_limiter: RateLimiter,
+    register_limiter: RegisterRateLimiter,
+    resolve_limiter: EnrollmentResolveLimiter,
+    token_limiter: EnrollmentRegisterLimiter,
+) -> Router<sqlx::PgPool> {
+    Router::new()
+        .route("/v1/auth/register", post(routes::auth::register))
+        .route(
+            "/v1/enrollment/resolve",
+            post(routes::team_enrollment::resolve).layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .layer(Extension(notifier))
+        .layer(Extension(auth_limiter))
+        .layer(Extension(register_limiter))
+        .layer(Extension(resolve_limiter))
+        .layer(Extension(token_limiter))
+        .layer(middleware::from_fn(rate_limit::attach_client_ip))
+}
 
 // Merged routers keep the last one's fallback, layers included; without this an
 // unknown path would run whatever middleware the last merged router carries.
@@ -235,6 +256,10 @@ async fn main() {
         register_per_day,
         Duration::from_secs(86400),
     ));
+    let enrollment_resolve_limiter =
+        EnrollmentResolveLimiter(RateLimiter::<std::net::IpAddr>::new(60, Duration::from_secs(60)));
+    let enrollment_register_limiter =
+        EnrollmentRegisterLimiter(RateLimiter::<uuid::Uuid>::new(500, Duration::from_secs(86400)));
     let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(
         invite_per_hour,
         Duration::from_secs(3600),
@@ -291,15 +316,13 @@ async fn main() {
         "Configured two-factor authentication"
     );
 
-    // Register — stricter limit: 5/day per IP on top of the general auth 10/min
-    let register_route = Router::new()
-        .route("/v1/auth/register", post(routes::auth::register))
-        .layer(Extension(notifier.clone()))
-        .layer(middleware::from_fn(rate_limit::register_rate_limit))
-        .layer(Extension(register_limiter))
-        .layer(middleware::from_fn(rate_limit::auth_rate_limit))
-        .layer(Extension(auth_limiter.clone()))
-        .layer(middleware::from_fn(features::require_registration));
+    let register_route = signup_routes(
+        notifier.clone(),
+        auth_limiter.clone(),
+        register_limiter,
+        enrollment_resolve_limiter,
+        enrollment_register_limiter,
+    );
 
     // Public auth + public invitation lookup — rate limited at 10/min per IP
     let public = Router::new()
