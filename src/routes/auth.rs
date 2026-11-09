@@ -18,7 +18,7 @@ use crate::auth::{
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
-use crate::enrollment::{admit_verified_requests, domain_allowed, redeem_for, RedeemOutcome};
+use crate::enrollment::{admit_verified_requests, domain_allowed, redeem_for, RedeemResponse};
 use crate::rate_limit::{
     check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
     ResendVerificationRateLimiter,
@@ -277,7 +277,7 @@ pub struct RegisterResponse {
     #[serde(flatten)]
     session: AuthResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enrollment: Option<RedeemOutcome>,
+    enrollment: Option<RedeemResponse>,
 }
 
 #[derive(Serialize)]
@@ -411,6 +411,7 @@ pub async fn register(
     let enrollment = match &token {
         Some(token) => redeem_for(&pool, &notifier, token, session.user_id, public_key.as_deref())
             .await
+            .map(|outcome| RedeemResponse { outcome, team_id: token.team_id })
             .map_err(|err| warn!(?err, user_id = %session.user_id, "Enrolment redeem after registration failed"))
             .ok(),
         None => None,
