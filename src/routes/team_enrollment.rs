@@ -1,53 +1,38 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::enrollment::{mint_secret, normalize_domains};
-
 use crate::rate_limit::{check_user_budget, GrantMintRateLimiter};
 use crate::routes::audit::write_audit_event;
+use crate::routes::ApiError;
 use crate::routes::team_grants::{require_grant_admin, require_grantable_role};
 use crate::session_grants::hash_secret;
 use crate::team_authority::lock_billing_owner;
 use crate::team_plan::require_granular;
-
-#[derive(Debug)]
-pub struct ApiError(pub StatusCode, pub Option<&'static str>);
-
-impl ApiError {
-    fn coded(status: StatusCode, code: &'static str) -> Self {
-        ApiError(status, Some(code))
-    }
-}
-
-impl From<StatusCode> for ApiError {
-    fn from(status: StatusCode) -> Self {
-        ApiError(status, None)
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        match self.1 {
-            Some(code) => super::coded_error(self.0, code),
-            None => self.0.into_response(),
-        }
-    }
-}
 
 fn internal(what: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
     move |e| {
         error!(error = %e, "{what}");
         StatusCode::INTERNAL_SERVER_ERROR.into()
     }
+}
+
+async fn revoke_live(conn: &mut PgConnection, team_id: Uuid) -> Result<Option<Uuid>, ApiError> {
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE team_enrollment_tokens SET revoked_at = now() WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
+    )
+    .bind(team_id)
+    .fetch_optional(conn)
+    .await
+    .map_err(internal("Failed to revoke enrollment token"))
 }
 
 async fn audit(pool: &PgPool, team_id: Uuid, actor: Uuid, action: &str, token_id: Uuid, metadata: Option<serde_json::Value>) {
@@ -127,13 +112,7 @@ pub async fn create_token(
     let secret = mint_secret();
     let mut tx = pool.begin().await.map_err(internal("Failed to begin enrollment token transaction"))?;
     lock_billing_owner(&mut tx, team_id).await?;
-    let replaced = sqlx::query_scalar::<_, Uuid>(
-        "UPDATE team_enrollment_tokens SET revoked_at = now() WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
-    )
-    .bind(team_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(internal("Failed to revoke previous enrollment token"))?;
+    let replaced = revoke_live(&mut tx, team_id).await?;
     let (id, created_at) = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
         "INSERT INTO team_enrollment_tokens \
          (team_id, secret_hash, role, allowed_domains, require_approval, expires_at, created_by) \
@@ -221,13 +200,8 @@ pub async fn revoke_token(
     Path(team_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_grant_admin(&pool, team_id, auth.0).await?;
-    let revoked = sqlx::query_scalar::<_, Uuid>(
-        "UPDATE team_enrollment_tokens SET revoked_at = now() WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
-    )
-    .bind(team_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(internal("Failed to revoke enrollment token"))?;
+    let mut conn = pool.acquire().await.map_err(internal("Failed to acquire connection"))?;
+    let revoked = revoke_live(&mut conn, team_id).await?;
     if let Some(id) = revoked {
         info!(team_id = %team_id, token_id = %id, "Enrollment token revoked");
         audit(&pool, team_id, auth.0, "enrollment_token.revoked", id, None).await;
@@ -449,9 +423,8 @@ mod tests {
     async fn create_role_above_actor_is_403() {
         let _billing = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
-        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let (team, _owner, _manager) = team_with_manager(&pool).await;
         let inviter = crate::test_support::inviter_with(&pool, team, PERM_INVITE_MEMBERS).await;
-        let _ = manager;
         let err = create(&pool, team, inviter, body("manager", &[], true)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
@@ -579,5 +552,27 @@ mod tests {
         assert_eq!(metadata["role"], "member");
         assert_eq!(metadata["allowed_domains"], serde_json::json!(["example.com"]));
         assert_eq!(metadata["require_approval"], true);
+    }
+
+    #[tokio::test]
+    async fn two_simultaneous_creates_leave_one_live_token() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+
+        let (a, b) = tokio::join!(
+            create(&pool, team, manager, body("member", &[], true)),
+            create(&pool, team, manager, body("editor", &[], true)),
+        );
+        assert!(a.is_ok() && b.is_ok());
+
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM team_enrollment_tokens WHERE team_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(team)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 1);
     }
 }
