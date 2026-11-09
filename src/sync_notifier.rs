@@ -80,6 +80,10 @@ impl SyncNotifier {
         self.notify(user_id, format!("pending_invitations_changed:{user_id}"));
     }
 
+    pub fn notify_my_join_requests_changed(&self, user_id: Uuid) {
+        self.notify(user_id, format!("my_join_requests_changed:{user_id}"));
+    }
+
     pub fn notify_presence_changed(&self, recipient: Uuid, subject: Uuid, online: bool) {
         let _ = self.0.tx.send(SyncEvent::PresenceChanged {
             recipient,

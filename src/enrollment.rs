@@ -302,11 +302,17 @@ pub(crate) async fn try_admit(
     if team_locked(pool, team_id).await? {
         return Err(EnrollError::Unavailable);
     }
+    let tell_requester = || {
+        if approved_by.is_some() {
+            notifier.notify_my_join_requests_changed(user_id);
+        }
+    };
 
     if is_member(&mut tx, team_id, user_id).await? {
         decide_pending(&mut tx, request_id, team_id, "approved", approved_by).await?;
         tx.commit().await?;
         notify_join_requests_changed(pool, notifier, team_id).await;
+        tell_requester();
         return Ok(RedeemOutcome::Member);
     }
 
@@ -346,6 +352,7 @@ pub(crate) async fn try_admit(
             tx.commit().await?;
             if changed {
                 notify_join_requests_changed(pool, notifier, team_id).await;
+                tell_requester();
             }
             if approved_by.is_some() && reason == PendingReason::SeatLimit {
                 return Err(EnrollError::NoSeat);
@@ -374,6 +381,7 @@ pub(crate) async fn try_admit(
             .await;
             notify_member_added(pool, notifier, team_id, user_id).await;
             notify_join_requests_changed(pool, notifier, team_id).await;
+            tell_requester();
             Ok(RedeemOutcome::Admitted)
         }
     }
@@ -392,7 +400,7 @@ pub(crate) async fn admit_verified_requests(pool: &PgPool, notifier: &SyncNotifi
     });
     for request_id in requests {
         match try_admit(pool, notifier, request_id, None).await {
-            Ok(_) => {}
+            Ok(_) => notifier.notify_my_join_requests_changed(user_id),
             Err(err @ (EnrollError::DomainMismatch | EnrollError::NotFound | EnrollError::Unavailable)) => {
                 warn!(?err, request_id = %request_id, "Join request not admitted after email verification");
             }

@@ -498,6 +498,7 @@ async fn main() {
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route("/v1/teams/:team_id/billing-owner", put(routes::team_ownership::transfer_billing_owner))
         .merge(enrollment_routes())
+        .route("/v1/enrollment/requests", get(routes::team_enrollment::my_requests))
         .route(
             "/v1/teams/:team_id/lock-policy",
             put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),
