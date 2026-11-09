@@ -18,7 +18,7 @@ use crate::auth::{
     password::{hash_auth_key, verify_auth_key},
     AuthUser,
 };
-use crate::enrollment::domain_allowed;
+use crate::enrollment::{admit_verified_requests, domain_allowed, redeem_for, RedeemOutcome};
 use crate::rate_limit::{
     check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
 };
@@ -272,6 +272,14 @@ pub struct EnrollmentCredential {
 }
 
 #[derive(Serialize)]
+pub struct RegisterResponse {
+    #[serde(flatten)]
+    session: AuthResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrollment: Option<RedeemOutcome>,
+}
+
+#[derive(Serialize)]
 pub struct AuthResponse {
     pub user_id: Uuid,
     pub jwt_token: String,
@@ -365,7 +373,7 @@ pub async fn register(
     axum::Extension(EnrollmentResolveLimiter(resolve_limiter)): axum::Extension<EnrollmentResolveLimiter>,
     axum::Extension(EnrollmentRegisterLimiter(token_limiter)): axum::Extension<EnrollmentRegisterLimiter>,
     body: Result<Json<RegisterRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<AuthResponse>), ApiError> {
+) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => {
@@ -398,7 +406,17 @@ pub async fn register(
             return Err(ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"));
         }
     }
-    Ok(register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await?)
+    let public_key = body.public_key.clone();
+    let (status, Json(session)) =
+        register_with(pool.clone(), &notifier, features, crate::email::delivery_configured(), body).await?;
+    let enrollment = match &token {
+        Some(token) => redeem_for(&pool, &notifier, token, session.user_id, public_key.as_deref())
+            .await
+            .map_err(|err| warn!(?err, user_id = %session.user_id, "Enrolment redeem after registration failed"))
+            .ok(),
+        None => None,
+    };
+    Ok((status, Json(RegisterResponse { session, enrollment })))
 }
 
 async fn register_with(
@@ -758,6 +776,7 @@ async fn derive_handle_on_verify(tx: &mut sqlx::PgConnection, user_id: Uuid, ema
 pub async fn verify_email(
     State(pool): State<PgPool>,
     axum::Extension(features): axum::Extension<crate::features::Features>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
     Json(body): Json<VerifyEmailRequest>,
 ) -> Result<Json<VerifyEmailResponse>, StatusCode> {
     let db_err = |what: &'static str| {
@@ -792,6 +811,7 @@ pub async fn verify_email(
         }
         tx.commit().await.map_err(db_err("Failed to commit email verification"))?;
         info!(email = %email, "User email verified");
+        admit_verified_requests(&pool, &notifier, user_id).await;
         return Ok(Json(VerifyEmailResponse { email, user_id }));
     }
     drop(tx);
@@ -2001,7 +2021,7 @@ mod handler_tests {
     }
 
     async fn verify(pool: &PgPool, switch: bool, token: String) {
-        let _ = verify_email(State(pool.clone()), features(switch), Json(VerifyEmailRequest { token })).await.unwrap();
+        let _ = verify_email(State(pool.clone()), features(switch), Extension(SyncNotifier::new()), Json(VerifyEmailRequest { token })).await.unwrap();
     }
 
     #[tokio::test]

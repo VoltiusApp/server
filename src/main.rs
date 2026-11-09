@@ -36,7 +36,7 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
+    EnrollmentRedeemRateLimiter, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
     RedeemRateLimiter, RegisterRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
@@ -286,6 +286,8 @@ async fn main() {
         GrantMintRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
     let grant_redeem_limiter =
         GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
+    let enrollment_redeem_limiter =
+        EnrollmentRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
@@ -336,7 +338,8 @@ async fn main() {
             get(routes::invitations::get_invitation),
         )
         .layer(middleware::from_fn(rate_limit::auth_rate_limit))
-        .layer(Extension(auth_limiter));
+        .layer(Extension(auth_limiter))
+        .layer(Extension(notifier.clone()));
 
     // A revoked session retries refresh every few seconds, and a passkey ceremony runs in the
     // browser beside the sign-in it completes; neither may spend the sign-in budget.
@@ -483,6 +486,22 @@ async fn main() {
                 .get(routes::team_enrollment::get_token)
                 .delete(routes::team_enrollment::revoke_token)
                 .layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .route(
+            "/v1/enrollment/redeem",
+            post(routes::team_enrollment::redeem).layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .route(
+            "/v1/teams/:team_id/join-requests",
+            get(routes::team_enrollment::list_requests).layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .route(
+            "/v1/teams/:team_id/join-requests/:request_id/approve",
+            post(routes::team_enrollment::approve).layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .route(
+            "/v1/teams/:team_id/join-requests/:request_id/deny",
+            post(routes::team_enrollment::deny).layer(middleware::from_fn(features::require_team_invites)),
         )
         .route(
             "/v1/teams/:team_id/lock-policy",
@@ -773,6 +792,7 @@ async fn main() {
         .layer(Extension(redeem_limiter))
         .layer(Extension(grant_mint_limiter))
         .layer(Extension(grant_redeem_limiter))
+        .layer(Extension(enrollment_redeem_limiter))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))

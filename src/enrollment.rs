@@ -1,7 +1,22 @@
-#![allow(dead_code)]
-
 use base64::Engine;
 use rand::RngCore;
+use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde_json::json;
+use sqlx::{PgConnection, PgPool};
+use tracing::error;
+use uuid::Uuid;
+
+use crate::permissions::PERM_INVITE_MEMBERS;
+use crate::routes::audit::write_audit_event;
+use crate::routes::invitations::{admit_member, notify_member_added};
+use crate::routes::team_enrollment::{EnrollError, TokenRow};
+use crate::routes::team_grants::store_public_key_if_empty;
+use crate::routes::teams::{ensure_seat_available};
+use crate::sync_notifier::{notify_team_permission_holders, SyncNotifier};
+use crate::team_authority::lock_billing_owner;
+use crate::team_plan::team_locked;
+
+pub(crate) const DEFAULT_ROLE: &str = "member";
 
 pub fn mint_secret() -> String {
     let mut bytes = [0u8; 32];
@@ -63,6 +78,255 @@ pub fn admission(guard: &Guard, email: &str, email_proven: bool, seat_available:
         return Admission::Pending(PendingReason::SeatLimit);
     }
     Admission::Admit
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedeemOutcome {
+    Member,
+    Admitted,
+    Pending(PendingReason),
+}
+
+impl Serialize for RedeemOutcome {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (status, reason) = match self {
+            RedeemOutcome::Member => ("member", None),
+            RedeemOutcome::Admitted => ("admitted", None),
+            RedeemOutcome::Pending(reason) => ("pending", Some(reason.as_str())),
+        };
+        let mut out = serializer.serialize_struct("RedeemOutcome", 1 + usize::from(reason.is_some()))?;
+        out.serialize_field("status", status)?;
+        if let Some(reason) = reason {
+            out.serialize_field("reason", reason)?;
+        }
+        out.end()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingRequest {
+    team_id: Uuid,
+    user_id: Uuid,
+    token_id: Option<Uuid>,
+}
+
+#[derive(sqlx::FromRow)]
+struct TokenState {
+    role: String,
+    allowed_domains: Vec<String>,
+    require_approval: bool,
+    created_by: Uuid,
+    live: bool,
+}
+
+pub(crate) async fn audit_request(pool: &PgPool, team_id: Uuid, actor: Uuid, action: &str, request_id: Uuid, user_id: Uuid) {
+    write_audit_event(
+        pool.clone(),
+        team_id,
+        actor,
+        action,
+        Some("join_request"),
+        Some(request_id.to_string()),
+        None,
+        Some(json!({ "user_id": user_id })),
+    )
+    .await;
+}
+
+pub(crate) async fn notify_join_requests_changed(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid) {
+    notify_team_permission_holders(pool, notifier, team_id, PERM_INVITE_MEMBERS, format!("join_requests:{team_id}")).await;
+}
+
+pub(crate) async fn decide_pending(
+    conn: &mut PgConnection,
+    request_id: Uuid,
+    team_id: Uuid,
+    status: &str,
+    decided_by: Option<Uuid>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE team_join_requests SET status = $3, reason = NULL, decided_by = $4, decided_at = now() \
+         WHERE id = $1 AND team_id = $2 AND status = 'pending' RETURNING user_id",
+    )
+    .bind(request_id)
+    .bind(team_id)
+    .bind(status)
+    .bind(decided_by)
+    .fetch_optional(conn)
+    .await
+}
+
+async fn is_member(conn: &mut PgConnection, team_id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)")
+        .bind(team_id)
+        .bind(user_id)
+        .fetch_one(conn)
+        .await
+}
+
+async fn user_identity(conn: &mut PgConnection, user_id: Uuid) -> Result<(String, bool), sqlx::Error> {
+    sqlx::query_as("SELECT email, email_proven_at IS NOT NULL FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(conn)
+        .await
+}
+
+async fn seat_available(pool: &PgPool, owner_id: Uuid, user_id: Uuid) -> Result<bool, EnrollError> {
+    match ensure_seat_available(pool, owner_id, Some(user_id)).await {
+        Ok(()) => Ok(true),
+        Err(axum::http::StatusCode::PAYMENT_REQUIRED) => Ok(false),
+        Err(status) => Err(status.into()),
+    }
+}
+
+pub(crate) async fn redeem_for(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    token: &TokenRow,
+    user_id: Uuid,
+    public_key: Option<&str>,
+) -> Result<RedeemOutcome, EnrollError> {
+    let mut conn = pool.acquire().await?;
+    if is_member(&mut conn, token.team_id, user_id).await? {
+        return Ok(RedeemOutcome::Member);
+    }
+    let (email, proven) = user_identity(&mut conn, user_id).await?;
+    let first = admission(&token.guard(), &email, proven, true);
+    let reason = match first {
+        Admission::DomainMismatch => return Err(EnrollError::DomainMismatch),
+        Admission::Pending(reason) => Some(reason.as_str()),
+        Admission::Admit => None,
+    };
+    store_public_key_if_empty(&mut conn, user_id, public_key).await?;
+    let (request_id, inserted) = sqlx::query_as::<_, (Uuid, bool)>(
+        "INSERT INTO team_join_requests (team_id, user_id, token_id, status, reason) VALUES ($1, $2, $3, 'pending', $4) \
+         ON CONFLICT (team_id, user_id) WHERE status = 'pending' \
+         DO UPDATE SET reason = EXCLUDED.reason, token_id = EXCLUDED.token_id \
+         RETURNING id, (xmax = 0)",
+    )
+    .bind(token.team_id)
+    .bind(user_id)
+    .bind(token.id)
+    .bind(reason)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query("UPDATE team_enrollment_tokens SET last_used_at = now() WHERE id = $1")
+        .bind(token.id)
+        .execute(&mut *conn)
+        .await?;
+    drop(conn);
+
+    if inserted {
+        audit_request(pool, token.team_id, user_id, "join_request.created", request_id, user_id).await;
+        notify_join_requests_changed(pool, notifier, token.team_id).await;
+    }
+    match first {
+        Admission::Pending(reason) => Ok(RedeemOutcome::Pending(reason)),
+        _ => try_admit(pool, notifier, request_id, None).await,
+    }
+}
+
+pub(crate) async fn try_admit(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    request_id: Uuid,
+    approved_by: Option<Uuid>,
+) -> Result<RedeemOutcome, EnrollError> {
+    let mut tx = pool.begin().await?;
+    let request = sqlx::query_as::<_, PendingRequest>(
+        "SELECT team_id, user_id, token_id FROM team_join_requests WHERE id = $1 AND status = 'pending' FOR UPDATE",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(EnrollError::NotFound)?;
+    let PendingRequest { team_id, user_id, token_id } = request;
+    let owner_id = lock_billing_owner(&mut tx, team_id).await?;
+    if team_locked(pool, team_id).await? {
+        return Err(EnrollError::Unavailable);
+    }
+
+    if is_member(&mut tx, team_id, user_id).await? {
+        decide_pending(&mut tx, request_id, team_id, "approved", approved_by).await?;
+        tx.commit().await?;
+        return Ok(RedeemOutcome::Member);
+    }
+
+    let token = sqlx::query_as::<_, TokenState>(
+        "SELECT role, allowed_domains, require_approval, created_by, \
+                (revoked_at IS NULL AND COALESCE(expires_at > now(), true)) AS live \
+         FROM team_enrollment_tokens WHERE id = $1",
+    )
+    .bind(token_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (email, proven) = user_identity(&mut tx, user_id).await?;
+    let (guard, proven) = match (&token, approved_by) {
+        (token, Some(_)) => (
+            Guard { allowed_domains: token.as_ref().map(|t| t.allowed_domains.clone()).unwrap_or_default(), require_approval: false },
+            true,
+        ),
+        (Some(token), None) if token.live => (Guard { allowed_domains: token.allowed_domains.clone(), require_approval: token.require_approval }, proven),
+        (_, None) => (Guard { allowed_domains: Vec::new(), require_approval: true }, proven),
+    };
+
+    match admission(&guard, &email, proven, seat_available(pool, owner_id, user_id).await?) {
+        Admission::DomainMismatch => Err(EnrollError::DomainMismatch),
+        Admission::Pending(reason) => {
+            sqlx::query("UPDATE team_join_requests SET reason = $2 WHERE id = $1")
+                .bind(request_id)
+                .bind(reason.as_str())
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            if approved_by.is_some() && reason == PendingReason::SeatLimit {
+                return Err(EnrollError::NoSeat);
+            }
+            Ok(RedeemOutcome::Pending(reason))
+        }
+        Admission::Admit => {
+            let role = token.as_ref().map_or(DEFAULT_ROLE, |t| t.role.as_str());
+            admit_member(&mut tx, team_id, user_id, token.as_ref().map(|t| t.created_by), role, &[], None).await?;
+            decide_pending(&mut tx, request_id, team_id, "approved", approved_by).await?;
+            tx.commit().await?;
+
+            if let Some(admin) = approved_by {
+                audit_request(pool, team_id, admin, "join_request.approved", request_id, user_id).await;
+            }
+            write_audit_event(
+                pool.clone(),
+                team_id,
+                approved_by.unwrap_or(user_id),
+                "member.admitted",
+                Some("user"),
+                Some(user_id.to_string()),
+                None,
+                Some(json!({ "via": "enrollment" })),
+            )
+            .await;
+            notify_member_added(pool, notifier, team_id, user_id).await;
+            notify_join_requests_changed(pool, notifier, team_id).await;
+            Ok(RedeemOutcome::Admitted)
+        }
+    }
+}
+
+pub(crate) async fn admit_verified_requests(pool: &PgPool, notifier: &SyncNotifier, user_id: Uuid) {
+    let requests = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM team_join_requests WHERE user_id = $1 AND status = 'pending' AND reason = 'email_unverified'",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        error!(error = %e, user_id = %user_id, "Failed to list join requests awaiting verification");
+        Vec::new()
+    });
+    for request_id in requests {
+        if let Err(err) = try_admit(pool, notifier, request_id, None).await {
+            error!(?err, request_id = %request_id, "Failed to admit a join request after email verification");
+        }
+    }
 }
 
 fn is_hostname(domain: &str) -> bool {

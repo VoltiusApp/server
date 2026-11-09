@@ -216,6 +216,10 @@ pub struct GrantMintRateLimiter(pub RateLimiter<Uuid>);
 #[derive(Clone)]
 pub struct GrantRedeemRateLimiter(pub RateLimiter<Uuid>);
 
+/// Enrolment-token redemptions per user, so a leaked token cannot be probed through one account.
+#[derive(Clone)]
+pub struct EnrollmentRedeemRateLimiter(pub RateLimiter<Uuid>);
+
 /// Handlers that charge IP limiters themselves read the address from here.
 #[derive(Clone, Copy)]
 pub struct ClientIp(pub IpAddr);

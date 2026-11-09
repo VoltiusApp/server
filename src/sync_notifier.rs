@@ -161,6 +161,22 @@ pub async fn notify_team(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid, 
     .await;
 }
 
+pub async fn notify_team_permission_holders(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    team_id: Uuid,
+    perm: i64,
+    payload: String,
+) {
+    let mut holders = Vec::new();
+    notify_team_members(pool, &[team_id], None, |member_id| holders.push(member_id)).await;
+    for member_id in holders {
+        if matches!(crate::permissions::effective_permissions(pool, team_id, member_id).await, Ok(bits) if bits & perm != 0) {
+            notifier.notify(member_id, payload.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
