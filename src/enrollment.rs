@@ -41,7 +41,7 @@ pub struct Guard {
 
 pub fn admission(guard: &Guard, email: &str, email_proven: bool, seat_available: bool) -> Admission {
     if !guard.allowed_domains.is_empty() {
-        let domain = email.rsplit_once('@').map(|(_, d)| d.to_lowercase());
+        let domain = email.split_once('@').filter(|(_, d)| !d.contains('@')).map(|(_, d)| d.to_lowercase());
         if !domain.is_some_and(|d| guard.allowed_domains.contains(&d)) {
             return Admission::DomainMismatch;
         }
@@ -104,6 +104,13 @@ mod tests {
     }
 
     #[test]
+    fn malformed_addresses_never_match_a_domain() {
+        let g = guard(&["acme.com"], false);
+        assert_eq!(admission(&g, "noat", true, true), Admission::DomainMismatch);
+        assert_eq!(admission(&g, "a@b@acme.com", true, true), Admission::DomainMismatch);
+    }
+
+    #[test]
     fn approval_only_guard_makes_everyone_pending() {
         let g = guard(&[], true);
         assert_eq!(admission(&g, "a@gmail.com", true, true), Admission::Pending(PendingReason::Approval));
@@ -135,6 +142,12 @@ mod tests {
             assert!(normalize_domains(&[bad.to_string()]).is_err(), "{bad}");
         }
         assert!(normalize_domains(&[format!("{}.com", "a".repeat(64))]).is_err());
+    }
+
+    #[test]
+    fn normalize_domains_accepts_punycode_and_rejects_a_trailing_dot() {
+        assert_eq!(normalize_domains(&["xn--bcher-kva.example".to_string()]), Ok(vec!["xn--bcher-kva.example".to_string()]));
+        assert!(normalize_domains(&["acme.com.".to_string()]).is_err());
     }
 
     #[test]

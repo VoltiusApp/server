@@ -902,7 +902,7 @@ pub async fn update_email(
     })?;
 
     sqlx::query(
-        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, email_undeliverable_at = NULL, updated_at = now() WHERE id = $2",
+        "UPDATE users SET email = $1, email_verified = FALSE, email_verified_at = NULL, email_proven_at = NULL, email_undeliverable_at = NULL, updated_at = now() WHERE id = $2",
     )
     .bind(&new_email)
     .bind(auth.0)
@@ -2018,6 +2018,33 @@ mod handler_tests {
         assert_eq!(verification_token_count(&pool, id).await, 0);
         assert_eq!(resend(&pool, id).await, StatusCode::OK);
         assert_eq!(verification_token_count(&pool, id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn changing_email_clears_the_proven_address_and_resend_issues_a_link() {
+        let pool = test_pool_or_skip!();
+        let account_id = Uuid::new_v4();
+        let id = crate::test_support::seed_user_with_credentials(&pool, account_id, "auth-key-secret").await;
+        sqlx::query("UPDATE users SET email_verified = TRUE, email_proven_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status = update_email(
+            State(pool.clone()),
+            Extension(AuthUser(id)),
+            Json(UpdateEmailRequest {
+                new_email: format!("{}@moved.test", unique_handle("nm")),
+                auth_key: "auth-key-secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(proven_at(&pool, id).await.is_none());
+        let after_change = verification_token_count(&pool, id).await;
+        assert_eq!(resend(&pool, id).await, StatusCode::OK);
+        assert_eq!(verification_token_count(&pool, id).await, after_change + 1);
     }
 
     #[tokio::test]
