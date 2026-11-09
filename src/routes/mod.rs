@@ -14,6 +14,7 @@ pub mod presence;
 pub mod resend_webhook;
 pub mod session_codes;
 pub mod sync;
+pub mod team_enrollment;
 pub mod team_grants;
 pub mod team_lock_policy;
 pub mod team_policy;

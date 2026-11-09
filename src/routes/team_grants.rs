@@ -36,8 +36,22 @@ const MAX_PUBLIC_KEY_LEN: usize = 256;
 /// The create/list/revoke gate, in one place: the same permission bit that
 /// guards `POST /v1/teams/:team_id/invite`. Preview and redeem are deliberately
 /// not gated on it — they are authenticated as whoever holds the link.
-async fn require_grant_admin(pool: &PgPool, team_id: Uuid, user: Uuid) -> Result<(), StatusCode> {
+pub(crate) async fn require_grant_admin(pool: &PgPool, team_id: Uuid, user: Uuid) -> Result<(), StatusCode> {
     require_all_team_permissions(pool, team_id, user, &[PERM_INVITE_MEMBERS]).await
+}
+
+/// Link-borne roles are the built-in ones below owner, and the actor may not confer more than they hold.
+pub(crate) async fn require_grantable_role(
+    pool: &PgPool,
+    team_id: Uuid,
+    actor: Uuid,
+    role: &str,
+) -> Result<(), StatusCode> {
+    if !grants::is_grantable_role(role) {
+        warn!(team_id = %team_id, user_id = %actor, role = %role, "Rejected non-grantable role");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    crate::team_authority::require_may_confer_builtin(pool, team_id, actor, role).await
 }
 
 fn reject(rejection: GrantRejection) -> StatusCode {
@@ -102,11 +116,7 @@ pub async fn create_grant(
     require_grant_admin(&pool, team_id, auth.0).await?;
 
     let role = body.role.as_deref().unwrap_or("member").to_string();
-    if !grants::is_grantable_role(&role) {
-        warn!(team_id = %team_id, user_id = %auth.0, role = %role, "Rejected non-grantable role");
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    crate::team_authority::require_may_confer_builtin(&pool, team_id, auth.0, &role).await?;
+    require_grantable_role(&pool, team_id, auth.0, &role).await?;
 
     let max_uses = grants::clamp_max_uses(body.max_uses);
     let ttl = grants::clamp_ttl(body.expires_in_secs);

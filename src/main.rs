@@ -455,6 +455,13 @@ async fn main() {
         .route("/v1/teams/:team_id", delete(routes::teams::delete_team).patch(routes::teams::rename_team))
         .route("/v1/teams/:team_id/billing-owner", put(routes::team_ownership::transfer_billing_owner))
         .route(
+            "/v1/teams/:team_id/enrollment-token",
+            post(routes::team_enrollment::create_token)
+                .get(routes::team_enrollment::get_token)
+                .delete(routes::team_enrollment::revoke_token)
+                .layer(middleware::from_fn(features::require_team_invites)),
+        )
+        .route(
             "/v1/teams/:team_id/lock-policy",
             put(routes::team_lock_policy::set_lock_policy).delete(routes::team_lock_policy::clear_lock_policy),
         )
