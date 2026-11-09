@@ -237,6 +237,7 @@ impl TokenRow {
 #[derive(Debug)]
 pub(crate) enum EnrollError {
     NotFound,
+    TokenNotFound,
     Gone,
     Unavailable,
     DomainMismatch,
@@ -260,7 +261,8 @@ impl From<StatusCode> for EnrollError {
 impl From<EnrollError> for ApiError {
     fn from(err: EnrollError) -> Self {
         match err {
-            EnrollError::NotFound => ApiError::coded(StatusCode::NOT_FOUND, "ENROLLMENT_NOT_FOUND"),
+            EnrollError::NotFound => StatusCode::NOT_FOUND.into(),
+            EnrollError::TokenNotFound => ApiError::coded(StatusCode::NOT_FOUND, "ENROLLMENT_NOT_FOUND"),
             EnrollError::Gone => StatusCode::GONE.into(),
             EnrollError::Unavailable => ApiError::coded(StatusCode::PAYMENT_REQUIRED, "ENROLLMENT_UNAVAILABLE"),
             EnrollError::DomainMismatch => ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"),
@@ -289,7 +291,7 @@ pub(crate) async fn load_live_token(pool: &PgPool, id: Uuid, secret: &str) -> Re
     .bind(hash_secret(secret))
     .fetch_optional(pool)
     .await?
-    .ok_or(EnrollError::NotFound)?;
+    .ok_or(EnrollError::TokenNotFound)?;
     if found.revoked || found.expired {
         return Err(EnrollError::Gone);
     }
@@ -1414,6 +1416,24 @@ mod tests {
 
         crate::test_support::set_user_seats(&pool, owner, 5).await;
         assert_eq!(approve_as(&pool, &notifier, manager, team, request).await.unwrap(), json!({ "status": "admitted" }));
+    }
+
+    #[tokio::test]
+    async fn approve_already_decided_is_plain_404() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let notifier = SyncNotifier::new();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let (id, secret) = insert_token(&pool, team, manager, "member", &[], true).await;
+        let user = user_at(&pool, &fresh_email("acme.com"), true).await;
+        redeem_as(&pool, &notifier, user, id, &secret).await.unwrap();
+        let (request, _) = pending_request(&pool, team, user).await;
+        approve_as(&pool, &notifier, manager, team, request).await.unwrap();
+
+        let err = approve_as(&pool, &notifier, manager, team, request).await.unwrap_err();
+        assert_eq!(error_code(err), (StatusCode::NOT_FOUND, None));
+        let raced = ApiError::from(try_admit(&pool, &notifier, request, Some(manager)).await.unwrap_err());
+        assert_eq!(error_code(raced), (StatusCode::NOT_FOUND, None));
     }
 
     #[tokio::test]
