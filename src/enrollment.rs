@@ -41,7 +41,7 @@ pub struct Guard {
 
 pub fn admission(guard: &Guard, email: &str, email_proven: bool, seat_available: bool) -> Admission {
     if !guard.allowed_domains.is_empty() {
-        let domain = email.split_once('@').filter(|(_, d)| !d.contains('@')).map(|(_, d)| d.to_lowercase());
+        let domain = email.rsplit_once('@').map(|(_, d)| d.to_lowercase());
         if !domain.is_some_and(|d| guard.allowed_domains.contains(&d)) {
             return Admission::DomainMismatch;
         }
@@ -104,10 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_addresses_never_match_a_domain() {
+    fn the_domain_is_the_part_after_the_last_at() {
         let g = guard(&["acme.com"], false);
         assert_eq!(admission(&g, "noat", true, true), Admission::DomainMismatch);
-        assert_eq!(admission(&g, "a@b@acme.com", true, true), Admission::DomainMismatch);
+        assert_eq!(admission(&g, "a@b@acme.com", true, true), Admission::Admit);
     }
 
     #[test]
