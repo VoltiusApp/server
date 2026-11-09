@@ -757,6 +757,16 @@ pub async fn delete_team(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
+    let requester_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM team_join_requests WHERE team_id = $1 AND status = 'pending'")
+            .bind(team_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                error!(error = %e, team_id = %team_id, "Failed to fetch pending join requests before delete");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
     sqlx::query("DELETE FROM teams WHERE id = $1")
         .bind(team_id)
         .execute(&pool)
@@ -772,6 +782,9 @@ pub async fn delete_team(
     info!(team_id = %team_id, deleted_by = %auth.0, "Team deleted by owner");
     for member_id in member_ids {
         notifier.notify_membership_changed(member_id, team_id, false);
+    }
+    for requester_id in requester_ids {
+        notifier.notify_my_join_requests_changed(requester_id);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3247,6 +3260,34 @@ mod authz_tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_team_notifies_its_pending_requesters() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = crate::test_support::seed_team_with_roles(&pool, owner).await;
+        let pending = seed_user(&pool).await;
+        let denied = seed_user(&pool).await;
+        for (user, status) in [(pending, "pending"), (denied, "denied")] {
+            sqlx::query("INSERT INTO team_join_requests (team_id, user_id, status) VALUES ($1, $2, $3)")
+                .bind(team)
+                .bind(user)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let notifier = SyncNotifier::new();
+        let mut rx = notifier.subscribe();
+
+        delete_team(State(pool.clone()), Extension(AuthUser(owner)), Extension(notifier), Extension(TerminalManager::new()), Path(team))
+            .await
+            .unwrap();
+
+        let told = crate::test_support::told(&mut rx, &format!("my_join_requests_changed:{pending}"));
+        assert_eq!(told, std::collections::HashSet::from([pending]));
+        assert!(crate::test_support::told(&mut rx, &format!("my_join_requests_changed:{denied}")).is_empty());
     }
 }
 
