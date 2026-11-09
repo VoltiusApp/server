@@ -24,6 +24,13 @@ impl Features {
         }
     }
 
+    pub(crate) fn registration_open(&self) -> Result<(), crate::routes::ApiError> {
+        if self.registration {
+            return Ok(());
+        }
+        Err(crate::routes::ApiError::coded(StatusCode::FORBIDDEN, "REGISTRATION_DISABLED"))
+    }
+
     #[cfg(test)]
     pub fn open() -> Self {
         Self { registration: true, team_invites: true, handles_from_email: false }
@@ -45,22 +52,11 @@ fn parse_flag(value: Option<&str>, default: bool) -> Result<bool, String> {
     }
 }
 
-const REGISTRATION_DISABLED: &str = "REGISTRATION_DISABLED";
-
 async fn deny_unless(enabled: bool, code: &'static str, req: Request, next: Next) -> Response {
     if enabled {
         return next.run(req).await;
     }
     crate::routes::coded_error(StatusCode::FORBIDDEN, code)
-}
-
-impl Features {
-    pub(crate) fn registration_open(&self) -> Result<(), crate::routes::ApiError> {
-        if self.registration {
-            return Ok(());
-        }
-        Err(crate::routes::ApiError::coded(StatusCode::FORBIDDEN, REGISTRATION_DISABLED))
-    }
 }
 
 pub async fn require_team_invites(

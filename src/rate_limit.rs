@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{warn, Instrument};
 use uuid::Uuid;
 
 /// Per-key sliding window rate limiter. Key is typically IpAddr or Uuid.
@@ -160,7 +160,7 @@ fn client_ip(peer: Option<IpAddr>, forwarded_for: Option<&str>, trusted: &[Trust
         .unwrap_or(peer)
 }
 
-pub(crate) fn extract_ip(req: &Request) -> IpAddr {
+fn extract_ip(req: &Request) -> IpAddr {
     client_ip(
         req.extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -234,27 +234,18 @@ pub struct EnrollmentResolveLimiter(pub RateLimiter<IpAddr>);
 #[derive(Clone)]
 pub struct EnrollmentRegisterLimiter(pub RateLimiter<Uuid>);
 
-/// Checks a limiter, warning and returning 429 on exhaustion. The one place
-/// this shape is expressed; middlewares and handlers alike call it.
+/// Warns and returns 429 when the key's budget is spent.
 pub async fn check_budget<K: Eq + Hash + Send + std::fmt::Display + 'static>(
     limiter: &RateLimiter<K>,
     key: K,
     label: &str,
 ) -> Result<(), StatusCode> {
-    let shown = key.to_string();
+    let shown = format!("{key}");
     if !limiter.check(key).await {
         warn!(key = %shown, limiter = label, "Rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(())
-}
-
-pub async fn check_user_budget(
-    limiter: &RateLimiter<Uuid>,
-    user: Uuid,
-    label: &str,
-) -> Result<(), StatusCode> {
-    check_budget(limiter, user, label).await
 }
 
 /// Shared body for the per-user middlewares below: check the limiter keyed on
@@ -266,7 +257,7 @@ async fn user_keyed_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    check_user_budget(limiter, user, label).await?;
+    check_budget(limiter, user, label).await?;
     Ok(next.run(req).await)
 }
 
@@ -296,7 +287,8 @@ pub async fn auth_rate_limit(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    check_budget(&limiter, extract_ip(&req), "auth").await?;
+    let span = tracing::warn_span!("auth_request", method = %req.method(), path = %req.uri().path());
+    check_budget(&limiter, extract_ip(&req), "auth").instrument(span).await?;
     Ok(next.run(req).await)
 }
 

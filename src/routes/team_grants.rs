@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::permissions::{require_all_team_permissions, PERM_INVITE_MEMBERS};
-use crate::rate_limit::{check_user_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
+use crate::rate_limit::{check_budget, GrantMintRateLimiter, GrantRedeemRateLimiter};
 use crate::routes::audit::write_audit_event;
 use crate::routes::invitations::{admit_member, announce_member_joined};
 use crate::routes::teams::{ensure_seat_available, notify_team_members_changed, team_owner};
@@ -112,7 +112,7 @@ pub async fn create_grant(
     Path(team_id): Path<Uuid>,
     Json(body): Json<CreateGrantRequest>,
 ) -> Result<(StatusCode, Json<CreateGrantResponse>), StatusCode> {
-    check_user_budget(&limiter, auth.0, "team_grant_mint").await?;
+    check_budget(&limiter, auth.0, "team_grant_mint").await?;
     require_grant_admin(&pool, team_id, auth.0).await?;
 
     let role = body.role.as_deref().unwrap_or("member").to_string();
@@ -229,7 +229,7 @@ pub async fn preview_grant(
     Path(grant_id): Path<Uuid>,
     Json(body): Json<SecretRequest>,
 ) -> Result<Json<PreviewResponse>, StatusCode> {
-    check_user_budget(&limiter, auth.0, "team_grant_preview").await?;
+    check_budget(&limiter, auth.0, "team_grant_preview").await?;
 
     let preview = grants::preview(&pool, grant_id, &body.secret)
         .await
@@ -268,7 +268,7 @@ pub async fn redeem_grant(
     Path(grant_id): Path<Uuid>,
     Json(body): Json<RedeemGrantRequest>,
 ) -> Result<Json<RedeemGrantResponse>, StatusCode> {
-    check_user_budget(&limiter, auth.0, "team_grant_redeem").await?;
+    check_budget(&limiter, auth.0, "team_grant_redeem").await?;
 
     if let Some(key) = body.public_key.as_deref() {
         if key.trim().is_empty() || key.len() > MAX_PUBLIC_KEY_LEN {

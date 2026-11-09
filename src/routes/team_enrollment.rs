@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::enrollment::{mint_secret, normalize_domains, Guard};
-use crate::rate_limit::{check_budget, check_user_budget, ClientIp, EnrollmentResolveLimiter, GrantMintRateLimiter};
+use crate::rate_limit::{check_budget, ClientIp, EnrollmentResolveLimiter, GrantMintRateLimiter};
 use crate::routes::audit::write_audit_event;
 use crate::routes::ApiError;
 use crate::routes::team_grants::{require_grant_admin, require_grantable_role};
@@ -103,7 +103,7 @@ pub async fn create_token(
     Path(team_id): Path<Uuid>,
     Json(body): Json<CreateTokenRequest>,
 ) -> Result<(StatusCode, Json<CreateTokenResponse>), ApiError> {
-    check_user_budget(&limiter, auth.0, "enrollment_token_mint").await?;
+    check_budget(&limiter, auth.0, "enrollment_token_mint").await?;
     require_grant_admin(&pool, team_id, auth.0).await?;
     require_grantable_role(&pool, team_id, auth.0, &body.role).await?;
     let domains = validated_domains(&body)?;
@@ -677,6 +677,10 @@ mod tests {
     }
 
     fn signup_app(pool: &PgPool, features: Features, register_per_day: usize) -> SignupApp {
+        signup_app_with_token_budget(pool, features, register_per_day, 500)
+    }
+
+    fn signup_app_with_token_budget(pool: &PgPool, features: Features, register_per_day: usize, token_per_day: usize) -> SignupApp {
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         let auth_limiter = RateLimiter::new(10, Duration::from_secs(60));
         let app = crate::signup_routes(
@@ -684,7 +688,7 @@ mod tests {
             auth_limiter.clone(),
             RegisterRateLimiter(RateLimiter::new(register_per_day, Duration::from_secs(86400))),
             EnrollmentResolveLimiter(RateLimiter::new(60, Duration::from_secs(60))),
-            EnrollmentRegisterLimiter(RateLimiter::new(500, Duration::from_secs(86400))),
+            EnrollmentRegisterLimiter(RateLimiter::new(token_per_day, Duration::from_secs(86400))),
         )
         .merge(
             axum::Router::new()
@@ -723,6 +727,17 @@ mod tests {
                 body["enrollment"] = json!({ "id": id, "secret": secret });
             }
             self.post("/v1/auth/register", ip, body).await
+        }
+
+        async fn register_raw(&self, ip: &str, body: &str) -> StatusCode {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::new(ip.parse().unwrap(), 4000)));
+            self.app.clone().oneshot(req).await.unwrap().status()
         }
 
         async fn user_exists(&self, email: &str) -> bool {
@@ -888,5 +903,62 @@ mod tests {
         let token = acme_token(&pool).await;
         let (status, value) = app.register("10.0.1.7", &fresh_email("acme.com"), Some((token.id, &token.secret))).await;
         assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "REGISTRATION_DISABLED" })));
+    }
+
+    #[tokio::test]
+    async fn malformed_body_hits_the_registration_gate_first() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 5);
+        assert_eq!(app.register_raw("10.0.1.8", "{not json").await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn malformed_body_is_charged_to_the_ip_buckets() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 2);
+        for _ in 0..2 {
+            assert!(app.register_raw("10.0.1.9", "{not json").await.is_client_error());
+        }
+        assert_eq!(app.register_raw("10.0.1.9", "{not json").await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn token_budget_is_keyed_on_the_token() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app_with_token_budget(&pool, Features::open(), 5, 2);
+        let a = acme_token(&pool).await;
+        let b = acme_token(&pool).await;
+        for _ in 0..2 {
+            assert_eq!(app.register("10.0.2.1", &fresh_email("acme.com"), Some((a.id, &a.secret))).await.0, StatusCode::CREATED);
+        }
+        let blocked = fresh_email("acme.com");
+        assert_eq!(app.register("10.0.2.1", &blocked, Some((a.id, &a.secret))).await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!app.user_exists(&blocked).await);
+        assert_eq!(app.register("10.0.2.1", &fresh_email("acme.com"), Some((b.id, &b.secret))).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn dead_token_on_a_closed_server_creates_no_user_and_is_charged_to_the_ip() {
+        let _billing = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 2);
+        let (team, owner, manager) = business_team(&pool).await;
+        let revoked = created(&pool, team, manager, body("member", &[], true)).await;
+        revoke(&pool, team, manager).await.unwrap();
+        let lapsed = created(&pool, team, manager, body("member", &[], true)).await;
+        set_user_tier(&pool, owner, "free").await;
+
+        let gone = fresh_email("acme.com");
+        let (status, _) = app.register("10.0.2.2", &gone, Some((revoked.id, &revoked.secret))).await;
+        assert_eq!(status, StatusCode::GONE);
+        let unavailable = fresh_email("acme.com");
+        let (status, value) = app.register("10.0.2.2", &unavailable, Some((lapsed.id, &lapsed.secret))).await;
+        assert_eq!((status, value), (StatusCode::PAYMENT_REQUIRED, json!({ "error": "ENROLLMENT_UNAVAILABLE" })));
+        assert!(!app.user_exists(&gone).await && !app.user_exists(&unavailable).await);
+        let (status, _) = app.register("10.0.2.2", &fresh_email("acme.com"), Some((revoked.id, &revoked.secret))).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 }

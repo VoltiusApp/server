@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -344,6 +344,16 @@ async fn charge_ip_gates(
     check_budget(register, ip, "register").await
 }
 
+async fn charge_untokened_gates(
+    features: &crate::features::Features,
+    auth: &RateLimiter,
+    register: &RateLimiter,
+    ip: std::net::IpAddr,
+) -> Result<(), ApiError> {
+    features.registration_open()?;
+    Ok(charge_ip_gates(auth, register, ip).await?)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn register(
     State(pool): State<PgPool>,
@@ -354,8 +364,15 @@ pub async fn register(
     axum::Extension(RegisterRateLimiter(register_limiter)): axum::Extension<RegisterRateLimiter>,
     axum::Extension(EnrollmentResolveLimiter(resolve_limiter)): axum::Extension<EnrollmentResolveLimiter>,
     axum::Extension(EnrollmentRegisterLimiter(token_limiter)): axum::Extension<EnrollmentRegisterLimiter>,
-    Json(body): Json<RegisterRequest>,
+    body: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<AuthResponse>), ApiError> {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?;
+            return Err(rejection.status().into());
+        }
+    };
     let credential = body.enrollment.as_ref().filter(|_| features.team_invites);
     let token = match credential {
         Some(credential) => {
@@ -372,8 +389,7 @@ pub async fn register(
             }
         }
         None => {
-            features.registration_open()?;
-            charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
+            charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?;
             None
         }
     };
