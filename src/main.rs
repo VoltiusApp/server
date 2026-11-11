@@ -14,6 +14,7 @@ mod permissions;
 mod rate_limit;
 mod routes;
 mod self_host;
+mod shutdown;
 mod single_instance;
 mod session_grants;
 mod team_authority;
@@ -41,6 +42,7 @@ use rate_limit::{
     SyncRateLimiter, WaitlistRateLimiter,
 };
 use routes::audit::AuditClientRateLimiter;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -236,6 +238,7 @@ async fn main() {
             }
         });
     }
+    let drain = shutdown::Drain::new();
     let presence_map: PresenceMap = Arc::new(DashMap::new());
     let usage_map: UsageMap = Arc::new(DashMap::new());
 
@@ -801,6 +804,7 @@ async fn main() {
         .layer(Extension(terminal_manager.clone()))
         .layer(Extension(presence_map.clone()))
         .layer(Extension(usage_map.clone()))
+        .layer(Extension(drain.clone()))
         .layer(Extension(min_client_version));
 
     // Admin routes — auth + admin check, no rate limit (internal tool)
@@ -869,7 +873,8 @@ async fn main() {
             get(routes::terminal::ws_handler),
         )
         .layer(Extension(terminal_manager))
-        .layer(Extension(notifier));
+        .layer(Extension(notifier))
+        .layer(Extension(drain.clone()));
 
     let app = Router::new()
         .merge(public)
@@ -932,14 +937,19 @@ async fn main() {
         }
     };
 
-    if let Err(error) = axum::serve(
+    let grace = Duration::from_secs(
+        std::env::var("SHUTDOWN_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+    );
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    {
-        tracing::error!(%error, "Server exited with an error");
-    }
+    .with_graceful_shutdown(drain.stopping())
+    .into_future();
+    drain.serve(server, grace).await;
 }
 
 #[cfg(test)]
