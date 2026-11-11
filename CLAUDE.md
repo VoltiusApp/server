@@ -12,7 +12,7 @@ This server cannot run as more than one instance today, and four pieces of state
 |---|---|---|
 | `SyncNotifier` | `src/sync_notifier.rs` | a client on A never sees an event caused by B — stale, no error |
 | `TerminalManager` | `src/terminal_manager.rs` | a shared session only works if every participant lands on the same instance |
-| Rate limiters | `src/rate_limit.rs` | N instances means N times every limit, register and auth included |
+| Short-window rate limiters | `src/rate_limit.rs` | N instances means N times auth, sync and search; the hour/day limits are already counted in Postgres via `.durable()` |
 | Presence/usage | `src/routes/presence.rs` | each instance sees only its own users |
 
 Every one added between now and that migration is another item on it. Four is a weekend;

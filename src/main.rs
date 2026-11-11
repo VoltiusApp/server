@@ -216,6 +216,11 @@ async fn main() {
                 Ok(n) => tracing::info!(deleted = n, "Unattached rule set sweep completed"),
                 Err(e) => tracing::error!(error = %e, "Unattached rule set sweep failed"),
             }
+
+            match rate_limit::sweep_durable_hits(&retention_pool).await {
+                Ok(n) => tracing::info!(deleted = n, "Expired rate limit hits swept"),
+                Err(e) => tracing::error!(error = %e, "Rate limit hit sweep failed"),
+            }
         }
     });
 
@@ -270,24 +275,23 @@ async fn main() {
         .unwrap_or(10);
     let auth_limiter =
         RateLimiter::<std::net::IpAddr>::new(auth_per_minute, Duration::from_secs(60));
-    let register_limiter = RegisterRateLimiter(RateLimiter::new(
-        register_per_day,
-        Duration::from_secs(86400),
-    ));
+    let hourly = |max: usize, bucket: &'static str| {
+        RateLimiter::<uuid::Uuid>::new(max, Duration::from_secs(3600)).durable(pool.clone(), bucket)
+    };
+    let register_limiter = RegisterRateLimiter(
+        RateLimiter::new(register_per_day, Duration::from_secs(86400)).durable(pool.clone(), "register"),
+    );
     let enrollment_resolve_limiter =
         EnrollmentResolveLimiter(RateLimiter::<std::net::IpAddr>::new(60, Duration::from_secs(60)));
-    let enrollment_register_limiter =
-        EnrollmentRegisterLimiter(RateLimiter::<uuid::Uuid>::new(500, Duration::from_secs(86400)));
+    let enrollment_register_limiter = EnrollmentRegisterLimiter(
+        RateLimiter::<uuid::Uuid>::new(500, Duration::from_secs(86400)).durable(pool.clone(), "enrollment_register"),
+    );
     let enrollment_policy_limiter =
         EnrollmentPolicyLimiter(RateLimiter::<std::net::IpAddr>::new(300, Duration::from_secs(60)));
-    let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(
-        invite_per_hour,
-        Duration::from_secs(3600),
-    ));
-    let waitlist_limiter = WaitlistRateLimiter(RateLimiter::new(
-        waitlist_per_hour,
-        Duration::from_secs(3600),
-    ));
+    let invite_limiter = InviteRateLimiter(hourly(invite_per_hour, "invite"));
+    let waitlist_limiter = WaitlistRateLimiter(
+        RateLimiter::new(waitlist_per_hour, Duration::from_secs(3600)).durable(pool.clone(), "waitlist"),
+    );
     let sync_limiter = SyncRateLimiter(RateLimiter::<uuid::Uuid>::new(
         sync_rate,
         Duration::from_secs(3600),
@@ -296,20 +300,13 @@ async fn main() {
         AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
     let search_limiter =
         SearchRateLimiter(RateLimiter::<uuid::Uuid>::new(search_rate, Duration::from_secs(60)));
-    let knock_limiter =
-        KnockRateLimiter(RateLimiter::<uuid::Uuid>::new(knock_per_hour, Duration::from_secs(3600)));
-    let session_code_limiter =
-        SessionCodeRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
-    let redeem_limiter =
-        RedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
-    let grant_mint_limiter =
-        GrantMintRateLimiter(RateLimiter::<uuid::Uuid>::new(30, Duration::from_secs(3600)));
-    let grant_redeem_limiter =
-        GrantRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
-    let enrollment_redeem_limiter =
-        EnrollmentRedeemRateLimiter(RateLimiter::<uuid::Uuid>::new(20, Duration::from_secs(3600)));
-    let resend_verification_limiter =
-        ResendVerificationRateLimiter(RateLimiter::<uuid::Uuid>::new(5, Duration::from_secs(3600)));
+    let knock_limiter = KnockRateLimiter(hourly(knock_per_hour, "knock"));
+    let session_code_limiter = SessionCodeRateLimiter(hourly(30, "session_code"));
+    let redeem_limiter = RedeemRateLimiter(hourly(20, "redeem"));
+    let grant_mint_limiter = GrantMintRateLimiter(hourly(30, "grant_mint"));
+    let grant_redeem_limiter = GrantRedeemRateLimiter(hourly(20, "grant_redeem"));
+    let enrollment_redeem_limiter = EnrollmentRedeemRateLimiter(hourly(20, "enrollment_redeem"));
+    let resend_verification_limiter = ResendVerificationRateLimiter(hourly(5, "resend_verification"));
 
     // Lemon Squeezy live metrics cache (background refresh every 5 min).
     let ls_cache = lemonsqueezy::LsCache::default();
