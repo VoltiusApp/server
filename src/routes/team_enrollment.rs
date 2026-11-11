@@ -29,11 +29,13 @@ fn internal(what: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
     }
 }
 
-async fn revoke_live(conn: &mut PgConnection, team_id: Uuid) -> Result<Option<Uuid>, ApiError> {
+async fn revoke_live(conn: &mut PgConnection, team_id: Uuid, superseded: bool) -> Result<Option<Uuid>, ApiError> {
     sqlx::query_scalar::<_, Uuid>(
-        "UPDATE team_enrollment_tokens SET revoked_at = now() WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
+        "UPDATE team_enrollment_tokens SET revoked_at = now(), superseded_at = CASE WHEN $2 THEN now() END \
+         WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
     )
     .bind(team_id)
+    .bind(superseded)
     .fetch_optional(conn)
     .await
     .map_err(internal("Failed to revoke enrollment token"))
@@ -122,7 +124,7 @@ pub async fn create_token(
     let secret = mint_secret();
     let mut tx = pool.begin().await.map_err(internal("Failed to begin enrollment token transaction"))?;
     lock_billing_owner(&mut tx, team_id).await?;
-    let replaced = revoke_live(&mut tx, team_id).await?;
+    let replaced = revoke_live(&mut tx, team_id, true).await?;
     let (id, created_at) = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
         "INSERT INTO team_enrollment_tokens \
          (team_id, secret_hash, role, allowed_domains, require_approval, expires_at, created_by) \
@@ -211,7 +213,7 @@ pub async fn revoke_token(
 ) -> Result<StatusCode, ApiError> {
     require_grant_admin(&pool, team_id, auth.0).await?;
     let mut conn = pool.acquire().await.map_err(internal("Failed to acquire connection"))?;
-    let revoked = revoke_live(&mut conn, team_id).await?;
+    let revoked = revoke_live(&mut conn, team_id, false).await?;
     if let Some(id) = revoked {
         info!(team_id = %team_id, token_id = %id, "Enrollment token revoked");
         audit(&pool, team_id, auth.0, "enrollment_token.revoked", id, None).await;
@@ -736,6 +738,47 @@ mod tests {
         .unwrap();
         assert_eq!(old_live, None);
         assert_eq!(fetch(&pool, team, manager).await["token"]["role"], "editor");
+    }
+
+    async fn revoked_and_superseded(pool: &PgPool, id: Uuid) -> (bool, bool) {
+        sqlx::query_as("SELECT revoked_at IS NOT NULL, superseded_at IS NOT NULL FROM team_enrollment_tokens WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rotation_marks_old_token_superseded() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let first = created(&pool, team, manager, body("member", &[], true)).await;
+        let second = created(&pool, team, manager, body("member", &[], true)).await;
+        assert_eq!(revoked_and_superseded(&pool, first.id).await, (true, true));
+        assert_eq!(revoked_and_superseded(&pool, second.id).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn revoke_does_not_supersede() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let token = created(&pool, team, manager, body("member", &[], true)).await;
+        revoke(&pool, team, manager).await.unwrap();
+        assert_eq!(revoked_and_superseded(&pool, token.id).await, (true, false));
+    }
+
+    #[tokio::test]
+    async fn revoke_after_rotation_leaves_old_superseded() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let first = created(&pool, team, manager, body("member", &[], true)).await;
+        let second = created(&pool, team, manager, body("member", &[], true)).await;
+        revoke(&pool, team, manager).await.unwrap();
+        assert_eq!(revoked_and_superseded(&pool, first.id).await, (true, true));
+        assert_eq!(revoked_and_superseded(&pool, second.id).await, (true, false));
     }
 
     #[tokio::test]
