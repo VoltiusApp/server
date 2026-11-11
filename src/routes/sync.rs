@@ -290,6 +290,7 @@ pub async fn sync_stream(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::Extension(presence): axum::Extension<PresenceMap>,
     axum::Extension(usage): axum::Extension<UsageMap>,
+    axum::Extension(drain): axum::Extension<crate::shutdown::Drain>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let user_id = auth.0;
 
@@ -352,6 +353,8 @@ pub async fn sync_stream(
         }
     });
 
+    // Ending the stream is what lets a draining server finish this response.
+    let stream = futures_util::StreamExt::take_until(stream, drain.stopping());
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(30))

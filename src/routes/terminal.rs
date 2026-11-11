@@ -1373,6 +1373,7 @@ pub async fn ws_handler(
     State(pool): State<PgPool>,
     Extension(manager): Extension<TerminalManager>,
     Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
+    Extension(drain): Extension<crate::shutdown::Drain>,
 ) -> impl IntoResponse {
     let user_id = match validate_token(&query.token, "access") {
         Ok(claims) => claims.sub,
@@ -1385,7 +1386,7 @@ pub async fn ws_handler(
     let handle = resolve_participant_handle(&pool, user_id).await;
 
     ws.on_upgrade(move |socket| {
-        handle_socket(
+        drain.track(handle_socket(
             socket,
             session_id,
             user_id,
@@ -1394,7 +1395,8 @@ pub async fn ws_handler(
             pool,
             manager,
             notifier,
-        )
+            drain.stopping(),
+        ))
     })
 }
 
@@ -1550,6 +1552,13 @@ async fn check_admission(
 }
 
 const ACCESS_REVOKED_FRAME: &str = r#"{"type":"session_ended","reason":"access_revoked"}"#;
+const SERVER_RESTART_FRAME: &str = r#"{"type":"session_ended","reason":"server_restart"}"#;
+
+async fn end_socket<S: futures_util::Sink<Message> + Unpin>(sender: &mut S, frame: &str, close_code: Option<u16>) {
+    let _ = sender.send(Message::Text(frame.to_string())).await;
+    let close = close_code.map(|code| axum::extract::ws::CloseFrame { code, reason: "".into() });
+    let _ = sender.send(Message::Close(close)).await;
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
@@ -1561,6 +1570,7 @@ async fn handle_socket(
     pool: PgPool,
     manager: TerminalManager,
     notifier: crate::sync_notifier::SyncNotifier,
+    stopping: tokio_util::sync::WaitForCancellationFutureOwned,
 ) {
     // Subscribed before admission so a revoke racing this join still triggers a recheck.
     let access_rx = manager.sessions.lock().await.get(&session_id).map(|s| s.access_changed.subscribe());
@@ -1669,15 +1679,19 @@ async fn handle_socket(
         let pool = pool.clone();
         let manager = manager.clone();
         tokio::spawn(async move {
+            tokio::pin!(stopping);
             loop {
                 tokio::select! {
+                    () = &mut stopping => {
+                        end_socket(&mut ws_sender, SERVER_RESTART_FRAME, Some(axum::extract::ws::close_code::RESTART)).await;
+                        break;
+                    }
                     Ok(()) = access_rx.changed() => {
                         let admission =
                             check_admission(&pool, &manager, session_id, user_id, invite_token.as_deref()).await;
                         if matches!(admission, Some(Admission { authorized: false, .. })) {
                             info!(session_id = %session_id, user_id = %user_id, "WS participant lost access");
-                            let _ = ws_sender.send(Message::Text(ACCESS_REVOKED_FRAME.to_string())).await;
-                            let _ = ws_sender.send(Message::Close(None)).await;
+                            end_socket(&mut ws_sender, ACCESS_REVOKED_FRAME, None).await;
                             break;
                         }
                     }
@@ -3872,20 +3886,23 @@ mod live_revoke_tests {
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, member_with_role, seed_session, seed_team, seed_user, set_user_tier};
     use axum::{routing::get, Router};
+    use crate::shutdown::Drain;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-    async fn serve(pool: PgPool, manager: TerminalManager) -> std::net::SocketAddr {
+    async fn serve(pool: PgPool, manager: TerminalManager) -> (std::net::SocketAddr, Drain) {
+        let drain = Drain::new();
         let app = Router::new()
             .route("/v1/terminal-sessions/:id/ws", get(ws_handler))
             .layer(Extension(manager))
             .layer(Extension(SyncNotifier::new()))
+            .layer(Extension(drain.clone()))
             .with_state(pool);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        addr
+        (addr, drain)
     }
 
     async fn try_connect(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid) -> Option<Client> {
@@ -3954,7 +3971,7 @@ mod live_revoke_tests {
         teams: &[Uuid],
         host: Uuid,
         mate: Uuid,
-    ) -> (TerminalManager, Uuid, std::net::SocketAddr) {
+    ) -> (TerminalManager, Uuid, std::net::SocketAddr, Drain) {
         set_user_tier(pool, host, "teams").await;
         for team in teams {
             add_member(pool, *team, host).await;
@@ -3966,8 +3983,8 @@ mod live_revoke_tests {
         grant_invitee(pool, &SyncNotifier::new(), &manager, &crate::test_support::default_knock_limiter(), session_id, host, mate, "wrapped")
             .await
             .unwrap();
-        let addr = serve(pool.clone(), manager.clone()).await;
-        (manager, session_id, addr)
+        let (addr, drain) = serve(pool.clone(), manager.clone()).await;
+        (manager, session_id, addr, drain)
     }
 
     async fn direct_session_with_joined_mate(
@@ -3976,7 +3993,7 @@ mod live_revoke_tests {
         host: Uuid,
         mate: Uuid,
     ) -> (TerminalManager, Uuid, Client, Client) {
-        let (manager, session_id, addr) = direct_session_inviting(pool, teams, host, mate).await;
+        let (manager, session_id, addr, _) = direct_session_inviting(pool, teams, host, mate).await;
         let host_ws = connect(addr, session_id, host).await;
         let mate_ws = connect(addr, session_id, mate).await;
         (manager, session_id, host_ws, mate_ws)
@@ -4033,12 +4050,47 @@ mod live_revoke_tests {
     }
 
     #[tokio::test]
+    async fn draining_ends_the_session_for_everyone_attached() {
+        let pool = test_pool_or_skip!();
+        let host = seed_user(&pool).await;
+        let mate = seed_user(&pool).await;
+        let team = seed_team(&pool, host).await;
+        let (manager, session_id, addr, drain) = direct_session_inviting(&pool, &[team], host, mate).await;
+        let mut host_ws = connect(addr, session_id, host).await;
+        let mut mate_ws = connect(addr, session_id, mate).await;
+
+        drain.begin();
+
+        for ws in [&mut host_ws, &mut mate_ws] {
+            let ended = next_of_type(ws, "session_ended").await.expect("told the session ended");
+            assert_eq!(ended["reason"], "server_restart");
+            let close = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap();
+            let Some(Ok(WsMessage::Close(Some(frame)))) = close else { panic!("expected a close frame, got {close:?}") };
+            assert_eq!(u16::from(frame.code), 1012);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while manager.sessions.lock().await.contains_key(&session_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the host's cleanup still runs");
+        let ended_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT ended_at FROM terminal_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_at.is_some(), "a drained session must not stay live in the database");
+    }
+
+    #[tokio::test]
     async fn a_banned_invitee_cannot_join_with_an_unexpired_token() {
         let pool = test_pool_or_skip!();
         let host = seed_user(&pool).await;
         let mate = seed_user(&pool).await;
         let team = seed_team(&pool, host).await;
-        let (_manager, session_id, addr) = direct_session_inviting(&pool, &[team], host, mate).await;
+        let (_manager, session_id, addr, _) = direct_session_inviting(&pool, &[team], host, mate).await;
         let _host_ws = connect(addr, session_id, host).await;
 
         lose_account(&pool, mate, BAN).await;
@@ -4144,7 +4196,7 @@ mod live_revoke_tests {
             state.visibility = "vault".to_string();
             state.vault_ids = vec![team];
         }
-        let addr = serve(pool.clone(), manager.clone()).await;
+        let (addr, _) = serve(pool.clone(), manager.clone()).await;
         let host_ws = connect(addr, session_id, host).await;
         let mate_ws = connect(addr, session_id, mate).await;
         VaultSession { manager, team, host, mate, session_id, host_ws, mate_ws }
@@ -4296,7 +4348,7 @@ mod live_revoke_tests {
         let manager = TerminalManager::new();
         manager.insert_test_session(session_id, host).await;
         manager.sessions.lock().await.get_mut(&session_id).unwrap().visibility = "invite_link".to_string();
-        let addr = serve(pool.clone(), manager.clone()).await;
+        let (addr, _) = serve(pool.clone(), manager.clone()).await;
 
         let mut host_ws = connect(addr, session_id, host).await;
         let mut guest_ws = try_connect_with(addr, session_id, guest, &format!("&invite_token={token}"))
