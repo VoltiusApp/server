@@ -1,18 +1,30 @@
 use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+use sqlx::PgPool;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{warn, Instrument};
+use tracing::{error, warn, Instrument};
 use uuid::Uuid;
+
+/// The daily sweep deletes durable hits older than this, so no durable window may exceed it.
+pub const DURABLE_WINDOW_MAX: Duration = Duration::from_secs(86_400);
 
 /// Per-key sliding window rate limiter. Key is typically IpAddr or Uuid.
 pub struct RateLimiter<K = IpAddr> {
     state: Arc<Mutex<Buckets<K>>>,
     max_requests: usize,
     window: Duration,
+    durable: Option<Durable>,
+}
+
+#[derive(Clone)]
+struct Durable {
+    pool: PgPool,
+    bucket: &'static str,
 }
 
 struct Buckets<K> {
@@ -27,11 +39,12 @@ impl<K> Clone for RateLimiter<K> {
             state: Arc::clone(&self.state),
             max_requests: self.max_requests,
             window: self.window,
+            durable: self.durable.clone(),
         }
     }
 }
 
-impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
+impl<K: Eq + Hash + Display + Send + 'static> RateLimiter<K> {
     pub fn new(max_requests: usize, window: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(Buckets {
@@ -40,10 +53,36 @@ impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
             })),
             max_requests,
             window,
+            durable: None,
         }
     }
 
+    /// Also counts hits in Postgres under `bucket`, so the budget survives restarts and is
+    /// shared by every instance. The in-memory check stays in front to absorb floods.
+    pub fn durable(mut self, pool: PgPool, bucket: &'static str) -> Self {
+        assert!(self.window <= DURABLE_WINDOW_MAX, "{bucket}: window outlives the hit sweep");
+        self.durable = Some(Durable { pool, bucket });
+        self
+    }
+
     pub async fn check(&self, key: K) -> bool {
+        let shown = self.durable.as_ref().map(|_| key.to_string());
+        if !self.check_memory(key).await {
+            return false;
+        }
+        let (Some(durable), Some(key)) = (&self.durable, shown) else {
+            return true;
+        };
+        match admit_durable(durable, &key, self.max_requests, self.window).await {
+            Ok(admitted) => admitted,
+            Err(e) => {
+                error!(error = %e, bucket = durable.bucket, "Durable rate limit check failed; using the in-memory count");
+                true
+            }
+        }
+    }
+
+    async fn check_memory(&self, key: K) -> bool {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         let window = self.window;
@@ -67,6 +106,47 @@ impl<K: Eq + Hash + Send + 'static> RateLimiter<K> {
     async fn tracked_keys(&self) -> usize {
         self.state.lock().await.by_key.len()
     }
+}
+
+async fn admit_durable(durable: &Durable, key: &str, max_requests: usize, window: Duration) -> sqlx::Result<bool> {
+    let mut tx = durable.pool.begin().await?;
+    // The two-key form has its own key space, apart from the single-key instance lock.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind(durable.bucket)
+        .bind(key)
+        .execute(&mut *tx)
+        .await?;
+    let recent: i64 = sqlx::query_scalar(
+        "WITH expired AS ( \
+             DELETE FROM rate_limit_hits \
+             WHERE bucket = $1 AND key = $2 AND at <= now() - make_interval(secs => $3) \
+         ) \
+         SELECT count(*) FROM rate_limit_hits \
+         WHERE bucket = $1 AND key = $2 AND at > now() - make_interval(secs => $3)",
+    )
+    .bind(durable.bucket)
+    .bind(key)
+    .bind(window.as_secs_f64())
+    .fetch_one(&mut *tx)
+    .await?;
+    let admitted = (recent as usize) < max_requests;
+    if admitted {
+        sqlx::query("INSERT INTO rate_limit_hits (bucket, key) VALUES ($1, $2)")
+            .bind(durable.bucket)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(admitted)
+}
+
+pub async fn sweep_durable_hits(pool: &PgPool) -> sqlx::Result<u64> {
+    sqlx::query("DELETE FROM rate_limit_hits WHERE at <= now() - make_interval(secs => $1)")
+        .bind(DURABLE_WINDOW_MAX.as_secs_f64())
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected())
 }
 
 /// A trusted proxy address or subnet. A containerised reverse proxy gets a new
@@ -427,6 +507,82 @@ mod tests {
             client_ip(Some(ip("172.22.0.5")), Some("not-an-ip"), &trusted),
             ip("172.22.0.5")
         );
+    }
+
+    fn durable(pool: &PgPool, max: usize) -> RateLimiter<Uuid> {
+        RateLimiter::<Uuid>::new(max, Duration::from_secs(3600)).durable(pool.clone(), "test")
+    }
+
+    async fn hits_for(pool: &PgPool, key: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM rate_limit_hits WHERE bucket = 'test' AND key = $1")
+            .bind(key.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn seed_hit(pool: &PgPool, key: Uuid, age: &str) {
+        sqlx::query("INSERT INTO rate_limit_hits (bucket, key, at) VALUES ('test', $1, now() - $2::interval)")
+            .bind(key.to_string())
+            .bind(age)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_durable_budget_survives_a_restart_and_is_shared_between_instances() {
+        let pool = crate::test_pool_or_skip!();
+        let key = Uuid::new_v4();
+        let before = durable(&pool, 2);
+        assert!(before.check(key).await);
+        assert!(before.check(key).await);
+
+        let after = durable(&pool, 2);
+        assert!(!after.check(key).await);
+        assert!(after.check(Uuid::new_v4()).await, "budgets are per key");
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_never_overshoot_the_durable_budget() {
+        let pool = crate::test_pool_or_skip!();
+        let key = Uuid::new_v4();
+        let checks = (0..12).map(|_| {
+            let limiter = durable(&pool, 5);
+            tokio::spawn(async move { limiter.check(key).await })
+        });
+        let admitted = futures_util::future::join_all(checks)
+            .await
+            .into_iter()
+            .filter(|admitted| *admitted.as_ref().unwrap())
+            .count();
+        assert_eq!(admitted, 5);
+        assert_eq!(hits_for(&pool, key).await, 5);
+    }
+
+    #[tokio::test]
+    async fn hits_outside_the_window_neither_count_nor_survive() {
+        let pool = crate::test_pool_or_skip!();
+        let key = Uuid::new_v4();
+        seed_hit(&pool, key, "2 hours").await;
+        assert!(durable(&pool, 1).check(key).await);
+        assert_eq!(hits_for(&pool, key).await, 1, "the expired hit is pruned on check");
+
+        let quiet = Uuid::new_v4();
+        seed_hit(&pool, quiet, "2 days").await;
+        sweep_durable_hits(&pool).await.unwrap();
+        assert_eq!(hits_for(&pool, quiet).await, 0);
+        assert_eq!(hits_for(&pool, key).await, 1, "the sweep keeps live hits");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_database_falls_back_to_the_in_memory_count() {
+        let pool = crate::test_pool_or_skip!();
+        let limiter = durable(&pool, 1);
+        pool.close().await;
+        let key = Uuid::new_v4();
+        assert!(limiter.check(key).await);
+        assert!(!limiter.check(key).await);
     }
 
     #[tokio::test]
