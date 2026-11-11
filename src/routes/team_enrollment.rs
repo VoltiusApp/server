@@ -821,6 +821,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_070_marks_tokens_rotated_before_it_as_superseded() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let mut ids = Vec::new();
+        for (created, revoked) in [("2026-01-01", Some("2026-01-02")), ("2026-02-01", Some("2026-03-01")), ("2026-03-01", None)] {
+            let (id, _) = insert_token(&pool, team, manager, "member", &[], true).await;
+            sqlx::query(
+                "UPDATE team_enrollment_tokens SET created_at = $2::timestamptz, revoked_at = $3::timestamptz, superseded_at = NULL WHERE id = $1",
+            )
+            .bind(id)
+            .bind(created)
+            .bind(revoked)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let [plain, rotated, current] = ids[..] else { unreachable!() };
+
+        for _ in 0..2 {
+            sqlx::raw_sql(include_str!("../../migrations/070_enrollment_token_superseded.sql")).execute(&pool).await.unwrap();
+        }
+
+        assert_eq!(revoked_and_superseded(&pool, plain).await, (true, false));
+        assert_eq!(revoked_and_superseded(&pool, rotated).await, (true, true));
+        assert_eq!(revoked_and_superseded(&pool, current).await, (false, false));
+        let superseded_at: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT superseded_at FROM team_enrollment_tokens WHERE id = $1")
+            .bind(rotated)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(superseded_at, Some("2026-03-01T00:00:00Z".parse().unwrap()));
+    }
+
+    #[tokio::test]
     async fn below_business_create_402_revoke_204() {
         let _billing = BillingMode::hosted();
         let pool = test_pool_or_skip!();
