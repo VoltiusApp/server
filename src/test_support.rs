@@ -447,8 +447,8 @@ pub fn test_user_email(id: Uuid) -> String {
 }
 
 /// Insert a pending invitation and return `(invitation_id, token)`. `user_id` is the
-/// in-app recipient binding (NULL for link-only invites). The token is a fresh UUID
-/// hex string so tests can look the invitation up by token.
+/// in-app recipient binding (NULL for link-only invites). The team owner sends it and
+/// is made a member holding the Owner role, since acceptance re-checks the sender.
 pub async fn seed_invitation(
     pool: &PgPool,
     team: Uuid,
@@ -456,11 +456,44 @@ pub async fn seed_invitation(
     role: &str,
     user_id: Option<Uuid>,
 ) -> (Uuid, String) {
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM teams WHERE id = $1")
+        .bind(team)
+        .fetch_one(pool)
+        .await
+        .expect("team owner");
+    sqlx::query("INSERT INTO team_members (team_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(team)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .expect("owner membership");
+    seed_builtin_roles(pool, team).await;
+    sqlx::query(
+        "INSERT INTO team_member_roles (team_id, user_id, role_id)
+         SELECT $1, $2, id FROM team_roles WHERE team_id = $1 AND is_builtin AND name = 'owner'
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(team)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("owner role");
+    seed_invitation_from(pool, team, owner, email, role, user_id).await
+}
+
+pub async fn seed_invitation_from(
+    pool: &PgPool,
+    team: Uuid,
+    inviter: Uuid,
+    email: &str,
+    role: &str,
+    user_id: Option<Uuid>,
+) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let token = Uuid::new_v4().simple().to_string();
     sqlx::query(
-        "INSERT INTO pending_invitations (id, team_id, email, role, token, user_id)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO pending_invitations (id, team_id, email, role, token, user_id, invited_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(id)
     .bind(team)
@@ -468,6 +501,7 @@ pub async fn seed_invitation(
     .bind(role)
     .bind(&token)
     .bind(user_id)
+    .bind(inviter)
     .execute(pool)
     .await
     .expect("seed invitation");

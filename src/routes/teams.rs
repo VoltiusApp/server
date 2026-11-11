@@ -447,14 +447,7 @@ pub async fn add_member(
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<AddMemberRequest>,
 ) -> Result<(StatusCode, Json<InviteMemberResponse>), StatusCode> {
-    let can_invite = crate::permissions::has_team_permission(
-        &pool, team_id, auth.0, crate::permissions::PERM_INVITE_MEMBERS,
-    )
-    .await?;
-    if !can_invite {
-        warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to invite members");
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_can_invite(&pool, team_id, auth.0).await?;
 
     let member_name = crate::routes::member_names::invite_member_name(&pool, team_id, auth.0, body.name.as_deref()).await?;
 
@@ -1589,6 +1582,36 @@ impl InvitedRoles {
     }
 }
 
+async fn require_can_invite(pool: &PgPool, team_id: Uuid, actor: Uuid) -> Result<(), StatusCode> {
+    if crate::permissions::has_team_permission(pool, team_id, actor, crate::permissions::PERM_INVITE_MEMBERS).await? {
+        return Ok(());
+    }
+    warn!(team_id = %team_id, user_id = %actor, "Insufficient permission to invite members");
+    Err(StatusCode::FORBIDDEN)
+}
+
+/// The send-time checks, run again at acceptance against whoever sent the invitation.
+/// Roles deleted since are left out, as `admit_member` skips them.
+pub(crate) async fn require_inviter_still_entitled(
+    pool: &PgPool,
+    team_id: Uuid,
+    inviter: Uuid,
+    role: &str,
+    role_ids: &[Uuid],
+) -> Result<(), StatusCode> {
+    require_can_invite(pool, team_id, inviter).await?;
+    let live = sqlx::query_scalar::<_, Uuid>("SELECT id FROM team_roles WHERE team_id = $1 AND id = ANY($2)")
+        .bind(team_id)
+        .bind(role_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to read invited roles");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    invited_roles(pool, team_id, inviter, Some(role), Some(&live)).await.map(drop)
+}
+
 async fn invited_roles(
     pool: &PgPool,
     team_id: Uuid,
@@ -1690,14 +1713,7 @@ pub async fn invite_member(
     axum::extract::Path(team_id): axum::extract::Path<Uuid>,
     Json(body): Json<InviteMemberRequest>,
 ) -> Result<Json<InviteMemberResponse>, StatusCode> {
-    let can_invite = crate::permissions::has_team_permission(
-        &pool, team_id, auth.0, crate::permissions::PERM_INVITE_MEMBERS,
-    )
-    .await?;
-    if !can_invite {
-        warn!(team_id = %team_id, user_id = %auth.0, "Insufficient permission to invite members");
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_can_invite(&pool, team_id, auth.0).await?;
 
     let member_name = crate::routes::member_names::invite_member_name(&pool, team_id, auth.0, body.name.as_deref()).await?;
 
