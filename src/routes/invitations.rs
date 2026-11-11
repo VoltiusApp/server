@@ -133,6 +133,17 @@ pub(crate) async fn accept_pending_invitation(
     user_email: Option<String>,
     via: &str,
 ) -> Result<(), StatusCode> {
+    let inviter = invitation.invited_by.ok_or(StatusCode::GONE)?;
+    crate::routes::teams::require_inviter_still_entitled(pool, invitation.team_id, inviter, &invitation.role, &invitation.role_ids)
+        .await
+        .map_err(|status| {
+            if status.is_server_error() {
+                return status;
+            }
+            warn!(invitation_id = %invitation.id, inviter = %inviter, ?status, "Invitation outlived its sender's authority");
+            StatusCode::GONE
+        })?;
+
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for invitation acceptance");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -740,5 +751,145 @@ mod admit_tests {
             .await
             .unwrap();
         assert_eq!(inviter_of(&pool, team, invitee).await, Some(owner));
+    }
+}
+
+#[cfg(test)]
+mod inviter_recheck_tests {
+    //! Acceptance re-checks that the sender may still grant what the invitation carries.
+    use super::*;
+    use crate::auth::AuthUser;
+    use crate::sync_notifier::SyncNotifier;
+    use crate::test_support::{
+        add_member, grant_builtin_role, seed_invitation_from, seed_team_with_roles, seed_user, test_user_email,
+    };
+    use axum::extract::{Path, State};
+    use axum::Extension;
+
+    struct Fixture {
+        pool: PgPool,
+        team: Uuid,
+        inviter: Uuid,
+        recipient: Uuid,
+        invitation: Uuid,
+    }
+
+    async fn invited_as(role: &str, inviter_role: &str) -> Option<Fixture> {
+        let pool = crate::test_support::test_pool().await?;
+        let primary = seed_user(&pool).await;
+        let team = seed_team_with_roles(&pool, primary).await;
+        let inviter = seed_user(&pool).await;
+        add_member(&pool, team, inviter).await;
+        grant_builtin_role(&pool, team, inviter, inviter_role).await;
+        let recipient = seed_user(&pool).await;
+        let (invitation, _) =
+            seed_invitation_from(&pool, team, inviter, &test_user_email(recipient), role, Some(recipient)).await;
+        Some(Fixture { pool, team, inviter, recipient, invitation })
+    }
+
+    async fn accept(f: &Fixture) -> Result<StatusCode, StatusCode> {
+        accept_my_pending_invitation(
+            State(f.pool.clone()),
+            Extension(AuthUser(f.recipient)),
+            Extension(SyncNotifier::new()),
+            Path(f.invitation),
+        )
+        .await
+    }
+
+    async fn holds(f: &Fixture, user: Uuid, role: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM team_member_roles tmr JOIN team_roles tr ON tr.id = tmr.role_id
+             WHERE tmr.team_id = $1 AND tmr.user_id = $2 AND tr.is_builtin AND tr.name = $3)",
+        )
+        .bind(f.team)
+        .bind(user)
+        .bind(role)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn is_member(f: &Fixture) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)")
+            .bind(f.team)
+            .bind(f.recipient)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn strip_roles(f: &Fixture) {
+        sqlx::query("DELETE FROM team_member_roles WHERE team_id = $1 AND user_id = $2")
+            .bind(f.team)
+            .bind(f.inviter)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_owner_invite_from_a_current_owner_makes_an_owner() {
+        let Some(f) = invited_as("owner", "owner").await else { return };
+        assert_eq!(accept(&f).await, Ok(StatusCode::NO_CONTENT));
+        assert!(holds(&f, f.recipient, "owner").await);
+    }
+
+    #[tokio::test]
+    async fn an_owner_invite_dies_when_its_sender_stops_being_owner() {
+        let Some(f) = invited_as("owner", "owner").await else { return };
+        strip_roles(&f).await;
+        grant_builtin_role(&f.pool, f.team, f.inviter, "manager").await;
+
+        assert_eq!(accept(&f).await, Err(StatusCode::GONE));
+        assert!(!is_member(&f).await);
+    }
+
+    #[tokio::test]
+    async fn an_invite_dies_when_its_sender_leaves_the_team() {
+        let Some(f) = invited_as("member", "manager").await else { return };
+        strip_roles(&f).await;
+        sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+            .bind(f.team)
+            .bind(f.inviter)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(accept(&f).await, Err(StatusCode::GONE));
+        assert!(!is_member(&f).await);
+    }
+
+    #[tokio::test]
+    async fn an_invite_dies_when_its_sender_deleted_their_account() {
+        let Some(f) = invited_as("member", "manager").await else { return };
+        sqlx::query("UPDATE pending_invitations SET invited_by = NULL WHERE id = $1")
+            .bind(f.invitation)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(accept(&f).await, Err(StatusCode::GONE));
+        assert!(!is_member(&f).await);
+    }
+
+    #[tokio::test]
+    async fn a_resend_by_a_current_owner_revives_it() {
+        let Some(f) = invited_as("owner", "owner").await else { return };
+        strip_roles(&f).await;
+        let primary: Uuid = sqlx::query_scalar("SELECT owner_id FROM teams WHERE id = $1")
+            .bind(f.team)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE pending_invitations SET invited_by = $2 WHERE id = $1")
+            .bind(f.invitation)
+            .bind(primary)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(accept(&f).await, Ok(StatusCode::NO_CONTENT));
+        assert!(holds(&f, f.recipient, "owner").await);
     }
 }
