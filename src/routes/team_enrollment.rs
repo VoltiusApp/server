@@ -13,7 +13,9 @@ use crate::enrollment::{
     audit_request, decide_pending, mint_secret, normalize_domains, notify_join_requests_changed, redeem_for, try_admit,
     Guard, RedeemOutcome, RedeemResponse, role_or_default,
 };
-use crate::rate_limit::{check_budget, ClientIp, EnrollmentRedeemRateLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter};
+use crate::rate_limit::{
+    check_budget, ClientIp, EnrollmentPolicyLimiter, EnrollmentRedeemRateLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter,
+};
 use crate::routes::audit::write_audit_event;
 use crate::routes::ApiError;
 use crate::routes::team_grants::{require_grant_admin, require_grantable_role, validate_public_key};
@@ -29,11 +31,13 @@ fn internal(what: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
     }
 }
 
-async fn revoke_live(conn: &mut PgConnection, team_id: Uuid) -> Result<Option<Uuid>, ApiError> {
+async fn revoke_live(conn: &mut PgConnection, team_id: Uuid, superseded: bool) -> Result<Option<Uuid>, ApiError> {
     sqlx::query_scalar::<_, Uuid>(
-        "UPDATE team_enrollment_tokens SET revoked_at = now() WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
+        "UPDATE team_enrollment_tokens SET revoked_at = now(), superseded_at = CASE WHEN $2 THEN now() END \
+         WHERE team_id = $1 AND revoked_at IS NULL RETURNING id",
     )
     .bind(team_id)
+    .bind(superseded)
     .fetch_optional(conn)
     .await
     .map_err(internal("Failed to revoke enrollment token"))
@@ -122,7 +126,7 @@ pub async fn create_token(
     let secret = mint_secret();
     let mut tx = pool.begin().await.map_err(internal("Failed to begin enrollment token transaction"))?;
     lock_billing_owner(&mut tx, team_id).await?;
-    let replaced = revoke_live(&mut tx, team_id).await?;
+    let replaced = revoke_live(&mut tx, team_id, true).await?;
     let (id, created_at) = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
         "INSERT INTO team_enrollment_tokens \
          (team_id, secret_hash, role, allowed_domains, require_approval, expires_at, created_by) \
@@ -211,7 +215,7 @@ pub async fn revoke_token(
 ) -> Result<StatusCode, ApiError> {
     require_grant_admin(&pool, team_id, auth.0).await?;
     let mut conn = pool.acquire().await.map_err(internal("Failed to acquire connection"))?;
-    let revoked = revoke_live(&mut conn, team_id).await?;
+    let revoked = revoke_live(&mut conn, team_id, false).await?;
     if let Some(id) = revoked {
         info!(team_id = %team_id, token_id = %id, "Enrollment token revoked");
         audit(&pool, team_id, auth.0, "enrollment_token.revoked", id, None).await;
@@ -239,6 +243,7 @@ pub(crate) enum EnrollError {
     NotFound,
     TokenNotFound,
     Gone,
+    Revoked,
     Unavailable,
     DomainMismatch,
     NoSeat,
@@ -264,6 +269,7 @@ impl From<EnrollError> for ApiError {
             EnrollError::NotFound => StatusCode::NOT_FOUND.into(),
             EnrollError::TokenNotFound => ApiError::coded(StatusCode::NOT_FOUND, "ENROLLMENT_NOT_FOUND"),
             EnrollError::Gone => StatusCode::GONE.into(),
+            EnrollError::Revoked => ApiError::coded(StatusCode::GONE, "ENROLLMENT_REVOKED"),
             EnrollError::Unavailable => ApiError::coded(StatusCode::PAYMENT_REQUIRED, "ENROLLMENT_UNAVAILABLE"),
             EnrollError::DomainMismatch => ApiError::coded(StatusCode::FORBIDDEN, "ENROLLMENT_DOMAIN_MISMATCH"),
             EnrollError::NoSeat => StatusCode::PAYMENT_REQUIRED.into(),
@@ -272,26 +278,40 @@ impl From<EnrollError> for ApiError {
     }
 }
 
+#[derive(Deserialize)]
+pub struct EnrollmentCredential {
+    pub id: Uuid,
+    pub secret: String,
+}
+
 #[derive(sqlx::FromRow)]
-struct LiveTokenLookup {
+struct TokenLookup {
     #[sqlx(flatten)]
     row: TokenRow,
     revoked: bool,
+    superseded: bool,
     expired: bool,
+    policy: Option<serde_json::Value>,
+    policy_revision: i64,
 }
 
-pub(crate) async fn load_live_token(pool: &PgPool, id: Uuid, secret: &str) -> Result<TokenRow, EnrollError> {
-    let found = sqlx::query_as::<_, LiveTokenLookup>(
+async fn find_token(pool: &PgPool, credential: &EnrollmentCredential) -> Result<TokenLookup, EnrollError> {
+    sqlx::query_as::<_, TokenLookup>(
         "SELECT t.id, t.team_id, tm.name AS team_name, t.allowed_domains, t.require_approval, \
-                t.revoked_at IS NOT NULL AS revoked, COALESCE(t.expires_at <= now(), false) AS expired \
+                t.revoked_at IS NOT NULL AS revoked, t.superseded_at IS NOT NULL AS superseded, \
+                COALESCE(t.expires_at <= now(), false) AS expired, tm.policy, tm.policy_revision \
          FROM team_enrollment_tokens t JOIN teams tm ON tm.id = t.team_id \
          WHERE t.id = $1 AND t.secret_hash = $2",
     )
-    .bind(id)
-    .bind(hash_secret(secret))
+    .bind(credential.id)
+    .bind(hash_secret(&credential.secret))
     .fetch_optional(pool)
     .await?
-    .ok_or(EnrollError::TokenNotFound)?;
+    .ok_or(EnrollError::TokenNotFound)
+}
+
+pub(crate) async fn load_live_token(pool: &PgPool, credential: &EnrollmentCredential) -> Result<TokenRow, EnrollError> {
+    let found = find_token(pool, credential).await?;
     if found.revoked || found.expired {
         return Err(EnrollError::Gone);
     }
@@ -301,20 +321,14 @@ pub(crate) async fn load_live_token(pool: &PgPool, id: Uuid, secret: &str) -> Re
     Ok(found.row)
 }
 
-#[derive(Deserialize)]
-pub struct ResolveRequest {
-    pub id: Uuid,
-    pub secret: String,
-}
-
 pub async fn resolve(
     State(pool): State<PgPool>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Extension(EnrollmentResolveLimiter(limiter)): Extension<EnrollmentResolveLimiter>,
-    Json(body): Json<ResolveRequest>,
+    Json(body): Json<EnrollmentCredential>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_budget(&limiter, ip, "enrollment_resolve").await?;
-    let token = load_live_token(&pool, body.id, &body.secret).await?;
+    let token = load_live_token(&pool, &body).await?;
     Ok(Json(json!({
         "team_name": token.team_name,
         "allowed_domains": token.allowed_domains,
@@ -325,9 +339,36 @@ pub async fn resolve(
 }
 
 #[derive(Deserialize)]
+pub struct PolicyRequest {
+    #[serde(flatten)]
+    pub token: EnrollmentCredential,
+    pub revision: Option<i64>,
+}
+
+pub async fn policy(
+    State(pool): State<PgPool>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+    Extension(EnrollmentPolicyLimiter(limiter)): Extension<EnrollmentPolicyLimiter>,
+    Json(body): Json<PolicyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_budget(&limiter, ip, "enrollment_policy").await?;
+    let found = find_token(&pool, &body.token).await?;
+    if found.revoked && !found.superseded {
+        return Err(EnrollError::Revoked.into());
+    }
+    let name = found.row.team_name;
+    if body.revision == Some(found.policy_revision) {
+        return Ok(Json(json!({ "unchanged": true, "name": name })));
+    }
+    Ok(Json(json!({
+        "team": { "id": found.row.team_id, "name": name, "policy": found.policy, "policy_revision": found.policy_revision },
+    })))
+}
+
+#[derive(Deserialize)]
 pub struct RedeemRequest {
-    pub id: Uuid,
-    pub secret: String,
+    #[serde(flatten)]
+    pub token: EnrollmentCredential,
     pub public_key: Option<String>,
 }
 
@@ -340,7 +381,7 @@ pub async fn redeem(
 ) -> Result<Json<RedeemResponse>, ApiError> {
     check_budget(&limiter, auth.0, "enrollment_redeem").await?;
     validate_public_key(body.public_key.as_deref())?;
-    let token = load_live_token(&pool, body.id, &body.secret).await?;
+    let token = load_live_token(&pool, &body.token).await?;
     let outcome = redeem_for(&pool, &notifier, &token, auth.0, body.public_key.as_deref()).await?;
     Ok(Json(RedeemResponse { outcome, team_id: token.team_id }))
 }
@@ -465,7 +506,7 @@ mod tests {
     use crate::features::Features;
     use crate::permissions::{PERM_CONNECT, PERM_INVITE_MEMBERS};
     use crate::enrollment::{try_admit, PendingReason};
-    use crate::rate_limit::{EnrollmentRegisterLimiter, RateLimiter, RegisterRateLimiter};
+    use crate::rate_limit::{EnrollmentPolicyLimiter, EnrollmentRegisterLimiter, RateLimiter, RegisterRateLimiter};
     use crate::sync_notifier::SyncEvent;
     use crate::test_pool_or_skip;
     use crate::test_support::{
@@ -738,6 +779,83 @@ mod tests {
         assert_eq!(fetch(&pool, team, manager).await["token"]["role"], "editor");
     }
 
+    async fn revoked_and_superseded(pool: &PgPool, id: Uuid) -> (bool, bool) {
+        sqlx::query_as("SELECT revoked_at IS NOT NULL, superseded_at IS NOT NULL FROM team_enrollment_tokens WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rotation_marks_old_token_superseded() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let first = created(&pool, team, manager, body("member", &[], true)).await;
+        let second = created(&pool, team, manager, body("member", &[], true)).await;
+        assert_eq!(revoked_and_superseded(&pool, first.id).await, (true, true));
+        assert_eq!(revoked_and_superseded(&pool, second.id).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn revoke_does_not_supersede() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let token = created(&pool, team, manager, body("member", &[], true)).await;
+        revoke(&pool, team, manager).await.unwrap();
+        assert_eq!(revoked_and_superseded(&pool, token.id).await, (true, false));
+    }
+
+    #[tokio::test]
+    async fn revoke_after_rotation_leaves_old_superseded() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let first = created(&pool, team, manager, body("member", &[], true)).await;
+        let second = created(&pool, team, manager, body("member", &[], true)).await;
+        revoke(&pool, team, manager).await.unwrap();
+        assert_eq!(revoked_and_superseded(&pool, first.id).await, (true, true));
+        assert_eq!(revoked_and_superseded(&pool, second.id).await, (true, false));
+    }
+
+    #[tokio::test]
+    async fn migration_070_marks_tokens_rotated_before_it_as_superseded() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let (team, _owner, manager) = team_with_manager(&pool).await;
+        let mut ids = Vec::new();
+        for (created, revoked) in [("2026-01-01", Some("2026-01-02")), ("2026-02-01", Some("2026-03-01")), ("2026-03-01", None)] {
+            let (id, _) = insert_token(&pool, team, manager, "member", &[], true).await;
+            sqlx::query(
+                "UPDATE team_enrollment_tokens SET created_at = $2::timestamptz, revoked_at = $3::timestamptz, superseded_at = NULL WHERE id = $1",
+            )
+            .bind(id)
+            .bind(created)
+            .bind(revoked)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let [plain, rotated, current] = ids[..] else { unreachable!() };
+
+        for _ in 0..2 {
+            sqlx::raw_sql(include_str!("../../migrations/070_enrollment_token_superseded.sql")).execute(&pool).await.unwrap();
+        }
+
+        assert_eq!(revoked_and_superseded(&pool, plain).await, (true, false));
+        assert_eq!(revoked_and_superseded(&pool, rotated).await, (true, true));
+        assert_eq!(revoked_and_superseded(&pool, current).await, (false, false));
+        let superseded_at: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT superseded_at FROM team_enrollment_tokens WHERE id = $1")
+            .bind(rotated)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(superseded_at, Some("2026-03-01T00:00:00Z".parse().unwrap()));
+    }
+
     #[tokio::test]
     async fn below_business_create_402_revoke_204() {
         let _billing = BillingMode::hosted();
@@ -852,6 +970,7 @@ mod tests {
             RegisterRateLimiter(RateLimiter::new(register_per_day, Duration::from_secs(86400))),
             EnrollmentResolveLimiter(RateLimiter::new(60, Duration::from_secs(60))),
             EnrollmentRegisterLimiter(RateLimiter::new(token_per_day, Duration::from_secs(86400))),
+            EnrollmentPolicyLimiter(RateLimiter::new(300, Duration::from_secs(60))),
         )
         .merge(
             axum::Router::new()
@@ -882,6 +1001,10 @@ mod tests {
 
         async fn resolve(&self, ip: &str, id: Uuid, secret: &str) -> (StatusCode, serde_json::Value) {
             self.post("/v1/enrollment/resolve", ip, json!({ "id": id, "secret": secret })).await
+        }
+
+        async fn policy(&self, ip: &str, id: Uuid, secret: &str, revision: Option<i64>) -> (StatusCode, serde_json::Value) {
+            self.post("/v1/enrollment/policy", ip, json!({ "id": id, "secret": secret, "revision": revision })).await
         }
 
         async fn register(&self, ip: &str, email: &str, enrollment: Option<(Uuid, &str)>) -> (StatusCode, serde_json::Value) {
@@ -1010,6 +1133,172 @@ mod tests {
         assert_eq!(app.resolve("10.0.0.3", Uuid::new_v4(), "x").await.0, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(app.post("/v1/auth/login", "10.0.0.3", json!({})).await.0, StatusCode::OK);
         assert_eq!(app.resolve("10.0.0.4", Uuid::new_v4(), "x").await.0, StatusCode::NOT_FOUND);
+    }
+
+    fn policy_doc() -> serde_json::Value {
+        json!({ "version": 1, "policy": { "security.lockAction": "vault" } })
+    }
+
+    async fn set_policy(pool: &PgPool, team: Uuid, revision: i64) {
+        sqlx::query("UPDATE teams SET policy = $1, policy_revision = $2 WHERE id = $3")
+            .bind(policy_doc())
+            .bind(revision)
+            .bind(team)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn served(pool: &PgPool, team: Uuid) -> (StatusCode, serde_json::Value) {
+        let (name, policy, revision): (String, Option<serde_json::Value>, i64) =
+            sqlx::query_as("SELECT name, policy, policy_revision FROM teams WHERE id = $1")
+                .bind(team)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (StatusCode::OK, json!({ "team": { "id": team, "name": name, "policy": policy, "policy_revision": revision } }))
+    }
+
+    fn coded(status: StatusCode, code: &str) -> (StatusCode, serde_json::Value) {
+        (status, json!({ "error": code }))
+    }
+
+    async fn token_with_policy(pool: &PgPool, team: Uuid, manager: Uuid) -> CreateTokenResponse {
+        let token = created(pool, team, manager, body("member", &[], true)).await;
+        set_policy(pool, team, 3).await;
+        token
+    }
+
+    async fn policy_team(pool: &PgPool) -> (Uuid, Uuid, CreateTokenResponse) {
+        let (team, _owner, manager) = team_with_manager(pool).await;
+        (team, manager, token_with_policy(pool, team, manager).await)
+    }
+
+    #[tokio::test]
+    async fn policy_live_token_returns_doc() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _manager, token) = policy_team(&pool).await;
+        let name: String = sqlx::query_scalar("SELECT name FROM teams WHERE id = $1").bind(team).fetch_one(&pool).await.unwrap();
+
+        let (status, value) = app.policy("10.0.3.1", token.id, &token.secret, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, json!({ "team": { "id": team, "name": name, "policy": policy_doc(), "policy_revision": 3 } }));
+        let omitted = app.post("/v1/enrollment/policy", "10.0.3.1", json!({ "id": token.id, "secret": token.secret })).await;
+        assert_eq!(omitted, (status, value));
+    }
+
+    #[tokio::test]
+    async fn policy_expired_token_still_reads() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _manager, token) = policy_team(&pool).await;
+        sqlx::query("UPDATE team_enrollment_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1")
+            .bind(token.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(app.policy("10.0.3.2", token.id, &token.secret, None).await, served(&pool, team).await);
+    }
+
+    #[tokio::test]
+    async fn policy_superseded_token_still_reads() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, manager, old) = policy_team(&pool).await;
+        let new = created(&pool, team, manager, body("member", &[], true)).await;
+        assert_eq!(app.policy("10.0.3.3", old.id, &old.secret, None).await, served(&pool, team).await);
+        assert_eq!(app.policy("10.0.3.3", new.id, &new.secret, None).await, served(&pool, team).await);
+    }
+
+    #[tokio::test]
+    async fn policy_revoked_token_is_410_revoked() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, manager, old) = policy_team(&pool).await;
+        let live = created(&pool, team, manager, body("member", &[], true)).await;
+        revoke(&pool, team, manager).await.unwrap();
+
+        assert_eq!(app.policy("10.0.3.4", live.id, &live.secret, None).await, coded(StatusCode::GONE, "ENROLLMENT_REVOKED"));
+        assert_eq!(app.policy("10.0.3.4", old.id, &old.secret, None).await, served(&pool, team).await);
+    }
+
+    #[tokio::test]
+    async fn policy_wrong_secret_404() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (_team, _manager, token) = policy_team(&pool).await;
+        let expected = coded(StatusCode::NOT_FOUND, "ENROLLMENT_NOT_FOUND");
+        assert_eq!(app.policy("10.0.3.5", token.id, "wrong-secret", None).await, expected);
+        assert_eq!(app.policy("10.0.3.5", Uuid::new_v4(), &token.secret, None).await, expected);
+    }
+
+    #[tokio::test]
+    async fn policy_deleted_team_404() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _manager, token) = policy_team(&pool).await;
+        sqlx::query("DELETE FROM teams WHERE id = $1").bind(team).execute(&pool).await.unwrap();
+        assert_eq!(
+            app.policy("10.0.3.6", token.id, &token.secret, None).await,
+            coded(StatusCode::NOT_FOUND, "ENROLLMENT_NOT_FOUND")
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_lapsed_team_still_served() {
+        let _billing = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, owner, manager) = business_team(&pool).await;
+        let token = token_with_policy(&pool, team, manager).await;
+        set_user_tier(&pool, owner, "free").await;
+        assert_eq!(app.resolve("10.0.3.7", token.id, &token.secret).await.0, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(app.policy("10.0.3.7", token.id, &token.secret, None).await, served(&pool, team).await);
+    }
+
+    #[tokio::test]
+    async fn policy_unchanged_returns_name_only() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        let (team, _manager, token) = policy_team(&pool).await;
+        sqlx::query("UPDATE teams SET name = 'Renamed' WHERE id = $1").bind(team).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            app.policy("10.0.3.8", token.id, &token.secret, Some(3)).await,
+            (StatusCode::OK, json!({ "unchanged": true, "name": "Renamed" }))
+        );
+        assert_eq!(app.policy("10.0.3.8", token.id, &token.secret, Some(2)).await, served(&pool, team).await);
+    }
+
+    #[tokio::test]
+    async fn policy_served_with_invites_off() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { team_invites: false, ..Features::open() }, 5);
+        let (team, _manager, token) = policy_team(&pool).await;
+        assert_eq!(app.resolve("10.0.3.9", token.id, &token.secret).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(app.policy("10.0.3.9", token.id, &token.secret, None).await, served(&pool, team).await);
+    }
+
+    #[tokio::test]
+    async fn policy_rate_limited_429() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        for _ in 0..300 {
+            assert_eq!(app.policy("10.0.3.10", Uuid::new_v4(), "x", None).await.0, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(app.policy("10.0.3.10", Uuid::new_v4(), "x", None).await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(app.resolve("10.0.3.10", Uuid::new_v4(), "x").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(app.policy("10.0.3.11", Uuid::new_v4(), "x", None).await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1229,7 +1518,10 @@ mod tests {
             Extension(AuthUser(user)),
             Extension(notifier.clone()),
             Extension(redeem_budget()),
-            Json(RedeemRequest { id, secret: secret.to_string(), public_key: public_key.map(str::to_string) }),
+            Json(RedeemRequest {
+                token: EnrollmentCredential { id, secret: secret.to_string() },
+                public_key: public_key.map(str::to_string),
+            }),
         )
         .await?;
         Ok(serde_json::to_value(outcome).unwrap())

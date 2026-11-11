@@ -36,7 +36,7 @@ use axum::{
 };
 use dashmap::{DashMap, DashSet};
 use rate_limit::{
-    EnrollmentRedeemRateLimiter, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
+    EnrollmentPolicyLimiter, EnrollmentRedeemRateLimiter, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, GrantMintRateLimiter, GrantRedeemRateLimiter, InviteRateLimiter, KnockRateLimiter, RateLimiter,
     RedeemRateLimiter, RegisterRateLimiter, ResendVerificationRateLimiter, SearchRateLimiter, SessionCodeRateLimiter,
     SyncRateLimiter, WaitlistRateLimiter,
 };
@@ -65,6 +65,7 @@ fn signup_routes(
     register_limiter: RegisterRateLimiter,
     resolve_limiter: EnrollmentResolveLimiter,
     token_limiter: EnrollmentRegisterLimiter,
+    policy_limiter: EnrollmentPolicyLimiter,
 ) -> Router<sqlx::PgPool> {
     Router::new()
         .route("/v1/auth/register", post(routes::auth::register))
@@ -72,11 +73,13 @@ fn signup_routes(
             "/v1/enrollment/resolve",
             post(routes::team_enrollment::resolve).layer(middleware::from_fn(features::require_team_invites)),
         )
+        .route("/v1/enrollment/policy", post(routes::team_enrollment::policy))
         .layer(Extension(notifier))
         .layer(Extension(auth_limiter))
         .layer(Extension(register_limiter))
         .layer(Extension(resolve_limiter))
         .layer(Extension(token_limiter))
+        .layer(Extension(policy_limiter))
         .layer(middleware::from_fn(rate_limit::attach_client_ip))
 }
 
@@ -275,6 +278,8 @@ async fn main() {
         EnrollmentResolveLimiter(RateLimiter::<std::net::IpAddr>::new(60, Duration::from_secs(60)));
     let enrollment_register_limiter =
         EnrollmentRegisterLimiter(RateLimiter::<uuid::Uuid>::new(500, Duration::from_secs(86400)));
+    let enrollment_policy_limiter =
+        EnrollmentPolicyLimiter(RateLimiter::<std::net::IpAddr>::new(300, Duration::from_secs(60)));
     let invite_limiter = InviteRateLimiter(RateLimiter::<uuid::Uuid>::new(
         invite_per_hour,
         Duration::from_secs(3600),
@@ -341,6 +346,7 @@ async fn main() {
         register_limiter,
         enrollment_resolve_limiter,
         enrollment_register_limiter,
+        enrollment_policy_limiter,
     );
 
     // Public auth + public invitation lookup — rate limited at 10/min per IP

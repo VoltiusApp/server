@@ -23,7 +23,7 @@ use crate::rate_limit::{
     check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
     ResendVerificationRateLimiter,
 };
-use crate::routes::team_enrollment::load_live_token;
+use crate::routes::team_enrollment::{load_live_token, EnrollmentCredential};
 use crate::routes::ApiError;
 use crate::email::{send_password_changed_email, send_verification_email};
 use crate::routes::email_undeliverable_response;
@@ -266,12 +266,6 @@ pub struct RegisterRequest {
     pub enrollment: Option<EnrollmentCredential>,
 }
 
-#[derive(Deserialize)]
-pub struct EnrollmentCredential {
-    pub id: Uuid,
-    pub secret: String,
-}
-
 #[derive(Serialize)]
 pub struct RegisterResponse {
     #[serde(flatten)]
@@ -384,7 +378,7 @@ pub async fn register(
     };
     let credential = body.enrollment.as_ref().filter(|_| features.team_invites);
     let token = match credential {
-        Some(credential) => match load_live_token(&pool, credential.id, &credential.secret).await {
+        Some(credential) => match load_live_token(&pool, credential).await {
             Ok(token) => {
                 check_budget(&token_limiter, token.id, "enrollment_register").await?;
                 Some(token)

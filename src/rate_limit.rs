@@ -234,6 +234,9 @@ pub async fn attach_client_ip(mut req: Request, next: Next) -> Response {
 #[derive(Clone)]
 pub struct EnrollmentResolveLimiter(pub RateLimiter<IpAddr>);
 
+#[derive(Clone)]
+pub struct EnrollmentPolicyLimiter(pub RateLimiter<IpAddr>);
+
 /// Sign-ups through one enrolment token, so a fleet rollout behind one NAT is not capped per IP.
 #[derive(Clone)]
 pub struct EnrollmentRegisterLimiter(pub RateLimiter<Uuid>);
