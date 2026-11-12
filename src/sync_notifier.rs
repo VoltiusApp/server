@@ -158,7 +158,15 @@ pub async fn notify_team_vault_changed(pool: &PgPool, notifier: &SyncNotifier, t
     notify_team(pool, notifier, team_id, team_vault_notification_payload(team_id)).await;
 }
 
+/// Bumps `teams.data_version` first, so a client that missed this event still sees the change in its team list.
 pub async fn notify_team(pool: &PgPool, notifier: &SyncNotifier, team_id: Uuid, payload: String) {
+    if let Err(e) = sqlx::query("UPDATE teams SET data_version = data_version + 1 WHERE id = $1")
+        .bind(team_id)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to bump team data_version");
+    }
     notify_team_members(pool, &[team_id], None, |member_id| {
         notifier.notify(member_id, payload.clone());
     })
@@ -207,5 +215,25 @@ mod tests {
         let mut expected = vec![host, member];
         expected.sort();
         assert_eq!(everyone, expected, "no exception reaches every member once");
+    }
+
+    #[tokio::test]
+    async fn every_team_event_advances_the_listed_data_version_of_that_team_only() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let team = seed_team(&pool, user).await;
+        let other = seed_team(&pool, user).await;
+        add_member(&pool, team, user).await;
+        add_member(&pool, other, user).await;
+        let listed = |t| crate::test_support::listed_team(&pool, t, user);
+        let before = listed(team).await.data_version;
+        let other_before = listed(other).await.data_version;
+
+        let notifier = SyncNotifier::new();
+        notify_team_vault_changed(&pool, &notifier, team).await;
+        crate::routes::teams::notify_team_members_changed(&pool, &notifier, team).await;
+
+        assert_eq!(listed(team).await.data_version, before + 2);
+        assert_eq!(listed(other).await.data_version, other_before);
     }
 }
