@@ -300,7 +300,7 @@ async fn main() {
         Duration::from_secs(3600),
     ));
     let audit_client_limiter =
-        AuditClientRateLimiter(RateLimiter::<uuid::Uuid>::new(100, Duration::from_secs(60)));
+        AuditClientRateLimiter(RateLimiter::<String>::new(100, Duration::from_secs(60)));
     let search_limiter =
         SearchRateLimiter(RateLimiter::<uuid::Uuid>::new(search_rate, Duration::from_secs(60)));
     let knock_limiter = KnockRateLimiter(hourly(knock_per_hour, "knock"));
