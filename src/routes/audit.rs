@@ -19,8 +19,9 @@ use crate::rate_limit::RateLimiter;
 
 // ─── Rate limiter newtype ─────────────────────────────────────────────────────
 
+// Keyed per member: one device replaying its backlog must not spend teammates' budget.
 #[derive(Clone)]
-pub struct AuditClientRateLimiter(pub RateLimiter<Uuid>);
+pub struct AuditClientRateLimiter(pub RateLimiter<String>);
 
 // ─── Write helper (called from other route modules) ───────────────────────────
 
@@ -402,6 +403,7 @@ pub struct ClientEventRequest {
     pub target_name: Option<String>,
     pub metadata: Option<Value>,
     pub occurred_at: String,
+    pub event_id: Option<Uuid>,
 }
 
 pub async fn report_client_event(
@@ -416,7 +418,7 @@ pub async fn report_client_event(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    if !limiter.0.check(team_id).await {
+    if !limiter.0.check(format!("{team_id}:{}", auth.0)).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -442,8 +444,10 @@ pub async fn report_client_event(
     sqlx::query(
         r#"INSERT INTO audit_logs
            (team_id, vault_id, actor_id, action, source, target_type, target_id, target_name,
-            metadata, ip_address, created_at)
-           VALUES ($1, $2, $3, $4, 'client', $5, $6, $7, $8, $9::inet, $10)"#,
+            metadata, ip_address, created_at, client_event_id)
+           VALUES ($1, $2, $3, $4, 'client', $5, $6, $7, $8, $9::inet, $10, $11)
+           ON CONFLICT (team_id, actor_id, client_event_id) WHERE client_event_id IS NOT NULL
+           DO NOTHING"#,
     )
     .bind(team_id)
     .bind(body.vault_id)
@@ -455,6 +459,7 @@ pub async fn report_client_event(
     .bind(&body.metadata)
     .bind(&ip_str)
     .bind(occurred_at)
+    .bind(body.event_id)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -659,19 +664,109 @@ mod authz_tests {
             target_name: None,
             metadata: None,
             occurred_at: Utc::now().to_rfc3339(),
+            event_id: None,
         }
     }
 
     async fn report_event_as(pool: &PgPool, team: Uuid, user: Uuid, target_id: Option<&str>) -> Result<StatusCode, StatusCode> {
+        submit_event(pool, team, user, client_event(target_id)).await
+    }
+
+    async fn submit_event(pool: &PgPool, team: Uuid, user: Uuid, event: ClientEventRequest) -> Result<StatusCode, StatusCode> {
+        submit_with(pool, no_rate_limit(), team, user, event).await
+    }
+
+    async fn submit_with(
+        pool: &PgPool,
+        limiter: AuditClientRateLimiter,
+        team: Uuid,
+        user: Uuid,
+        event: ClientEventRequest,
+    ) -> Result<StatusCode, StatusCode> {
         report_client_event(
             State(pool.clone()),
             Extension(AuthUser(user)),
-            Extension(no_rate_limit()),
+            Extension(limiter),
             ConnectInfo("127.0.0.1:0".parse().unwrap()),
             Path(team),
-            Json(client_event(target_id)),
+            Json(event),
         )
         .await
+    }
+
+    async fn client_rows(pool: &PgPool, team: Uuid, event_id: Option<Uuid>) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_logs WHERE team_id = $1 AND source = 'client' \
+             AND ($2::uuid IS NULL OR client_event_id = $2)",
+        )
+        .bind(team)
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn team_with_reporter(pool: &PgPool) -> (Uuid, Uuid) {
+        let owner = seed_user(pool).await;
+        let team = seed_team(pool, owner).await;
+        (team, member_with_role(pool, team, PERM_CONNECT).await)
+    }
+
+    #[tokio::test]
+    async fn a_retried_event_is_acknowledged_and_stored_once() {
+        let pool = test_pool_or_skip!();
+        let (team, reporter) = team_with_reporter(&pool).await;
+        let event_id = Uuid::new_v4();
+        let occurred_at = "2026-01-02T03:04:05Z";
+        let event = || ClientEventRequest { event_id: Some(event_id), occurred_at: occurred_at.into(), ..client_event(None) };
+
+        assert_eq!(submit_event(&pool, team, reporter, event()).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(submit_event(&pool, team, reporter, event()).await, Ok(StatusCode::NO_CONTENT));
+
+        assert_eq!(client_rows(&pool, team, Some(event_id)).await, 1);
+        let stored: DateTime<Utc> = sqlx::query_scalar("SELECT created_at FROM audit_logs WHERE client_event_id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored.to_rfc3339(), "2026-01-02T03:04:05+00:00");
+    }
+
+    #[tokio::test]
+    async fn the_same_event_id_from_another_member_is_its_own_row() {
+        let pool = test_pool_or_skip!();
+        let (team, reporter) = team_with_reporter(&pool).await;
+        let other = member_with_role(&pool, team, PERM_CONNECT).await;
+        let event_id = Uuid::new_v4();
+        let event = || ClientEventRequest { event_id: Some(event_id), ..client_event(None) };
+
+        assert_eq!(submit_event(&pool, team, reporter, event()).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(submit_event(&pool, team, other, event()).await, Ok(StatusCode::NO_CONTENT));
+
+        assert_eq!(client_rows(&pool, team, Some(event_id)).await, 2);
+    }
+
+    #[tokio::test]
+    async fn one_member_spending_the_budget_leaves_a_teammate_theirs() {
+        let pool = test_pool_or_skip!();
+        let (team, reporter) = team_with_reporter(&pool).await;
+        let other = member_with_role(&pool, team, PERM_CONNECT).await;
+        let limiter = AuditClientRateLimiter(RateLimiter::new(1, std::time::Duration::from_secs(60)));
+
+        assert_eq!(submit_with(&pool, limiter.clone(), team, reporter, client_event(None)).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(submit_with(&pool, limiter.clone(), team, reporter, client_event(None)).await, Err(StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(submit_with(&pool, limiter, team, other, client_event(None)).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn events_without_an_id_are_never_deduplicated() {
+        let pool = test_pool_or_skip!();
+        let (team, reporter) = team_with_reporter(&pool).await;
+
+        assert_eq!(report_event_as(&pool, team, reporter, None).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(report_event_as(&pool, team, reporter, None).await, Ok(StatusCode::NO_CONTENT));
+
+        assert_eq!(client_rows(&pool, team, None).await, 2);
     }
 
     #[tokio::test]
