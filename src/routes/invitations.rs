@@ -114,7 +114,7 @@ pub(crate) async fn admit_member(
 #[derive(sqlx::FromRow)]
 pub(crate) struct PendingInvitation {
     id: Uuid,
-    team_id: Uuid,
+    pub(crate) team_id: Uuid,
     email: String,
     role: String,
     role_ids: Vec<Uuid>,

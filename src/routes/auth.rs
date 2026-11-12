@@ -272,6 +272,20 @@ pub struct RegisterResponse {
     session: AuthResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     enrollment: Option<RedeemResponse>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    withdrawn_invitations: Vec<WithdrawnInvitation>,
+}
+
+/// An invitation waiting for this address that could not be honoured because its sender may no longer grant it.
+#[derive(Serialize)]
+pub struct WithdrawnInvitation {
+    pub team_name: String,
+}
+
+struct Registered {
+    status: StatusCode,
+    session: AuthResponse,
+    withdrawn_invitations: Vec<WithdrawnInvitation>,
 }
 
 #[derive(Serialize)]
@@ -400,7 +414,7 @@ pub async fn register(
         }
     }
     let public_key = body.public_key.clone();
-    let (status, Json(session)) =
+    let Registered { status, session, withdrawn_invitations } =
         register_with(pool.clone(), &notifier, features, crate::email::delivery_configured(), body).await?;
     let enrollment = match &token {
         Some(token) => redeem_for(&pool, &notifier, token, session.user_id, public_key.as_deref())
@@ -410,7 +424,7 @@ pub async fn register(
             .ok(),
         None => None,
     };
-    Ok((status, Json(RegisterResponse { session, enrollment })))
+    Ok((status, Json(RegisterResponse { session, enrollment, withdrawn_invitations })))
 }
 
 async fn register_with(
@@ -419,7 +433,7 @@ async fn register_with(
     features: crate::features::Features,
     delivery_configured: bool,
     body: RegisterRequest,
-) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+) -> Result<Registered, StatusCode> {
     let email = crate::email::normalize(&body.email);
 
     let auth_hash = hash_auth_key(&body.auth_key).map_err(|err| {
@@ -530,11 +544,12 @@ async fn register_with(
     .await
     .unwrap_or_default();
 
+    let mut withdrawn_invitations = Vec::new();
     for invitation in &pending {
-        if let Err(status) =
-            accept_pending_invitation(&pool, notifier, invitation, user_id, Some(email.clone()), "registration").await
-        {
-            error!(user_id = %user_id, ?status, "Failed to auto-accept invitation on registration");
+        match accept_pending_invitation(&pool, notifier, invitation, user_id, Some(email.clone()), "registration").await {
+            Ok(()) => {}
+            Err(StatusCode::GONE) => withdrawn_invitations.push(WithdrawnInvitation { team_name: team_name(&pool, invitation.team_id).await }),
+            Err(status) => error!(user_id = %user_id, ?status, "Failed to auto-accept invitation on registration"),
         }
     }
 
@@ -550,7 +565,17 @@ async fn register_with(
         info!(user_id = %user_id, "User registered with 14-day trial");
     }
 
-    Ok((StatusCode::CREATED, Json(session)))
+    Ok(Registered { status: StatusCode::CREATED, session, withdrawn_invitations })
+}
+
+async fn team_name(pool: &PgPool, team_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT name FROM teams WHERE id = $1")
+        .bind(team_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 // ─── Login ───────────────────────────────────────────────────────────────────
@@ -1166,7 +1191,9 @@ mod handler_tests {
         Extension(notifier): Extension<SyncNotifier>,
         Json(body): Json<RegisterRequest>,
     ) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
-        register_with(pool, &notifier, features, crate::email::delivery_configured(), body).await
+        register_with(pool, &notifier, features, crate::email::delivery_configured(), body)
+            .await
+            .map(|r| (r.status, Json(r.session)))
     }
 
     fn register_req(email: &str, account_id: Uuid, fp: Option<&str>) -> RegisterRequest {
@@ -1359,6 +1386,34 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn register_names_the_teams_whose_invitation_outlived_its_sender() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        let (invitation, _) = crate::test_support::seed_invitation(&pool, team, &email, "member", None).await;
+        sqlx::query("UPDATE pending_invitations SET invited_by = NULL WHERE id = $1")
+            .bind(invitation)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let registered = register_with(pool.clone(), &SyncNotifier::new(), Features::open(), true, register_req(&email, Uuid::new_v4(), None))
+            .await
+            .expect("register ok");
+
+        assert_eq!(registered.withdrawn_invitations.iter().map(|w| w.team_name.as_str()).collect::<Vec<_>>(), vec!["test-team"]);
+        let member: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)")
+            .bind(team)
+            .bind(registered.session.user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!member);
+    }
+
+    #[tokio::test]
     async fn register_with_pending_invitation_issues_seat_token() {
         let _env = EnvGuard::new(false);
         let pool = test_pool_or_skip!();
@@ -1369,7 +1424,7 @@ mod handler_tests {
         let email = format!("{}@ex.test", Uuid::new_v4());
         crate::test_support::seed_invitation(&pool, team, &email, "member", None).await;
 
-        let (_, Json(resp)) = register_with(
+        let Registered { session: resp, .. } = register_with(
             pool.clone(),
             &SyncNotifier::new(),
             Features::open(),
@@ -2006,7 +2061,7 @@ mod handler_tests {
     }
 
     async fn registered_unverified(pool: &PgPool, switch: bool, email: &str) -> (Uuid, String) {
-        let (_, Json(resp)) = register_with(pool.clone(), &SyncNotifier::new(), features(switch).0, true, register_req(email, Uuid::new_v4(), None))
+        let Registered { session: resp, .. } = register_with(pool.clone(), &SyncNotifier::new(), features(switch).0, true, register_req(email, Uuid::new_v4(), None))
             .await
             .unwrap();
         let token = sqlx::query_scalar("SELECT token FROM email_verification_tokens WHERE user_id = $1")
@@ -2080,7 +2135,7 @@ mod handler_tests {
         let _env = EnvGuard::new(true);
         let pool = test_pool_or_skip!();
         let email = format!("{}@corp.test", unique_handle("av"));
-        let (_, Json(resp)) = register_with(pool.clone(), &SyncNotifier::new(), features(false).0, false, register_req(&email, Uuid::new_v4(), None))
+        let Registered { session: resp, .. } = register_with(pool.clone(), &SyncNotifier::new(), features(false).0, false, register_req(&email, Uuid::new_v4(), None))
             .await
             .unwrap();
         let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
