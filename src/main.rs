@@ -145,6 +145,25 @@ async fn main() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    let email_transport = email::Transport::validated_from_env()
+        .unwrap_or_else(|e| panic!("Invalid email configuration: {e}"));
+    tracing::info!(transport = %email_transport, "Email delivery");
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("send-test-email") {
+        let Some(to) = args.next() else {
+            eprintln!("usage: voltius-server send-test-email <address>");
+            std::process::exit(2);
+        };
+        match email::send_test_email(&email_transport, &to).await {
+            Ok(()) => println!("Accepted for delivery to {to} by: {email_transport}"),
+            Err(e) => {
+                eprintln!("Sending to {to} failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Before anything serves or writes: a second instance on this database is
     // silently wrong today, so it must not start.
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");

@@ -38,6 +38,7 @@ data-encoding = "2"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 url = "2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots"] }
 dashmap = "6"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
