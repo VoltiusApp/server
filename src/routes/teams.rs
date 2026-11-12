@@ -195,6 +195,7 @@ pub struct TeamWithRole {
     pub lock_policy: Option<crate::team_policy::LockPolicy>,
     pub policy: Option<serde_json::Value>,
     pub policy_revision: i64,
+    pub data_version: i64,
     pub joined_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -217,30 +218,32 @@ async fn teams_for_user(
     user_id: Uuid,
     only: Option<Uuid>,
 ) -> Result<Vec<TeamWithRole>, sqlx::Error> {
-    // Returns one row per (team, role) — aggregated in Rust
-    type Row = (
-        Uuid,
-        String,
-        Uuid,
-        chrono::DateTime<chrono::Utc>,
-        Option<Uuid>,
-        i64,
-        i64,
-        Option<i32>,
-        bool,
-        Option<serde_json::Value>,
-        i64,
-        chrono::DateTime<chrono::Utc>,
-        String,
-        Option<chrono::DateTime<chrono::Utc>>,
-        bool,
-        Option<String>,
-    );
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Uuid,
+        name: String,
+        owner_id: Uuid,
+        created_at: chrono::DateTime<chrono::Utc>,
+        role_id: Option<Uuid>,
+        permission_allow: i64,
+        permission_deny: i64,
+        lock_max_minutes: Option<i32>,
+        lock_force_vault: bool,
+        policy: Option<serde_json::Value>,
+        policy_revision: i64,
+        data_version: i64,
+        joined_at: chrono::DateTime<chrono::Utc>,
+        subscription_tier: String,
+        trial_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+        admin_override: bool,
+        ls_subscription_id: Option<String>,
+    }
+    // One row per (team, role), aggregated below.
     let rows = sqlx::query_as::<_, Row>(&format!(
         r#"
         SELECT t.id, t.name, t.owner_id, t.created_at, tmr.role_id,
-               COALESCE(o.allow_mask, 0), COALESCE(o.deny_mask, 0),
-               t.lock_max_minutes, t.lock_force_vault, t.policy, t.policy_revision, tm.joined_at,
+               COALESCE(o.allow_mask, 0) AS permission_allow, COALESCE(o.deny_mask, 0) AS permission_deny,
+               t.lock_max_minutes, t.lock_force_vault, t.policy, t.policy_revision, t.data_version, tm.joined_at,
                {}
         FROM teams t
         JOIN team_members tm ON tm.team_id = t.id AND tm.user_id = $1
@@ -258,50 +261,37 @@ async fn teams_for_user(
     .await?;
 
     let mut teams: Vec<TeamWithRole> = Vec::new();
-    for (
-        id,
-        name,
-        owner_id,
-        created_at,
-        role_id,
-        permission_allow,
-        permission_deny,
-        lock_max_minutes,
-        lock_force_vault,
-        policy,
-        policy_revision,
-        joined_at,
-        tier,
-        trial_ends_at,
-        admin_override,
-        ls_sub,
-    ) in rows
-    {
+    for row in rows {
         match teams.last_mut() {
-            Some(last) if last.id == id => {
-                if let Some(rid) = role_id {
+            Some(last) if last.id == row.id => {
+                if let Some(rid) = row.role_id {
                     last.role_ids.push(rid);
                 }
             }
             _ => {
-                let owner_tier =
-                    crate::team_plan::plan_from_row(&(tier, trial_ends_at, admin_override, ls_sub));
+                let owner_tier = crate::team_plan::plan_from_row(&(
+                    row.subscription_tier,
+                    row.trial_ends_at,
+                    row.admin_override,
+                    row.ls_subscription_id,
+                ));
                 teams.push(TeamWithRole {
-                    id,
-                    name,
-                    owner_id,
+                    id: row.id,
+                    name: row.name,
+                    owner_id: row.owner_id,
                     owner_tier,
-                    created_at,
-                    role_ids: role_id.into_iter().collect(),
-                    permission_allow,
-                    permission_deny,
-                    lock_policy: match &policy {
+                    created_at: row.created_at,
+                    role_ids: row.role_id.into_iter().collect(),
+                    permission_allow: row.permission_allow,
+                    permission_deny: row.permission_deny,
+                    lock_policy: match &row.policy {
                         Some(doc) => crate::team_policy::lock_policy_of(Some(doc)),
-                        None => crate::team_policy::LockPolicy::from_columns(lock_max_minutes, lock_force_vault),
+                        None => crate::team_policy::LockPolicy::from_columns(row.lock_max_minutes, row.lock_force_vault),
                     },
-                    policy,
-                    policy_revision,
-                    joined_at,
+                    policy: row.policy,
+                    policy_revision: row.policy_revision,
+                    data_version: row.data_version,
+                    joined_at: row.joined_at,
                 });
             }
         }
