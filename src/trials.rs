@@ -115,7 +115,7 @@ pub async fn activate_trial(
         return Err(unavailable());
     };
 
-    let source = body.source.as_deref().unwrap_or("unknown");
+    let source: String = body.source.as_deref().unwrap_or("unknown").chars().take(64).collect();
     if let Err(e) = sqlx::query(
         "INSERT INTO promo_events (user_id, promo, event, source) VALUES ($1, $2, 'activated', $3)",
     )
@@ -296,6 +296,12 @@ mod tests {
         .unwrap();
         assert_eq!((tier.as_str(), seats, pro, teams), ("teams", Some(10), false, false));
         assert_eq!(crate::routes::teams::owner_seat_cap(&pool, u).await, Ok(Some(10)));
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM promo_events WHERE user_id = $1 AND promo = 'teams_promo' AND event = 'activated'")
+            .bind(u)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]
