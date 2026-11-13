@@ -833,6 +833,13 @@ async fn main() {
         .layer(Extension(drain.clone()))
         .layer(Extension(min_client_version));
 
+    // Card-free trial activation: hosted-only, so the self-host guard stays off the other protected routes.
+    let trial_routes = Router::new()
+        .route("/v1/billing/trial", post(trials::activate_trial))
+        .route_layer(middleware::from_fn(self_host::block_when_self_hosted))
+        .layer(middleware::from_fn_with_state(pool.clone(), auth::auth_middleware))
+        .layer(Extension(notifier.clone()));
+
     // Admin routes — auth + admin check, no rate limit (internal tool)
     let admin_routes = Router::new()
         .route("/v1/admin/overview", get(routes::admin::get_overview))
@@ -914,6 +921,7 @@ async fn main() {
         .merge(teams_gated)
         .merge(audit_client)
         .merge(protected)
+        .merge(trial_routes)
         .merge(admin_routes)
         .merge(ws_routes)
         .merge(metrics_route)
