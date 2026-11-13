@@ -137,6 +137,164 @@ pub async fn activate_trial(
     Ok(Json(ActivateTrialResponse { plan: plan.to_string(), trial_ends_at: ends.timestamp() }))
 }
 
+#[derive(Serialize)]
+pub struct SeenPromo {
+    pub promo: String,
+    pub source: String,
+    pub occurrence: Option<i64>,
+    pub at: i64,
+}
+
+#[derive(Serialize)]
+pub struct PlanEnded {
+    pub kind: String,
+    pub at: i64,
+}
+
+#[derive(Serialize)]
+pub struct TeamEnded {
+    pub team_id: uuid::Uuid,
+    pub team_name: String,
+    pub at: i64,
+}
+
+#[derive(Serialize)]
+pub struct PaymentIssue {
+    pub status: String,
+    pub renews_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct PromoState {
+    pub pro_trial_available: bool,
+    pub teams_trial_available: bool,
+    pub email_verified: bool,
+    pub seen: Vec<SeenPromo>,
+    pub plan_ended: Option<PlanEnded>,
+    pub team_ended: Option<TeamEnded>,
+    pub payment_issue: Option<PaymentIssue>,
+}
+
+#[derive(Deserialize)]
+pub struct PromoEventRequest {
+    pub promo: String,
+    pub event: String,
+    #[serde(default = "default_source")]
+    pub source: String,
+    #[serde(default)]
+    pub occurrence: Option<i64>,
+}
+
+fn default_source() -> String {
+    "launch".to_string()
+}
+
+type OwnerPlanRow = (uuid::Uuid, String, String, Option<DateTime<Utc>>, bool, Option<String>, DateTime<Utc>);
+type SeenRow = (String, String, Option<DateTime<Utc>>, DateTime<Utc>);
+
+type PromoUserRow = (bool, bool, bool, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>);
+
+/// Everything the client needs to decide which promo to show.
+pub async fn get_promos(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+) -> Result<Json<PromoState>, Response> {
+    let internal = |e: sqlx::Error| {
+        error!("promo state failed: {e}");
+        coded_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+    };
+
+    let (pro, teams, verified, ended_at, ended_kind, ls_status, renews): PromoUserRow = sqlx::query_as(
+        "SELECT pro_trial_available, teams_trial_available, email_verified, last_plan_ended_at, last_plan_ended_kind, \
+         ls_subscription_status, subscription_renews_at FROM users WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(auth.0)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal)?;
+
+    let seen_rows: Vec<SeenRow> = sqlx::query_as(
+        "SELECT promo, source, occurrence, created_at FROM promo_events WHERE user_id = $1 AND event = 'shown' ORDER BY created_at",
+    )
+    .bind(auth.0)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+
+    let owners: Vec<OwnerPlanRow> = sqlx::query_as(
+        "SELECT t.id, t.name, o.subscription_tier, o.trial_ends_at, o.admin_override, o.ls_subscription_id, o.last_plan_ended_at \
+         FROM team_members m JOIN teams t ON t.id = m.team_id JOIN users o ON o.id = t.owner_id \
+         WHERE m.user_id = $1 AND t.owner_id <> $1 AND o.last_plan_ended_kind = 'teams_trial' AND o.last_plan_ended_at IS NOT NULL \
+         ORDER BY o.last_plan_ended_at DESC",
+    )
+    .bind(auth.0)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal)?;
+    let now = Utc::now();
+    let team_ended = owners
+        .into_iter()
+        .find(|(_, _, tier, ends, admin, sub, _)| {
+            !matches!(effective_tier(tier, *ends, sub.is_some(), *admin, now), "teams" | "business")
+        })
+        .map(|(team_id, team_name, _, _, _, _, at)| TeamEnded { team_id, team_name, at: at.timestamp() });
+
+    let plan_ended = match (ended_at, ended_kind) {
+        (Some(at), Some(kind)) => Some(PlanEnded { kind, at: at.timestamp() }),
+        _ => None,
+    };
+    let payment_issue = ls_status
+        .filter(|s| s == "past_due" || s == "unpaid")
+        .map(|status| PaymentIssue { status, renews_at: renews.map(|r| r.timestamp()) });
+
+    Ok(Json(PromoState {
+        pro_trial_available: pro,
+        teams_trial_available: teams,
+        email_verified: verified,
+        seen: seen_rows
+            .into_iter()
+            .map(|(promo, source, occ, at)| SeenPromo { promo, source, occurrence: occ.map(|o| o.timestamp()), at: at.timestamp() })
+            .collect(),
+        plan_ended,
+        team_ended,
+        payment_issue,
+    }))
+}
+
+/// Records a promo interaction; `shown` is idempotent per promo and occurrence.
+pub async fn post_promo_event(
+    State(pool): State<PgPool>,
+    Extension(auth): Extension<AuthUser>,
+    Json(body): Json<PromoEventRequest>,
+) -> Result<StatusCode, Response> {
+    let invalid = || coded_error(StatusCode::BAD_REQUEST, "INVALID_PROMO_EVENT");
+    if !matches!(body.promo.as_str(), "pro_redeem" | "teams_promo" | "plan_ended")
+        || !matches!(body.event.as_str(), "shown" | "dismissed" | "clicked" | "activated")
+    {
+        return Err(invalid());
+    }
+    let occurrence = match body.occurrence {
+        Some(secs) => Some(DateTime::<Utc>::from_timestamp(secs, 0).ok_or_else(invalid)?),
+        None => None,
+    };
+    let source: String = body.source.chars().take(64).collect();
+    sqlx::query(
+        "INSERT INTO promo_events (user_id, promo, event, source, occurrence) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+    )
+    .bind(auth.0)
+    .bind(&body.promo)
+    .bind(&body.event)
+    .bind(source)
+    .bind(occurrence)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("promo event insert failed: {e}");
+        coded_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +542,125 @@ mod tests {
         let (status, body) = err_body(activate(&pool, u, "business").await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, r#"{"error":"INVALID_PLAN"}"#);
+    }
+
+    async fn promos(pool: &sqlx::PgPool, u: uuid::Uuid) -> PromoState {
+        let Json(s) = get_promos(State(pool.clone()), Extension(AuthUser(u))).await.ok().unwrap();
+        s
+    }
+
+    async fn post_event(
+        pool: &sqlx::PgPool,
+        u: uuid::Uuid,
+        promo: &str,
+        event: &str,
+        occurrence: Option<i64>,
+    ) -> Result<StatusCode, Response> {
+        post_promo_event(
+            State(pool.clone()),
+            Extension(AuthUser(u)),
+            Json(PromoEventRequest {
+                promo: promo.to_string(),
+                event: event.to_string(),
+                source: "launch".to_string(),
+                occurrence,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn promo_state_reports_flags_and_seen() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        sqlx::query("INSERT INTO promo_events (user_id, promo, event, source) VALUES ($1, 'pro_redeem', 'shown', 'banner'), ($1, 'pro_redeem', 'dismissed', 'banner')")
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s = promos(&pool, u).await;
+        assert!(s.pro_trial_available && s.teams_trial_available && s.email_verified);
+        assert_eq!(s.seen.len(), 1);
+        assert_eq!((s.seen[0].promo.as_str(), s.seen[0].source.as_str()), ("pro_redeem", "banner"));
+        assert!(s.plan_ended.is_none() && s.team_ended.is_none() && s.payment_issue.is_none());
+    }
+
+    #[tokio::test]
+    async fn shown_event_is_idempotent() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        for _ in 0..2 {
+            assert_eq!(post_event(&pool, u, "teams_promo", "shown", None).await.ok().unwrap(), StatusCode::NO_CONTENT);
+        }
+        for _ in 0..2 {
+            post_event(&pool, u, "plan_ended", "shown", Some(1_700_000_000)).await.ok().unwrap();
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM promo_events WHERE user_id = $1 AND promo = 'teams_promo' AND event = 'shown'")
+            .bind(u)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let s = promos(&pool, u).await;
+        assert_eq!(s.seen.len(), 2);
+        let pe = s.seen.iter().find(|p| p.promo == "plan_ended").unwrap();
+        assert_eq!(pe.occurrence, Some(1_700_000_000));
+    }
+
+    #[tokio::test]
+    async fn invalid_promo_event_rejected() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        for (p, e) in [("bogus", "shown"), ("pro_redeem", "bogus")] {
+            let r = post_event(&pool, u, p, e, None).await.expect_err("expected error");
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+            assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), r#"{"error":"INVALID_PROMO_EVENT"}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_ended_reported_from_columns() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        assert!(promos(&pool, u).await.plan_ended.is_none());
+        sqlx::query("UPDATE users SET last_plan_ended_at = to_timestamp(1700000000), last_plan_ended_kind = 'pro_trial' WHERE id = $1")
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pe = promos(&pool, u).await.plan_ended.unwrap();
+        assert_eq!((pe.kind.as_str(), pe.at), ("pro_trial", 1_700_000_000));
+    }
+
+    #[tokio::test]
+    async fn team_ended_reported_to_members() {
+        let pool = crate::test_pool_or_skip!();
+        let owner = verified_user(&pool).await;
+        let member = verified_user(&pool).await;
+        let team = crate::test_support::seed_team(&pool, owner).await;
+        crate::test_support::add_member(&pool, team, owner).await;
+        crate::test_support::add_member(&pool, team, member).await;
+        sqlx::query("UPDATE users SET last_plan_ended_at = to_timestamp(1700000000), last_plan_ended_kind = 'teams_trial' WHERE id = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let te = promos(&pool, member).await.team_ended.unwrap();
+        assert_eq!((te.team_id, te.team_name.as_str(), te.at), (team, "test-team", 1_700_000_000));
+        assert!(promos(&pool, owner).await.team_ended.is_none());
+        crate::test_support::set_user_tier(&pool, owner, "teams").await;
+        assert!(promos(&pool, member).await.team_ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn payment_issue_reported_for_past_due() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        crate::test_support::set_user_ls_status(&pool, u, "past_due").await;
+        let pi = promos(&pool, u).await.payment_issue.unwrap();
+        assert_eq!(pi.status, "past_due");
+        crate::test_support::set_user_ls_status(&pool, u, "active").await;
+        assert!(promos(&pool, u).await.payment_issue.is_none());
     }
 }

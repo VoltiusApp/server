@@ -805,6 +805,16 @@ async fn main() {
             post(trials::activate_trial)
                 .route_layer(middleware::from_fn(self_host::block_when_self_hosted)),
         )
+        .route(
+            "/v1/promos",
+            get(trials::get_promos)
+                .route_layer(middleware::from_fn(self_host::block_when_self_hosted)),
+        )
+        .route(
+            "/v1/promos/events",
+            post(trials::post_promo_event)
+                .route_layer(middleware::from_fn(self_host::block_when_self_hosted)),
+        )
         .route("/v1/billing/portal", post(routes::billing::get_portal))
         .route("/v1/billing/seats", post(routes::billing::update_seats))
         .route(
