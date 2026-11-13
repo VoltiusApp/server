@@ -1,0 +1,10 @@
+# Enable with COMPOSE_FILE=compose.yml:compose.portal.yml in .env.
+services:
+  portal:
+    image: ghcr.io/voltiusapp/voltius-portal:${PORTAL_TAG:-latest}
+    container_name: voltius-portal
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORTAL_PORT:-3000}:3000"
+    environment:
+      VOLTIUS_API_URL: ${VOLTIUS_API_URL:?VOLTIUS_API_URL is required for the portal — the server's public URL}
