@@ -45,6 +45,9 @@ pub struct Claims {
     pub billing_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_team: Option<SeatTeamClaim>,
+    /// The login session this token belongs to; absent on tokens issued before sessions existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
 }
 
 impl Claims {
@@ -67,6 +70,7 @@ fn secret() -> Vec<u8> {
         .into_bytes()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_access_token(
     user_id: Uuid,
     plan: PlanClaims,
@@ -75,6 +79,7 @@ pub fn create_access_token(
     is_admin: bool,
     is_banned: bool,
     email_verified: bool,
+    sid: Option<Uuid>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
@@ -92,6 +97,7 @@ pub fn create_access_token(
         jti: None,
         billing_tier: Some(plan.billing_tier),
         seat_team: plan.seat_team,
+        sid,
     };
     encode(
         &Header::default(),
@@ -109,6 +115,7 @@ fn bare_token(
     lifetime: Duration,
     token_version: i32,
     jti: Option<Uuid>,
+    sid: Option<Uuid>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
@@ -126,6 +133,7 @@ fn bare_token(
         jti,
         billing_tier: None,
         seat_team: None,
+        sid,
     };
     encode(
         &Header::default(),
@@ -137,15 +145,16 @@ fn bare_token(
 pub fn create_refresh_token(
     user_id: Uuid,
     token_version: i32,
+    sid: Option<Uuid>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    bare_token(user_id, "refresh", Duration::days(90), token_version, None)
+    bare_token(user_id, "refresh", crate::login_sessions::LIFETIME, token_version, None, sid)
 }
 
 pub fn create_pending_token(
     user_id: Uuid,
     token_version: i32,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    bare_token(user_id, PENDING_SECOND_FACTOR, Duration::minutes(5), token_version, Some(Uuid::new_v4()))
+    bare_token(user_id, PENDING_SECOND_FACTOR, Duration::minutes(5), token_version, Some(Uuid::new_v4()), None)
 }
 
 pub fn validate_token(
@@ -211,7 +220,7 @@ pub(crate) mod tests {
         std::env::set_var("JWT_SECRET", "test-secret");
         let user_id = Uuid::new_v4();
 
-        let token = create_access_token(user_id, PlanClaims::own("pro"), None, false, false, false, true).unwrap();
+        let token = create_access_token(user_id, PlanClaims::own("pro"), None, false, false, false, true, None).unwrap();
         let claims = validate_token(&token, "access").unwrap();
 
         assert!(claims.email_verified);
@@ -257,7 +266,7 @@ pub(crate) mod tests {
         let _guard = crate::test_support::env_lock();
         std::env::set_var("JWT_SECRET", "test-secret");
 
-        let token = create_refresh_token(Uuid::new_v4(), 7).unwrap();
+        let token = create_refresh_token(Uuid::new_v4(), 7, None).unwrap();
 
         assert_eq!(validate_token(&token, "refresh").unwrap().ver, 7);
     }
@@ -285,6 +294,7 @@ pub(crate) mod tests {
                 false,
                 false,
                 true,
+                None,
             )
             .unwrap();
         let claims = validate_token(&token, "access").unwrap();

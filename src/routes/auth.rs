@@ -16,8 +16,9 @@ use crate::auth::{
         SeatTeamClaim, PENDING_SECOND_FACTOR,
     },
     password::{hash_auth_key, verify_auth_key},
-    AuthUser,
+    AuthUser, CurrentSession,
 };
+use crate::login_sessions::{self, Device, SessionInfo};
 use crate::enrollment::{admit_verified_requests, domain_allowed, redeem_for, RedeemResponse};
 use crate::rate_limit::{
     check_budget, ClientIp, EnrollmentRegisterLimiter, EnrollmentResolveLimiter, RateLimiter, RegisterRateLimiter,
@@ -29,7 +30,7 @@ use crate::email::{send_password_changed_email, send_verification_email};
 use crate::routes::email_undeliverable_response;
 use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
-use crate::sync_notifier::SyncNotifier;
+use crate::sync_notifier::{EndedSessions, SyncNotifier};
 use crate::passkeys::Passkeys;
 use crate::two_factor::{self, Refusal, SecondFactorProof, SeedCipher};
 
@@ -60,7 +61,7 @@ struct TierInfo {
     token_version: i32,
 }
 
-fn access_token_for(user_id: Uuid, tier: &TierInfo) -> Result<String, StatusCode> {
+fn access_token_for(user_id: Uuid, tier: &TierInfo, sid: Option<Uuid>) -> Result<String, StatusCode> {
     create_access_token(
         user_id,
         PlanClaims {
@@ -73,6 +74,7 @@ fn access_token_for(user_id: Uuid, tier: &TierInfo) -> Result<String, StatusCode
         tier.is_admin,
         tier.is_banned,
         tier.email_verified,
+        sid,
     )
     .map_err(|err| {
         error!(error = %err, user_id = %user_id, "Failed to create access token");
@@ -80,32 +82,68 @@ fn access_token_for(user_id: Uuid, tier: &TierInfo) -> Result<String, StatusCode
     })
 }
 
-fn issue_session(user_id: Uuid, tier: &TierInfo) -> Result<(String, String), StatusCode> {
-    let refresh_token = create_refresh_token(user_id, tier.token_version).map_err(|err| {
+fn refresh_token_for(user_id: Uuid, tier: &TierInfo, sid: Uuid) -> Result<String, StatusCode> {
+    create_refresh_token(user_id, tier.token_version, Some(sid)).map_err(|err| {
         error!(error = %err, user_id = %user_id, "Failed to create refresh token");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok((access_token_for(user_id, tier)?, refresh_token))
+    })
 }
 
-async fn bump_token_version(pool: &PgPool, user_id: Uuid) -> Result<(), StatusCode> {
+fn issue_session(user_id: Uuid, tier: &TierInfo, sid: Uuid) -> Result<(String, String), StatusCode> {
+    Ok((access_token_for(user_id, tier, Some(sid))?, refresh_token_for(user_id, tier, sid)?))
+}
+
+fn session_db_failure(user_id: Uuid) -> impl FnOnce(sqlx::Error) -> StatusCode {
+    move |e| {
+        error!(error = %e, user_id = %user_id, "Login session query failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+async fn open_session(pool: &PgPool, user_id: Uuid, device: &Device) -> Result<Uuid, StatusCode> {
+    login_sessions::open(pool, user_id, device).await.map_err(session_db_failure(user_id))
+}
+
+/// Bumps the token version, ending every login session but the caller's.
+async fn reset_sessions(pool: &PgPool, user_id: Uuid, current: CurrentSession) -> Result<(), StatusCode> {
+    let mut tx = pool.begin().await.map_err(session_db_failure(user_id))?;
     sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| {
-            error!(error = %e, user_id = %user_id, "Failed to bump token version");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(())
+        .map_err(session_db_failure(user_id))?;
+    login_sessions::keep(&mut *tx, user_id, current.0).await.map_err(session_db_failure(user_id))?;
+    tx.commit().await.map_err(session_db_failure(user_id))
+}
+
+/// The caller's session, kept across a token-version bump; a caller without one gets a new session.
+async fn caller_session(pool: &PgPool, user_id: Uuid, current: CurrentSession) -> Result<Uuid, StatusCode> {
+    if login_sessions::keep(pool, user_id, current.0).await.map_err(session_db_failure(user_id))? {
+        if let Some(sid) = current.0 {
+            return Ok(sid);
+        }
+    }
+    open_session(pool, user_id, &Device::default()).await
+}
+
+async fn sign_in_response(
+    pool: &PgPool,
+    user_id: Uuid,
+    tier: TierInfo,
+    wrapped_user_secrets: Option<String>,
+    device: &Device,
+) -> Result<AuthResponse, StatusCode> {
+    let sid = open_session(pool, user_id, device).await?;
+    auth_response(user_id, tier, wrapped_user_secrets, sid)
 }
 
 fn auth_response(
     user_id: Uuid,
     tier: TierInfo,
     wrapped_user_secrets: Option<String>,
+    sid: Uuid,
 ) -> Result<AuthResponse, StatusCode> {
-    let (jwt_token, refresh_token) = issue_session(user_id, &tier)?;
+    let (jwt_token, refresh_token) = issue_session(user_id, &tier, sid)?;
     Ok(AuthResponse {
         user_id,
         jwt_token,
@@ -120,15 +158,22 @@ fn auth_response(
 
 #[derive(Serialize)]
 pub struct SessionTokens {
+    #[serde(skip)]
+    pub session_id: Uuid,
     pub jwt_token: String,
     pub refresh_token: String,
 }
 
-/// A pair at the user's current token version, for the device that just moved it.
-pub(crate) async fn fresh_session(pool: &PgPool, user_id: Uuid) -> Result<SessionTokens, StatusCode> {
+/// A pair for the caller's session at the user's current token version.
+pub(crate) async fn fresh_session(
+    pool: &PgPool,
+    user_id: Uuid,
+    current: CurrentSession,
+) -> Result<SessionTokens, StatusCode> {
     let tier = fetch_tier(pool, user_id).await?;
-    let (jwt_token, refresh_token) = issue_session(user_id, &tier)?;
-    Ok(SessionTokens { jwt_token, refresh_token })
+    let sid = caller_session(pool, user_id, current).await?;
+    let (jwt_token, refresh_token) = issue_session(user_id, &tier, sid)?;
+    Ok(SessionTokens { session_id: sid, jwt_token, refresh_token })
 }
 
 pub(crate) async fn require_auth_key(pool: &PgPool, user_id: Uuid, auth_key: &str) -> Result<(), StatusCode> {
@@ -264,6 +309,8 @@ pub struct RegisterRequest {
     pub machine_fingerprint: Option<String>,
     #[serde(default)]
     pub enrollment: Option<EnrollmentCredential>,
+    #[serde(default)]
+    pub device: Device,
 }
 
 #[derive(Serialize)]
@@ -553,7 +600,8 @@ async fn register_with(
         }
     }
 
-    let session = auth_response(user_id, fetch_tier(&pool, user_id).await?, body.wrapped_user_secrets)?;
+    let session =
+        sign_in_response(&pool, user_id, fetch_tier(&pool, user_id).await?, body.wrapped_user_secrets, &body.device).await?;
 
     // `account_id` is deliberately absent: despite the name it is the KDF salt
     // passed to derive_keys, so a log line carrying it hands anyone who can read
@@ -584,6 +632,8 @@ async fn team_name(pool: &PgPool, team_id: Uuid) -> String {
 pub struct LoginRequest {
     pub account_id: Uuid,
     pub auth_key: String,
+    #[serde(default)]
+    pub device: Device,
 }
 
 #[derive(Serialize)]
@@ -667,12 +717,14 @@ pub async fn login(
 
     info!(user_id = %user_id, tier = %tier.tier, "User logged in");
 
-    Ok(LoginOutcome::Session(auth_response(user_id, tier, wrapped_user_secrets)?))
+    Ok(LoginOutcome::Session(sign_in_response(&pool, user_id, tier, wrapped_user_secrets, &body.device).await?))
 }
 
 #[derive(Deserialize)]
 pub struct SecondFactorLoginRequest {
     pub pending_token: String,
+    #[serde(default)]
+    pub device: Device,
     #[serde(flatten)]
     pub proof: SecondFactorProof,
 }
@@ -722,7 +774,7 @@ pub async fn login_second_factor(
 
     info!(user_id = %user_id, tier = %tier.tier, "User logged in with second factor");
 
-    Ok(Json(auth_response(user_id, tier, wrapped_user_secrets)?))
+    Ok(Json(sign_in_response(&pool, user_id, tier, wrapped_user_secrets, &body.device).await?))
 }
 
 // ─── Refresh ─────────────────────────────────────────────────────────────────
@@ -730,11 +782,16 @@ pub async fn login_second_factor(
 #[derive(Deserialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
+    /// Sent only by clients that store a refresh token handed back here.
+    #[serde(default)]
+    pub device: Option<Device>,
 }
 
 #[derive(Serialize)]
 pub struct RefreshResponse {
     pub jwt_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 pub async fn refresh(
@@ -745,20 +802,41 @@ pub async fn refresh(
         warn!("Refresh failed: invalid refresh token");
         StatusCode::UNAUTHORIZED
     })?;
+    let user_id = claims.sub;
 
-    let tier = fetch_tier(&pool, claims.sub).await?;
-    if claims.ver != tier.token_version {
-        warn!(user_id = %claims.sub, "Refresh failed: session revoked");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let jwt_token = access_token_for(claims.sub, &tier)?;
+    let tier = fetch_tier(&pool, user_id).await?;
+    let (sid, refresh_token) = match (claims.sid, &body.device) {
+        (Some(sid), _) => {
+            if !login_sessions::is_live(&pool, user_id, sid).await.map_err(session_db_failure(user_id))? {
+                warn!(user_id = %user_id, "Refresh failed: session ended");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let touch_pool = pool.clone();
+            tokio::spawn(async move {
+                if let Err(e) = login_sessions::touch(&touch_pool, sid).await {
+                    warn!(error = %e, "Failed to stamp login session activity");
+                }
+            });
+            (Some(sid), None)
+        }
+        (None, _) if claims.ver != tier.token_version => {
+            warn!(user_id = %user_id, "Refresh failed: session revoked");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        (None, Some(device)) => {
+            let sid = open_session(&pool, user_id, device).await?;
+            (Some(sid), Some(refresh_token_for(user_id, &tier, sid)?))
+        }
+        (None, None) => (None, None),
+    };
+    let jwt_token = access_token_for(user_id, &tier, sid)?;
 
     // A refreshed session means the account is still live. Fire-and-forget.
-    crate::last_seen::touch(&pool, claims.sub);
+    crate::last_seen::touch(&pool, user_id);
 
-    info!(user_id = %claims.sub, tier = %tier.tier, "Access token refreshed");
+    info!(user_id = %user_id, tier = %tier.tier, "Access token refreshed");
 
-    Ok(Json(RefreshResponse { jwt_token }))
+    Ok(Json(RefreshResponse { jwt_token, refresh_token }))
 }
 
 // ─── Email verification ──────────────────────────────────────────────────────
@@ -1058,6 +1136,7 @@ pub struct UpdatePasswordRequest {
 pub async fn update_password(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(current): axum::Extension<CurrentSession>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::Extension(cipher): axum::Extension<SeedCipher>,
     Json(body): Json<UpdatePasswordRequest>,
@@ -1070,21 +1149,25 @@ pub async fn update_password(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let mut tx = pool.begin().await.map_err(session_db_failure(auth.0))?;
     let (email, undeliverable) = sqlx::query_as::<_, (String, bool)>(
         "UPDATE users SET auth_hash = $1, wrapped_user_secrets = $2, token_version = token_version + 1, updated_at = now() WHERE id = $3 RETURNING email, email_undeliverable_at IS NOT NULL",
     )
     .bind(&new_auth_hash)
     .bind(&body.new_wrapped_user_secrets)
     .bind(auth.0)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         error!(error = %e, user_id = %auth.0, "Failed to update password");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    login_sessions::keep(&mut *tx, auth.0, current.0).await.map_err(session_db_failure(auth.0))?;
+    tx.commit().await.map_err(session_db_failure(auth.0))?;
 
     let tier = fetch_tier(&pool, auth.0).await?;
-    notifier.notify(auth.0, "token_invalidated".to_string());
+    let sid = caller_session(&pool, auth.0, current).await?;
+    notifier.notify_sessions_reset(auth.0, Some(sid));
     if !undeliverable {
         let user_id = auth.0;
         tokio::spawn(async move {
@@ -1096,23 +1179,66 @@ pub async fn update_password(
 
     info!(user_id = %auth.0, "User password updated");
 
-    Ok(Json(auth_response(auth.0, tier, Some(body.new_wrapped_user_secrets))?))
+    Ok(Json(auth_response(auth.0, tier, Some(body.new_wrapped_user_secrets), sid)?))
 }
 
-// ─── Log out everywhere ───────────────────────────────────────────────────────
+// ─── Login sessions ───────────────────────────────────────────────────────────
 
-pub async fn logout_all(
+#[derive(Serialize)]
+pub struct SessionList {
+    pub sessions: Vec<SessionInfo>,
+}
+
+pub async fn list_sessions(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(current): axum::Extension<CurrentSession>,
+) -> Result<Json<SessionList>, StatusCode> {
+    let sessions = login_sessions::list(&pool, auth.0, current.0).await.map_err(session_db_failure(auth.0))?;
+    Ok(Json(SessionList { sessions }))
+}
+
+pub async fn end_session(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
+    axum::extract::Path(session_id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    if !login_sessions::end(&pool, auth.0, session_id).await.map_err(session_db_failure(auth.0))? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    notifier.notify_login_sessions_ended(auth.0, EndedSessions::One(session_id));
+    info!(user_id = %auth.0, session_id = %session_id, "User signed out one session");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends every other session, including ones from before login sessions existed.
+pub async fn logout_all(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(current): axum::Extension<CurrentSession>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
 ) -> Result<Json<SessionTokens>, StatusCode> {
-    bump_token_version(&pool, auth.0).await?;
-    let session = fresh_session(&pool, auth.0).await?;
-    notifier.notify(auth.0, "token_invalidated".to_string());
+    reset_sessions(&pool, auth.0, current).await?;
+    let session = fresh_session(&pool, auth.0, current).await?;
+    notifier.notify_sessions_reset(auth.0, Some(session.session_id));
 
     info!(user_id = %auth.0, "User signed out every other session");
 
     Ok(Json(session))
+}
+
+pub async fn logout_everywhere(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(notifier): axum::Extension<SyncNotifier>,
+) -> Result<StatusCode, StatusCode> {
+    reset_sessions(&pool, auth.0, CurrentSession(None)).await?;
+    notifier.notify_sessions_reset(auth.0, None);
+
+    info!(user_id = %auth.0, "User signed out every session");
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── Upload wrapped user secrets ──────────────────────────────────
@@ -1205,6 +1331,7 @@ mod handler_tests {
             wrapped_user_secrets: None,
             machine_fingerprint: fp.map(str::to_string),
             enrollment: None,
+            device: Device::default(),
         }
     }
 
@@ -1541,7 +1668,7 @@ mod handler_tests {
         assert_eq!(seat.name, "test-team");
         assert!(!seat.trial);
 
-        let token = access_token_for(member, &info).unwrap();
+        let token = access_token_for(member, &info, None).unwrap();
         let claims = validate_token(&token, "access").unwrap();
         assert_eq!(claims.tier, "teams");
         assert_eq!(claims.billing_tier(), "free");
@@ -1562,7 +1689,7 @@ mod handler_tests {
             .unwrap();
         let info = fetch_tier(&pool, member).await.unwrap();
         assert_eq!(info.seat_team.as_ref().unwrap().name, "Команда?");
-        let token = access_token_for(member, &info).unwrap();
+        let token = access_token_for(member, &info, None).unwrap();
         let payload = token.split('.').nth(1).unwrap();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1595,6 +1722,7 @@ mod handler_tests {
             Json(LoginRequest {
                 account_id,
                 auth_key: auth_key.to_string(),
+                device: Device { name: Some("laptop".into()), platform: Some("linux".into()), client: Some("app".into()) },
             }),
         )
         .await?;
@@ -1837,15 +1965,18 @@ mod handler_tests {
 
     // ── revocation: a refresh token dies when token_version moves ────────────
 
+    async fn refresh_as(
+        pool: &PgPool,
+        refresh_token: &str,
+        device: Option<Device>,
+    ) -> Result<RefreshResponse, StatusCode> {
+        refresh(State(pool.clone()), Json(RefreshRequest { refresh_token: refresh_token.to_string(), device }))
+            .await
+            .map(|Json(r)| r)
+    }
+
     async fn refresh_with(pool: &PgPool, refresh_token: &str) -> Result<String, StatusCode> {
-        refresh(
-            State(pool.clone()),
-            Json(RefreshRequest {
-                refresh_token: refresh_token.to_string(),
-            }),
-        )
-        .await
-        .map(|Json(r)| r.jwt_token)
+        refresh_as(pool, refresh_token, None).await.map(|r| r.jwt_token)
     }
 
     async fn signed_in_twice(pool: &PgPool) -> (Uuid, AuthResponse, AuthResponse) {
@@ -1856,15 +1987,38 @@ mod handler_tests {
         (uid, here, elsewhere)
     }
 
+    fn sid_of(session: &AuthResponse) -> Uuid {
+        validate_token(&session.refresh_token, "refresh").unwrap().sid.expect("session id")
+    }
+
+    fn current(session: &AuthResponse) -> Extension<CurrentSession> {
+        Extension(CurrentSession(Some(sid_of(session))))
+    }
+
+    async fn access_status(pool: &PgPool, session: &AuthResponse) -> Result<(), StatusCode> {
+        crate::auth::authenticate(pool, &session.jwt_token).await.map(drop)
+    }
+
+    async fn assert_dead(pool: &PgPool, session: &AuthResponse) {
+        assert_eq!(refresh_with(pool, &session.refresh_token).await, Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(access_status(pool, session).await, Err(StatusCode::UNAUTHORIZED));
+    }
+
+    async fn assert_live(pool: &PgPool, session: &AuthResponse) {
+        assert!(refresh_with(pool, &session.refresh_token).await.is_ok());
+        assert_eq!(access_status(pool, session).await, Ok(()));
+    }
+
     #[tokio::test]
-    async fn password_change_revokes_earlier_refresh_tokens() {
+    async fn password_change_ends_other_sessions_and_keeps_the_callers() {
         let _env = EnvGuard::new(true);
         let pool = test_pool_or_skip!();
-        let (uid, _, elsewhere) = signed_in_twice(&pool).await;
+        let (uid, here, elsewhere) = signed_in_twice(&pool).await;
 
         let Json(changed) = update_password(
             State(pool.clone()),
             Extension(AuthUser(uid)),
+            current(&here),
             Extension(SyncNotifier::new()),
             Extension(SeedCipher::for_tests()),
             Json(UpdatePasswordRequest {
@@ -1877,15 +2031,61 @@ mod handler_tests {
         .await
         .expect("password change ok");
 
-        assert_eq!(
-            refresh_with(&pool, &elsewhere.refresh_token).await,
-            Err(StatusCode::UNAUTHORIZED)
-        );
-        assert!(refresh_with(&pool, &changed.refresh_token).await.is_ok());
+        assert_dead(&pool, &elsewhere).await;
+        assert_live(&pool, &here).await;
+        assert_live(&pool, &changed).await;
+        assert_eq!(sid_of(&changed), sid_of(&here));
     }
 
     #[tokio::test]
-    async fn logout_all_revokes_other_sessions_and_keeps_the_caller() {
+    async fn revoke_others_ends_other_sessions_and_keeps_the_caller() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        use crate::sync_notifier::SyncEvent;
+        let (uid, here, elsewhere) = signed_in_twice(&pool).await;
+        let legacy = crate::auth::jwt::tests::legacy_token(uid, "refresh", "ci-test-secret");
+        let notifier = SyncNotifier::new();
+        let mut events = notifier.subscribe();
+
+        let Json(fresh) = logout_all(State(pool.clone()), Extension(AuthUser(uid)), current(&here), Extension(notifier))
+            .await
+            .expect("logout-all ok");
+
+        assert_dead(&pool, &elsewhere).await;
+        assert_eq!(refresh_with(&pool, &legacy).await, Err(StatusCode::UNAUTHORIZED));
+        assert_live(&pool, &here).await;
+        assert!(refresh_with(&pool, &fresh.refresh_token).await.is_ok());
+        assert_eq!(fresh.session_id, sid_of(&here));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SyncEvent::BlobPushed { user_id, device_id }) if user_id == uid && device_id == "token_invalidated"
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SyncEvent::LoginSessionsEnded { user_id, ended: EndedSessions::AllBut(Some(kept)) })
+                if user_id == uid && kept == sid_of(&here)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoke_others_from_a_device_signed_in_before_sessions_opens_one() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, here, _) = signed_in_twice(&pool).await;
+
+        let Json(fresh) =
+            logout_all(State(pool.clone()), Extension(AuthUser(uid)), Extension(CurrentSession(None)), Extension(SyncNotifier::new()))
+                .await
+                .expect("logout-all ok");
+
+        assert_dead(&pool, &here).await;
+        assert!(refresh_with(&pool, &fresh.refresh_token).await.is_ok());
+        let listed = login_sessions::list(&pool, uid, None).await.unwrap();
+        assert_eq!(listed.iter().map(|s| s.id).collect::<Vec<_>>(), vec![fresh.session_id]);
+    }
+
+    #[tokio::test]
+    async fn signing_out_one_session_leaves_the_others() {
         let _env = EnvGuard::new(true);
         let pool = test_pool_or_skip!();
         use crate::sync_notifier::SyncEvent;
@@ -1893,19 +2093,86 @@ mod handler_tests {
         let notifier = SyncNotifier::new();
         let mut events = notifier.subscribe();
 
-        let Json(fresh) = logout_all(State(pool.clone()), Extension(AuthUser(uid)), Extension(notifier))
-            .await
-            .expect("logout-all ok");
+        let status = end_session(
+            State(pool.clone()),
+            Extension(AuthUser(uid)),
+            Extension(notifier),
+            axum::extract::Path(sid_of(&elsewhere)),
+        )
+        .await
+        .expect("end ok");
 
-        for revoked in [&here.refresh_token, &elsewhere.refresh_token] {
-            assert_eq!(refresh_with(&pool, revoked).await, Err(StatusCode::UNAUTHORIZED));
-        }
-        assert!(refresh_with(&pool, &fresh.refresh_token).await.is_ok());
-        assert!(validate_token(&fresh.jwt_token, "access").is_ok());
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_dead(&pool, &elsewhere).await;
+        assert_live(&pool, &here).await;
         assert!(matches!(
             events.try_recv(),
-            Ok(SyncEvent::BlobPushed { user_id, device_id }) if user_id == uid && device_id == "token_invalidated"
+            Ok(SyncEvent::LoginSessionsEnded { user_id, ended: EndedSessions::One(ended) })
+                if user_id == uid && ended == sid_of(&elsewhere)
         ));
+    }
+
+    #[tokio::test]
+    async fn signing_out_the_current_session_ends_it() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, here, elsewhere) = signed_in_twice(&pool).await;
+
+        end_session(State(pool.clone()), Extension(AuthUser(uid)), Extension(SyncNotifier::new()), axum::extract::Path(sid_of(&here)))
+            .await
+            .expect("end ok");
+
+        assert_dead(&pool, &here).await;
+        assert_live(&pool, &elsewhere).await;
+    }
+
+    #[tokio::test]
+    async fn another_accounts_session_cannot_be_signed_out() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (_, theirs, _) = signed_in_twice(&pool).await;
+        let (me, _, _) = signed_in_twice(&pool).await;
+
+        let res = end_session(State(pool.clone()), Extension(AuthUser(me)), Extension(SyncNotifier::new()), axum::extract::Path(sid_of(&theirs)))
+            .await;
+
+        assert_eq!(res, Err(StatusCode::NOT_FOUND));
+        assert_live(&pool, &theirs).await;
+    }
+
+    #[tokio::test]
+    async fn revoke_all_ends_every_session() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, here, elsewhere) = signed_in_twice(&pool).await;
+
+        let status = logout_everywhere(State(pool.clone()), Extension(AuthUser(uid)), Extension(SyncNotifier::new()))
+            .await
+            .expect("revoke-all ok");
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_dead(&pool, &here).await;
+        assert_dead(&pool, &elsewhere).await;
+        assert!(login_sessions::list(&pool, uid, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_list_marks_the_caller_and_shows_device_labels() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, here, elsewhere) = signed_in_twice(&pool).await;
+
+        let Json(SessionList { sessions }) = list_sessions(State(pool.clone()), Extension(AuthUser(uid)), current(&here))
+            .await
+            .expect("list ok");
+
+        assert_eq!(sessions.iter().map(|s| (s.id, s.current)).collect::<Vec<_>>(), vec![
+            (sid_of(&here), true),
+            (sid_of(&elsewhere), false),
+        ]);
+        assert_eq!(sessions[0].device_name.as_deref(), Some("laptop"));
+        assert_eq!(sessions[0].platform.as_deref(), Some("linux"));
+        assert_eq!(sessions[0].client.as_deref(), Some("app"));
     }
 
     #[tokio::test]
@@ -1916,8 +2183,32 @@ mod handler_tests {
         let legacy = crate::auth::jwt::tests::legacy_token(uid, "refresh", "ci-test-secret");
 
         assert!(refresh_with(&pool, &legacy).await.is_ok());
-        bump_token_version(&pool, uid).await.expect("bump");
+        reset_sessions(&pool, uid, CurrentSession(None)).await.expect("bump");
         assert_eq!(refresh_with(&pool, &legacy).await, Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn a_sessionless_refresh_token_is_upgraded_only_for_a_client_that_asks() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let uid = seed_user_with_credentials(&pool, Uuid::new_v4(), "auth-key-secret").await;
+        let legacy = crate::auth::jwt::tests::legacy_token(uid, "refresh", "ci-test-secret");
+
+        let old_client = refresh_as(&pool, &legacy, None).await.expect("refresh ok");
+        assert!(old_client.refresh_token.is_none());
+        assert!(validate_token(&old_client.jwt_token, "access").unwrap().sid.is_none());
+        assert!(login_sessions::list(&pool, uid, None).await.unwrap().is_empty());
+
+        let device = Device { name: Some("desk".into()), ..Default::default() };
+        let upgraded = refresh_as(&pool, &legacy, Some(device)).await.expect("refresh ok");
+        let new_refresh = upgraded.refresh_token.expect("upgraded refresh token");
+        let sid = validate_token(&new_refresh, "refresh").unwrap().sid.expect("session id");
+        assert_eq!(validate_token(&upgraded.jwt_token, "access").unwrap().sid, Some(sid));
+        let listed = login_sessions::list(&pool, uid, None).await.unwrap();
+        assert_eq!(listed.iter().map(|s| (s.id, s.device_name.as_deref())).collect::<Vec<_>>(), vec![(sid, Some("desk"))]);
+
+        let again = refresh_as(&pool, &new_refresh, Some(Device::default())).await.expect("refresh ok");
+        assert!(again.refresh_token.is_none());
     }
 
     // ── soft delete: a deleted account is locked out of every auth path ───────
@@ -1959,6 +2250,7 @@ mod handler_tests {
             State(pool.clone()),
             Json(RefreshRequest {
                 refresh_token: session.refresh_token,
+                device: None,
             }),
         )
         .await;

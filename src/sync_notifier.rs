@@ -34,6 +34,25 @@ pub enum SyncEvent {
     },
     /// A team session this recipient could see has ended.
     SessionEnded { recipient: Uuid, session_id: Uuid },
+    /// Some of this user's login sessions were signed out.
+    LoginSessionsEnded { user_id: Uuid, ended: EndedSessions },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndedSessions {
+    One(Uuid),
+    AllBut(Option<Uuid>),
+}
+
+impl EndedSessions {
+    /// Connections opened with a token from before login sessions are never matched.
+    pub fn covers(&self, session: Option<Uuid>) -> bool {
+        match (self, session) {
+            (_, None) => false,
+            (EndedSessions::One(ended), Some(session)) => *ended == session,
+            (EndedSessions::AllBut(kept), Some(session)) => *kept != Some(session),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -63,6 +82,32 @@ impl SyncNotifier {
     /// Not a membership change — see `SyncEvent::VaultKeyChanged`.
     pub fn notify_vault_key_changed(&self, user_id: Uuid) {
         let _ = self.0.tx.send(SyncEvent::VaultKeyChanged { user_id });
+    }
+
+    pub fn notify_login_sessions_ended(&self, user_id: Uuid, ended: EndedSessions) {
+        let _ = self.0.tx.send(SyncEvent::LoginSessionsEnded { user_id, ended });
+    }
+
+    /// After a token-version bump: devices refresh, and streams of every other session close.
+    pub fn notify_sessions_reset(&self, user_id: Uuid, kept: Option<Uuid>) {
+        self.notify(user_id, "token_invalidated".to_string());
+        self.notify_login_sessions_ended(user_id, EndedSessions::AllBut(kept));
+    }
+
+    /// Resolves once `session` is signed out; never for a connection without one.
+    pub fn signed_out(&self, user_id: Uuid, session: Option<Uuid>) -> impl std::future::Future<Output = ()> {
+        let mut rx = self.subscribe();
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(SyncEvent::LoginSessionsEnded { user_id: uid, ended }) if uid == user_id && ended.covers(session) => {
+                        return
+                    }
+                    Err(broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub fn notify_plan_changed(&self, user_id: Uuid) {
@@ -235,5 +280,17 @@ mod tests {
 
         assert_eq!(listed(team).await.data_version, before + 2);
         assert_eq!(listed(other).await.data_version, other_before);
+    }
+
+    #[test]
+    fn ended_sessions_match_only_the_streams_they_name() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(EndedSessions::One(a).covers(Some(a)));
+        assert!(!EndedSessions::One(a).covers(Some(b)));
+        assert!(EndedSessions::AllBut(Some(a)).covers(Some(b)));
+        assert!(!EndedSessions::AllBut(Some(a)).covers(Some(a)));
+        assert!(EndedSessions::AllBut(None).covers(Some(a)));
+        assert!(!EndedSessions::AllBut(None).covers(None));
+        assert!(!EndedSessions::One(a).covers(None));
     }
 }

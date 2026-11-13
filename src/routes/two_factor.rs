@@ -4,7 +4,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, CurrentSession};
+use crate::login_sessions;
 use crate::passkeys::{self, PasskeyInfo};
 use crate::routes::auth::{fresh_session, require_auth_key, SessionTokens};
 use crate::sync_notifier::SyncNotifier;
@@ -76,15 +77,17 @@ pub async fn conclude_addition(
     notifier: &SyncNotifier,
     mut tx: Transaction<'_, Postgres>,
     user_id: Uuid,
+    current: CurrentSession,
     was_enabled: bool,
 ) -> Result<FactorAdded, Refusal> {
     let recovery_codes =
         two_factor::first_factor_added(&mut tx, user_id, was_enabled).await.map_err(db_failure)?;
+    login_sessions::keep(&mut *tx, user_id, current.0).await.map_err(db_failure)?;
     tx.commit().await.map_err(db_failure)?;
 
-    let session = fresh_session(pool, user_id).await?;
+    let session = fresh_session(pool, user_id, current).await?;
     if !was_enabled {
-        notifier.notify(user_id, "token_invalidated".to_string());
+        notifier.notify_sessions_reset(user_id, Some(session.session_id));
         info!(user_id = %user_id, "Two-factor authentication enabled");
     }
     Ok(FactorAdded { recovery_codes, session })
@@ -93,6 +96,7 @@ pub async fn conclude_addition(
 pub async fn enable(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(current): Extension<CurrentSession>,
     Extension(cipher): Extension<SeedCipher>,
     Extension(notifier): Extension<SyncNotifier>,
     Json(proof): Json<SecondFactorProof>,
@@ -116,7 +120,7 @@ pub async fn enable(
     if enabled.rows_affected() == 0 {
         return Err(Refusal::AlreadyEnabled);
     }
-    conclude_addition(&pool, &notifier, tx, auth.0, was_enabled).await.map(Json)
+    conclude_addition(&pool, &notifier, tx, auth.0, current, was_enabled).await.map(Json)
 }
 
 pub enum Factor {
@@ -138,6 +142,7 @@ pub async fn remove(
     cipher: &SeedCipher,
     notifier: &SyncNotifier,
     user_id: Uuid,
+    current: CurrentSession,
     body: &StepUpRequest,
     factor: Factor,
 ) -> Result<Json<Removal>, Refusal> {
@@ -158,11 +163,12 @@ pub async fn remove(
         return Err(StatusCode::NOT_FOUND.into());
     }
     let two_factor_enabled = two_factor::settle_after_removal(&mut tx, user_id).await.map_err(db_failure)?;
+    login_sessions::keep(&mut *tx, user_id, current.0).await.map_err(db_failure)?;
     tx.commit().await.map_err(db_failure)?;
 
-    let session = fresh_session(pool, user_id).await?;
+    let session = fresh_session(pool, user_id, current).await?;
     if !two_factor_enabled {
-        notifier.notify(user_id, "token_invalidated".to_string());
+        notifier.notify_sessions_reset(user_id, Some(session.session_id));
         info!(user_id = %user_id, "Two-factor authentication disabled");
     }
     Ok(Json(Removal { two_factor_enabled, session }))
@@ -171,21 +177,23 @@ pub async fn remove(
 pub async fn disable(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(current): Extension<CurrentSession>,
     Extension(cipher): Extension<SeedCipher>,
     Extension(notifier): Extension<SyncNotifier>,
     Json(body): Json<StepUpRequest>,
 ) -> Result<Json<Removal>, Refusal> {
-    remove(&pool, &cipher, &notifier, auth.0, &body, Factor::All).await
+    remove(&pool, &cipher, &notifier, auth.0, current, &body, Factor::All).await
 }
 
 pub async fn remove_totp(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(current): Extension<CurrentSession>,
     Extension(cipher): Extension<SeedCipher>,
     Extension(notifier): Extension<SyncNotifier>,
     Json(body): Json<StepUpRequest>,
 ) -> Result<Json<Removal>, Refusal> {
-    remove(&pool, &cipher, &notifier, auth.0, &body, Factor::Totp).await
+    remove(&pool, &cipher, &notifier, auth.0, current, &body, Factor::Totp).await
 }
 
 #[derive(Serialize)]
@@ -313,6 +321,7 @@ pub(crate) mod tests {
         enable(
             State(pool.clone()),
             Extension(AuthUser(uid)),
+            Extension(CurrentSession::default()),
             Extension(SeedCipher::for_tests()),
             Extension(SyncNotifier::new()),
             Json(proof),
@@ -336,7 +345,7 @@ pub(crate) mod tests {
             State(pool.clone()),
             Extension(cipher),
             Extension(Passkeys::for_tests()),
-            Json(LoginRequest { account_id, auth_key: AUTH_KEY.to_string() }),
+            Json(LoginRequest { account_id, auth_key: AUTH_KEY.to_string(), device: Default::default() }),
         )
         .await
         .expect("password accepted");
@@ -355,7 +364,7 @@ pub(crate) mod tests {
         login_second_factor(
             State(pool.clone()),
             Extension(cipher),
-            Json(SecondFactorLoginRequest { pending_token: pending_token.to_string(), proof }),
+            Json(SecondFactorLoginRequest { pending_token: pending_token.to_string(), device: Default::default(), proof }),
         )
         .await
         .map(|Json(r)| r)
@@ -370,7 +379,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn refreshes(pool: &PgPool, refresh_token: &str) -> bool {
-        refresh(State(pool.clone()), Json(RefreshRequest { refresh_token: refresh_token.to_string() }))
+        refresh(State(pool.clone()), Json(RefreshRequest { refresh_token: refresh_token.to_string(), device: None }))
             .await
             .is_ok()
     }
@@ -456,7 +465,7 @@ pub(crate) mod tests {
         let _env = jwt_env();
         let pool = test_pool_or_skip!();
         let uid = seed_user_with_credentials(&pool, Uuid::new_v4(), AUTH_KEY).await;
-        let before = create_refresh_token(uid, 0).unwrap();
+        let before = create_refresh_token(uid, 0, None).unwrap();
         let seed = begin_setup(&pool, &SeedCipher::for_tests(), uid).await.expect("setup ok");
 
         assert_eq!(confirm(&pool, uid, code("000000")).await.err(), Some(Refusal::Invalid));
@@ -503,6 +512,7 @@ pub(crate) mod tests {
             disable(
                 State(pool.clone()),
                 Extension(AuthUser(user.uid)),
+                Extension(CurrentSession::default()),
                 Extension(SeedCipher::for_tests()),
                 Extension(SyncNotifier::new()),
                 Json(step_up_request(auth_key, proof)),
@@ -526,7 +536,7 @@ pub(crate) mod tests {
             State(pool.clone()),
             Extension(SeedCipher::for_tests()),
             Extension(Passkeys::for_tests()),
-            Json(LoginRequest { account_id: user.account_id, auth_key: AUTH_KEY.to_string() }),
+            Json(LoginRequest { account_id: user.account_id, auth_key: AUTH_KEY.to_string(), device: Default::default() }),
         )
         .await
         .expect("login ok");
@@ -622,6 +632,7 @@ pub(crate) mod tests {
             update_password(
                 State(pool.clone()),
                 Extension(AuthUser(user.uid)),
+                Extension(CurrentSession::default()),
                 Extension(SyncNotifier::new()),
                 Extension(SeedCipher::for_tests()),
                 Json(UpdatePasswordRequest {
@@ -662,7 +673,7 @@ pub(crate) mod tests {
             State(pool.clone()),
             Extension(SeedCipher::for_tests()),
             Extension(Passkeys::for_tests()),
-            Json(LoginRequest { account_id: user.account_id, auth_key: AUTH_KEY.to_string() }),
+            Json(LoginRequest { account_id: user.account_id, auth_key: AUTH_KEY.to_string(), device: Default::default() }),
         )
         .await
         .expect("login ok");

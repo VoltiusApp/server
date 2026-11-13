@@ -2,14 +2,15 @@ pub mod jwt;
 pub mod password;
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
-use tracing::warn;
+use sqlx::PgPool;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use jwt::Claims;
@@ -26,7 +27,26 @@ pub struct AdminEmail(pub String);
 #[derive(Debug, Clone)]
 pub struct AuthClaims(pub Claims);
 
-pub async fn auth_middleware(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+/// The login session the caller's access token belongs to, if it carries one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CurrentSession(pub Option<Uuid>);
+
+/// Decodes an access token and refuses one whose login session has ended.
+pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Claims, StatusCode> {
+    let claims = jwt::validate_token(token, "access").map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if let Some(sid) = claims.sid {
+        let live = crate::login_sessions::is_live(pool, claims.sub, sid).await.map_err(|e| {
+            error!(error = %e, user_id = %claims.sub, "Failed to check login session");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+        if !live {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(claims)
+}
+
+pub async fn auth_middleware(State(pool): State<PgPool>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_owned();
 
     let header = match req
@@ -49,11 +69,11 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Result<Response, S
         }
     };
 
-    let claims = match jwt::validate_token(token, "access") {
+    let claims = match authenticate(&pool, token).await {
         Ok(claims) => claims,
-        Err(_) => {
-            warn!(path = %path, "Unauthorized request with invalid access token");
-            return Err(StatusCode::UNAUTHORIZED);
+        Err(status) => {
+            warn!(path = %path, %status, "Unauthorized request with invalid or ended access token");
+            return Err(status);
         }
     };
 
@@ -68,6 +88,7 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Result<Response, S
     }
 
     req.extensions_mut().insert(AuthUser(claims.sub));
+    req.extensions_mut().insert(CurrentSession(claims.sid));
     req.extensions_mut().insert(AuthClaims(claims));
     Ok(next.run(req).await)
 }
@@ -140,8 +161,14 @@ mod authz_tests {
     //! through a throwaway `Router` via `oneshot`. These are pure (no DB), so they
     //! run without `TEST_DATABASE_URL`.
     use super::*;
-    use crate::test_support::{env_lock, EnvLockGuard};
-    use axum::{body::Body, http::Request, middleware::from_fn, routing::get, Extension, Router};
+    use crate::test_support::{dead_pool, env_lock, EnvLockGuard};
+    use axum::{
+        body::Body,
+        http::Request,
+        middleware::{from_fn, from_fn_with_state},
+        routing::get,
+        Extension, Router,
+    };
     use tower::ServiceExt;
 
     async fn ok_handler() -> StatusCode {
@@ -169,6 +196,7 @@ mod authz_tests {
             jti: None,
             billing_tier: None,
             seat_team: None,
+            sid: None,
         }
     }
 
@@ -381,7 +409,7 @@ mod authz_tests {
     async fn auth_middleware_rejects_missing_header() {
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn(auth_middleware));
+            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
 
         let resp = app
             .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
@@ -395,7 +423,7 @@ mod authz_tests {
     async fn auth_middleware_rejects_non_bearer_header() {
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn(auth_middleware));
+            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
 
         let resp = app
             .oneshot(
@@ -417,7 +445,7 @@ mod authz_tests {
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn(auth_middleware));
+            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
 
         let resp = app
             .oneshot(
@@ -438,10 +466,10 @@ mod authz_tests {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         let token =
-            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, true, true).unwrap();
+            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, true, true, None).unwrap();
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn(auth_middleware));
+            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
 
         let resp = app
             .oneshot(
@@ -462,11 +490,11 @@ mod authz_tests {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("JWT_SECRET", "ci-test-secret");
         let token =
-            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, false, true)
+            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, false, true, None)
                 .unwrap();
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn(auth_middleware));
+            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
 
         let resp = app
             .oneshot(
@@ -480,5 +508,38 @@ mod authz_tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_fails_closed_when_the_session_cannot_be_checked() {
+        let _guard = EnvLockGuard(env_lock());
+        std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let token = jwt::create_access_token(
+            Uuid::new_v4(),
+            jwt::PlanClaims::own("pro"),
+            None,
+            false,
+            false,
+            false,
+            true,
+            Some(Uuid::new_v4()),
+        )
+        .unwrap();
+        let app = Router::new()
+            .route("/x", get(ok_handler))
+            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
