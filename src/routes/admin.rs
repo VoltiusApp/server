@@ -94,6 +94,18 @@ pub struct OverviewResponse {
     churn_series: Vec<DayBucket>,
     recent_signups: Vec<RecentUser>,
     recent_churn: Vec<RecentChurnRow>,
+    promo_funnel: Vec<PromoFunnelRow>,
+    trials_activated_30d: i64,
+    trial_to_paid_30d: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct PromoFunnelRow {
+    promo: String,
+    source: String,
+    shown: i64,
+    clicked: i64,
+    activated: i64,
 }
 
 #[derive(Serialize)]
@@ -322,6 +334,42 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         0.0
     };
 
+    // ── Promo funnel (last 30 days) ──────────────────────────────────────────
+    let promo_funnel = sqlx::query_as::<_, PromoFunnelRow>(
+        r#"
+        SELECT promo, source,
+               COUNT(*) FILTER (WHERE event = 'shown')::bigint AS shown,
+               COUNT(*) FILTER (WHERE event = 'clicked')::bigint AS clicked,
+               COUNT(*) FILTER (WHERE event = 'activated')::bigint AS activated
+        FROM promo_events
+        WHERE created_at > now() - interval '30 days'
+        GROUP BY promo, source
+        ORDER BY promo, source
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: promo funnel failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let (trials_activated_30d, trial_to_paid_30d) = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT COUNT(DISTINCT pe.user_id),
+               COUNT(DISTINCT pe.user_id) FILTER (WHERE u.ls_subscription_id IS NOT NULL)
+        FROM promo_events pe
+        JOIN users u ON u.id = pe.user_id
+        WHERE pe.event = 'activated' AND pe.created_at > now() - interval '30 days'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "overview: promo conversion failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     Ok(Json(OverviewResponse {
         mrr_total,
         mrr_by_tier: TierMrr {
@@ -354,6 +402,9 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         churn_series,
         recent_signups,
         recent_churn,
+        promo_funnel,
+        trials_activated_30d,
+        trial_to_paid_30d,
     }))
 }
 
@@ -2521,5 +2572,65 @@ mod admin_handler_tests {
         assert_eq!(rows[0].reason, "conflict");
         assert_eq!(handle_of(&pool, id).await, current);
         assert!(set_handle_audits(&pool, id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overview_reports_promo_funnel() {
+        let pool = test_pool_or_skip!();
+        let before = get_overview(State(pool.clone())).await.unwrap().0;
+        let src = format!("t6-{}", Uuid::new_v4());
+        let (u1, u2, u3) = (
+            seed_user(&pool).await,
+            seed_user(&pool).await,
+            seed_user(&pool).await,
+        );
+        let ev = |u: Uuid, promo: &'static str, event: &'static str, ago: &'static str| {
+            let pool = pool.clone();
+            let src = src.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO promo_events (user_id, promo, event, source, created_at) VALUES ($1, $2, $3, $4, now() - $5::interval)",
+                )
+                .bind(u)
+                .bind(promo)
+                .bind(event)
+                .bind(src)
+                .bind(ago)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        for u in [u1, u2, u3] {
+            ev(u, "pro_redeem", "shown", "1 day").await;
+        }
+        for u in [u1, u2] {
+            ev(u, "pro_redeem", "clicked", "1 day").await;
+            ev(u, "pro_redeem", "activated", "1 day").await;
+        }
+        // Outside the 30-day window: must be ignored everywhere.
+        ev(u3, "pro_redeem", "activated", "40 days").await;
+        ev(u3, "teams_promo", "shown", "40 days").await;
+        sqlx::query("UPDATE users SET ls_subscription_id = 'sub_t6' WHERE id = $1")
+            .bind(u1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET ls_subscription_id = 'sub_t6' WHERE id = $1")
+            .bind(u3)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let after = get_overview(State(pool.clone())).await.unwrap().0;
+        let mine: Vec<_> = after.promo_funnel.iter().filter(|r| r.source == src).collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].promo, "pro_redeem");
+        assert_eq!(
+            (mine[0].shown, mine[0].clicked, mine[0].activated),
+            (3, 2, 2)
+        );
+        assert_eq!(after.trials_activated_30d - before.trials_activated_30d, 2);
+        assert_eq!(after.trial_to_paid_30d - before.trial_to_paid_30d, 1);
     }
 }
