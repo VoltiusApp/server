@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
@@ -307,6 +307,9 @@ pub struct RegisterRequest {
     pub wrapped_user_secrets: Option<String>,
     #[serde(default)]
     pub machine_fingerprint: Option<String>,
+    /// Client can start a trial itself; the account then starts free with trials on offer.
+    #[serde(default)]
+    pub supports_trial_activation: bool,
     #[serde(default)]
     pub enrollment: Option<EnrollmentCredential>,
     /// An emailed invitation's token: opens registration to the invited address only.
@@ -358,6 +361,8 @@ struct NewUser<'a> {
     wrapped_user_secrets: Option<&'a str>,
     tier: &'a str,
     trial_ends_at: Option<DateTime<Utc>>,
+    pro_trial_available: bool,
+    teams_trial_available: bool,
 }
 
 fn is_handle_taken(err: &sqlx::Error) -> bool {
@@ -371,8 +376,8 @@ async fn insert_user(
     handle_is_custom: bool,
 ) -> Result<Uuid, sqlx::Error> {
     sqlx::query_scalar(
-        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle, handle_is_custom)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+        "INSERT INTO users (email, account_id, auth_hash, public_key, wrapped_user_secrets, subscription_tier, trial_ends_at, handle, handle_is_custom, pro_trial_available, teams_trial_available)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
     )
     .bind(u.email)
     .bind(u.account_id)
@@ -383,6 +388,8 @@ async fn insert_user(
     .bind(u.trial_ends_at)
     .bind(handle)
     .bind(handle_is_custom)
+    .bind(u.pro_trial_available)
+    .bind(u.teams_trial_available)
     .fetch_one(pool)
     .await
 }
@@ -518,15 +525,11 @@ async fn register_with(
         false
     };
 
-    // Self-hosted: everyone gets business tier with no trial countdown.
-    let (initial_tier, trial_ends_at) = if self_hosted {
-        ("business", None)
-    } else if trial_blocked {
+    if trial_blocked {
         warn!(fingerprint = ?body.machine_fingerprint, "Trial blocked: machine fingerprint already used");
-        ("free", None)
-    } else {
-        ("pro", Some(Utc::now() + Duration::days(14)))
-    };
+    }
+    // Self-hosted: everyone gets business tier with no trial countdown.
+    let plan = crate::trials::initial_plan(self_hosted, trial_blocked, body.supports_trial_activation, Utc::now());
 
     let (handle, handle_is_custom) =
         crate::handles::registration_handle(&pool, &email, features.handles_from_email && !delivery_configured)
@@ -542,8 +545,10 @@ async fn register_with(
         auth_hash: &auth_hash,
         public_key: body.public_key.as_deref(),
         wrapped_user_secrets: body.wrapped_user_secrets.as_deref(),
-        tier: initial_tier,
-        trial_ends_at,
+        tier: plan.tier,
+        trial_ends_at: plan.trial_ends_at,
+        pro_trial_available: plan.pro_trial_available,
+        teams_trial_available: plan.teams_trial_available,
     };
     let user_id = insert_user_with_handle_fallback(&pool, &new_user, &handle, handle_is_custom)
         .await
@@ -1342,6 +1347,7 @@ mod handler_tests {
             public_key: None,
             wrapped_user_secrets: None,
             machine_fingerprint: fp.map(str::to_string),
+            supports_trial_activation: false,
             enrollment: None,
             invitation: None,
             device: Device::default(),
@@ -1376,6 +1382,8 @@ mod handler_tests {
             wrapped_user_secrets: None,
             tier: "free",
             trial_ends_at: None,
+            pro_trial_available: false,
+            teams_trial_available: false,
         }
     }
 
@@ -1523,6 +1531,71 @@ mod handler_tests {
 
         let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
         assert_eq!(claims.tier, "free");
+    }
+
+    async fn trial_flags(pool: &PgPool, id: Uuid) -> (bool, bool) {
+        sqlx::query_as::<_, (bool, bool)>(
+            "SELECT pro_trial_available, teams_trial_available FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("fetch trial flags")
+    }
+
+    #[tokio::test]
+    async fn register_activation_client_starts_free_with_offers() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        let mut req = register_req(&email, Uuid::new_v4(), None);
+        req.supports_trial_activation = true;
+
+        let (_, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Extension(SyncNotifier::new()), Json(req))
+            .await
+            .expect("register ok");
+
+        assert_eq!(resp.tier, "free");
+        assert_eq!(resp.trial_ends_at, None);
+        let claims = validate_token(&resp.jwt_token, "access").expect("decode session");
+        assert_eq!(claims.tier, "free");
+        let (db_tier, db_trial) = stored_tier(&pool, resp.user_id).await;
+        assert_eq!(db_tier, "free");
+        assert_eq!(db_trial, None);
+        assert_eq!(trial_flags(&pool, resp.user_id).await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn register_legacy_client_keeps_silent_trial() {
+        let _env = EnvGuard::new(false);
+        let pool = test_pool_or_skip!();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        let before = Utc::now().timestamp();
+
+        let (_, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Extension(SyncNotifier::new()), Json(register_req(&email, Uuid::new_v4(), None)))
+            .await
+            .expect("register ok");
+
+        assert_eq!(resp.tier, "pro");
+        let ends = resp.trial_ends_at.expect("trial should be set");
+        assert!(ends > before + 13 * 86_400 && ends < before + 15 * 86_400);
+        assert_eq!(trial_flags(&pool, resp.user_id).await, (false, true));
+    }
+
+    #[tokio::test]
+    async fn register_self_hosted_unchanged_with_flag() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let email = format!("{}@ex.test", Uuid::new_v4());
+        let mut req = register_req(&email, Uuid::new_v4(), None);
+        req.supports_trial_activation = true;
+
+        let (_, Json(resp)) = register(State(pool.clone()), Extension(Features::open()), Extension(SyncNotifier::new()), Json(req))
+            .await
+            .expect("register ok");
+
+        assert_eq!(resp.tier, "business");
+        assert_eq!(trial_flags(&pool, resp.user_id).await, (false, false));
     }
 
     #[tokio::test]
