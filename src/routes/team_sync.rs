@@ -212,43 +212,54 @@ pub async fn get_vault_key_at_version(
 
 // ─── GET /v1/teams/:team_id/vault-key/rotation-status ────────────────────────
 
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct OldEpochCounts {
+    pub objects: i64,
+    pub secrets: i64,
+    pub blobs: i64,
+}
+
+impl OldEpochCounts {
+    fn any(&self) -> bool {
+        self.objects + self.secrets + self.blobs > 0
+    }
+}
+
 #[derive(Serialize)]
 pub struct RotationStatusResponse {
     pub stale: bool,
     pub draining: bool,
+    pub epoch: i32,
+    pub rotated_at: Option<DateTime<Utc>>,
+    pub rotation_requested_at: Option<DateTime<Utc>>,
+    pub uncovered_members: i64,
+    pub old_epoch: OldEpochCounts,
 }
 
-/// Does any ciphertext row for `team_id` still sit on an epoch behind
-/// `epoch`? Shared by `get_rotation_status` (reporting) and `rotate_vault_key`
-/// (enforcement — the spec forbids stacking a new epoch while a prior one is
-/// still draining, #217 review finding I4).
-///
-/// `team_vault_objects.metadata->>'kv'` is client-supplied JSON (any member
-/// with an edit permission can write it via `upsert_object`), so the cast only
-/// fires when the value is actually a JSON number — a non-numeric `kv` (bug
-/// or malice) falls back to epoch 1 instead of raising a Postgres cast error
-/// that would 500 this query for the whole team on every future call (#217
-/// review finding I6).
-async fn is_draining(pool: &PgPool, team_id: Uuid, epoch: i32) -> Result<bool, StatusCode> {
-    sqlx::query_scalar(
+/// `metadata.kv` is client-written JSON: a non-numeric value counts as epoch 1
+/// instead of failing the cast and 500ing the team forever (#217 I6).
+const OBJECT_EPOCH: &str =
+    "(CASE WHEN jsonb_typeof(o.metadata->'kv') = 'number' THEN (o.metadata->>'kv')::int ELSE 1 END)";
+
+/// Ciphertext rows still behind `epoch`. `rotate_vault_key` refuses a new epoch
+/// while any remain, so one stuck row blocks every later rotation (#217 I4).
+async fn old_epoch_counts(pool: &PgPool, team_id: Uuid, epoch: i32) -> Result<OldEpochCounts, StatusCode> {
+    let (objects, secrets, blobs) = sqlx::query_as::<_, (i64, i64, i64)>(&format!(
         r#"SELECT
-             EXISTS(SELECT 1 FROM team_vault_secrets WHERE team_id = $1 AND key_version < $2)
-             OR EXISTS(SELECT 1 FROM team_vault_objects WHERE team_id = $1 AND deleted_at IS NULL
-                       AND (CASE WHEN jsonb_typeof(metadata->'kv') = 'number'
-                                 THEN (metadata->>'kv')::int
-                                 ELSE 1
-                            END) < $2)
-             OR EXISTS(SELECT 1 FROM team_sync_blobs WHERE team_id = $1 AND key_version < $2)
-           "#,
-    )
+             (SELECT COUNT(*) FROM team_vault_objects o
+               WHERE o.team_id = $1 AND o.deleted_at IS NULL AND {OBJECT_EPOCH} < $2),
+             (SELECT COUNT(*) FROM team_vault_secrets WHERE team_id = $1 AND key_version < $2),
+             (SELECT COUNT(*) FROM team_sync_blobs WHERE team_id = $1 AND key_version < $2)"#
+    ))
     .bind(team_id)
     .bind(epoch)
     .fetch_one(pool)
     .await
     .map_err(|e| {
-        error!(error = %e, team_id = %team_id, "Failed to compute rotation draining state");
+        error!(error = %e, team_id = %team_id, "Failed to count old-epoch rows");
         StatusCode::INTERNAL_SERVER_ERROR
-    })
+    })?;
+    Ok(OldEpochCounts { objects, secrets, blobs })
 }
 
 pub async fn get_rotation_status(
@@ -260,39 +271,123 @@ pub async fn get_rotation_status(
 
     let epoch = current_epoch(&pool, team_id).await?;
 
-    // stale: does a team member with a public key on file lack a row at the
-    // current epoch? A member with no public key can never be covered (they
-    // cannot receive a wrapped key), so they are excluded entirely. Also
-    // stale if `remove_member` left an unresolved rotation request — a
-    // removal never creates an under-covered member, so it can't be caught
-    // above.
-    let stale: bool = sqlx::query_scalar(
-        r#"SELECT EXISTS(
-             SELECT 1 FROM team_members tm
-             JOIN users u ON u.id = tm.user_id
-             WHERE tm.team_id = $1
-               AND u.public_key IS NOT NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM team_vault_keys tvk
-                 WHERE tvk.team_id = tm.team_id AND tvk.user_id = tm.user_id AND tvk.key_version = $2
-               )
-           ) OR EXISTS(
-             SELECT 1 FROM team_rotation_requests r
-             WHERE r.team_id = $1 AND r.requested_at_epoch >= $2
-           )"#,
-    )
+    // A removal never leaves an under-covered member, so `remove_member` records
+    // a request instead; minting the next epoch leaves it behind and clears it.
+    let (uncovered_members, rotation_requested_at, rotated_at) =
+        sqlx::query_as::<_, (i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+            r#"SELECT
+                 (SELECT COUNT(*) FROM team_members tm
+                   JOIN users u ON u.id = tm.user_id
+                   WHERE tm.team_id = $1
+                     AND u.public_key IS NOT NULL
+                     AND NOT EXISTS (
+                       SELECT 1 FROM team_vault_keys tvk
+                       WHERE tvk.team_id = tm.team_id AND tvk.user_id = tm.user_id AND tvk.key_version = $2
+                     )),
+                 (SELECT MIN(created_at) FROM team_rotation_requests
+                   WHERE team_id = $1 AND requested_at_epoch >= $2),
+                 (SELECT created_at FROM team_key_epochs WHERE team_id = $1 AND key_version = $2)"#,
+        )
+        .bind(team_id)
+        .bind(epoch)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, "Failed to compute rotation staleness");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let old_epoch = old_epoch_counts(&pool, team_id, epoch).await?;
+
+    Ok(Json(RotationStatusResponse {
+        stale: uncovered_members > 0 || rotation_requested_at.is_some(),
+        draining: old_epoch.any(),
+        epoch,
+        rotated_at,
+        rotation_requested_at,
+        uncovered_members,
+        old_epoch,
+    }))
+}
+
+// ─── GET /v1/teams/:team_id/vault-key/stale-items ────────────────────────────
+
+const STALE_ITEMS_LIMIT: usize = 200;
+
+#[derive(Serialize, Debug, sqlx::FromRow)]
+pub struct StaleItem {
+    pub kind: String,
+    pub object_id: Option<String>,
+    pub secret_id: Option<String>,
+    pub object_type: Option<String>,
+    pub key_version: i32,
+    pub orphan: bool,
+    #[serde(skip)]
+    rule_set_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub my_permissions: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct StaleItemsResponse {
+    pub epoch: i32,
+    pub items: Vec<StaleItem>,
+    pub hidden: i64,
+    pub truncated: bool,
+}
+
+/// Rows holding up the drain, filtered to what the caller may view. Metadata
+/// only: ids, types and epochs, never ciphertext.
+pub async fn get_stale_items(
+    State(pool): State<PgPool>,
+    axum::Extension(auth): axum::Extension<AuthUser>,
+    Path(team_id): Path<Uuid>,
+) -> Result<Json<StaleItemsResponse>, StatusCode> {
+    require_vault_key_access(&pool, team_id, auth.0, "get_stale_items").await?;
+    let authz = ObjectAuthz::load(&pool, team_id, auth.0).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let epoch = current_epoch(&pool, team_id).await?;
+
+    let rows = sqlx::query_as::<_, StaleItem>(&format!(
+        r#"SELECT 'object' AS kind, o.object_id, NULL::text AS secret_id, o.object_type,
+                  {OBJECT_EPOCH} AS key_version, false AS orphan, o.rule_set_id
+             FROM team_vault_objects o
+            WHERE o.team_id = $1 AND o.deleted_at IS NULL AND {OBJECT_EPOCH} < $2
+           UNION ALL
+           SELECT 'secret', s.object_id, s.secret_id,
+                  CASE WHEN o.deleted_at IS NULL THEN o.object_type END,
+                  s.key_version, (o.object_id IS NULL OR o.deleted_at IS NOT NULL), o.rule_set_id
+             FROM team_vault_secrets s
+             LEFT JOIN team_vault_objects o ON o.team_id = s.team_id AND o.object_id = s.object_id
+            WHERE s.team_id = $1 AND s.key_version < $2
+           UNION ALL
+           SELECT 'blob', NULL, NULL, NULL, key_version, false, NULL
+             FROM team_sync_blobs WHERE team_id = $1 AND key_version < $2
+           ORDER BY kind, secret_id, object_id"#
+    ))
     .bind(team_id)
     .bind(epoch)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .map_err(|e| {
-        error!(error = %e, team_id = %team_id, "Failed to compute rotation staleness");
+        error!(error = %e, team_id = %team_id, "Failed to list stale rows");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let draining = is_draining(&pool, team_id, epoch).await?;
+    let total = rows.len();
+    let mut items: Vec<StaleItem> = rows
+        .into_iter()
+        .filter_map(|mut item| {
+            let mask = authz.mask(item.rule_set_id);
+            let shown = if item.orphan { authz.is_admin() } else { mask & PERM_VIEW != 0 };
+            item.my_permissions = mask;
+            shown.then_some(item)
+        })
+        .collect();
+    let hidden = (total - items.len()) as i64;
+    let truncated = items.len() > STALE_ITEMS_LIMIT;
+    items.truncate(STALE_ITEMS_LIMIT);
 
-    Ok(Json(RotationStatusResponse { stale, draining }))
+    Ok(Json(StaleItemsResponse { epoch, items, hidden, truncated }))
 }
 
 // ─── GET /v1/teams/:team_id/vault-key/holders ────────────────────────────────
@@ -497,7 +592,7 @@ pub async fn rotate_vault_key(
     // fully drained: minting epoch N+1 here would leave epoch-N ciphertext
     // stranded behind two rotations instead of one. Only the client was
     // previously asked to honor this (#217 review finding I4).
-    if is_draining(&pool, team_id, epoch).await? {
+    if old_epoch_counts(&pool, team_id, epoch).await?.any() {
         warn!(team_id = %team_id, user_id = %auth.0, epoch, "Rotation rejected: team is still draining a prior epoch");
         return Err(StatusCode::CONFLICT);
     }
@@ -732,8 +827,8 @@ mod tests {
     use crate::permissions::{PERM_CONNECT, PERM_VIEW_SECRETS};
     use crate::test_pool_or_skip;
     use crate::test_support::{
-        add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_team,
-        seed_user, seed_vault_key, set_member_overrides,
+        add_member, assign_role, member_with_role, rule_set_client_headers, seed_role, seed_rule_set,
+        seed_team, seed_user, seed_vault_key, set_member_overrides,
     };
     use axum::extract::{Path, State};
     use axum::Extension;
@@ -1391,6 +1486,143 @@ mod tests {
         let outsider = seed_user(&pool).await;
 
         let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
+
+        assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    async fn at_epoch_2(pool: &PgPool, team: Uuid, holder: Uuid) {
+        sqlx::query("INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'k2', $2, 2)")
+            .bind(team).bind(holder).execute(pool).await.expect("epoch 2 key");
+        sqlx::query("INSERT INTO team_key_epochs (team_id, key_version, created_by) VALUES ($1, 2, $2)")
+            .bind(team).bind(holder).execute(pool).await.expect("epoch 2 ledger");
+    }
+
+    async fn object_at(pool: &PgPool, team: Uuid, by: Uuid, object_id: &str, kv: i32) {
+        sqlx::query(
+            "INSERT INTO team_vault_objects (team_id, object_id, object_type, vault_id, metadata, updated_by) \
+             VALUES ($1, $2, 'connection', $1, $3, $4)",
+        )
+        .bind(team).bind(object_id).bind(serde_json::json!({ "v": 2, "enc": "x", "kv": kv })).bind(by)
+        .execute(pool).await.expect("seed object");
+    }
+
+    async fn secret_at(pool: &PgPool, team: Uuid, by: Uuid, secret_id: &str, object_id: &str, kv: i32) {
+        sqlx::query(
+            "INSERT INTO team_vault_secrets (team_id, secret_id, object_id, secret_type, ciphertext, updated_by, key_version) \
+             VALUES ($1, $2, $3, 'connection_password', 'cipher', $4, $5)",
+        )
+        .bind(team).bind(secret_id).bind(object_id).bind(by).bind(kv)
+        .execute(pool).await.expect("seed secret");
+    }
+
+    #[tokio::test]
+    async fn rotation_status_reports_epoch_coverage_and_old_epoch_counts() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        at_epoch_2(&pool, team, owner).await;
+        object_at(&pool, team, owner, "obj-old", 1).await;
+        object_at(&pool, team, owner, "obj-new", 2).await;
+        secret_at(&pool, team, owner, "sec-old", "obj-old", 1).await;
+        let newcomer = seed_user(&pool).await;
+        add_member(&pool, team, newcomer).await;
+        sqlx::query("UPDATE users SET public_key = 'pk' WHERE id = $1").bind(newcomer).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO team_rotation_requests (team_id, requested_at_epoch) VALUES ($1, 2)")
+            .bind(team).execute(&pool).await.unwrap();
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team)).await.expect("status ok").0;
+
+        assert!(res.stale && res.draining);
+        assert_eq!(res.epoch, 2);
+        assert!(res.rotated_at.is_some());
+        assert!(res.rotation_requested_at.is_some());
+        assert_eq!(res.uncovered_members, 1);
+        assert_eq!(res.old_epoch, OldEpochCounts { objects: 1, secrets: 1, blobs: 0 });
+    }
+
+    #[tokio::test]
+    async fn rotation_status_on_a_never_rotated_team_has_no_timestamps() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, false).await;
+
+        let res = get_rotation_status(State(pool.clone()), Extension(AuthUser(owner)), Path(team)).await.expect("status ok").0;
+
+        assert_eq!((res.epoch, res.rotated_at, res.rotation_requested_at, res.uncovered_members), (1, None, None, 0));
+        assert_eq!(res.old_epoch, OldEpochCounts::default());
+    }
+
+    #[tokio::test]
+    async fn stale_items_lists_rows_behind_the_current_epoch_and_flags_orphans() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets(&pool, team, owner).await;
+        grant_admin(&pool, team, owner).await;
+        at_epoch_2(&pool, team, owner).await;
+        object_at(&pool, team, owner, "obj-old", 1).await;
+        object_at(&pool, team, owner, "obj-new", 2).await;
+        secret_at(&pool, team, owner, "sec-old", "obj-old", 1).await;
+        secret_at(&pool, team, owner, "sec-new", "obj-new", 2).await;
+        secret_at(&pool, team, owner, "sec-orphan", "obj-gone", 1).await;
+        insert_team_blob(&pool, team, owner).await;
+
+        let res = get_stale_items(State(pool.clone()), Extension(AuthUser(owner)), Path(team)).await.expect("stale items ok").0;
+
+        let ids: Vec<(&str, Option<&str>, Option<&str>, bool)> = res
+            .items
+            .iter()
+            .map(|i| (i.kind.as_str(), i.object_id.as_deref(), i.secret_id.as_deref(), i.orphan))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("blob", None, None, false),
+                ("object", Some("obj-old"), None, false),
+                ("secret", Some("obj-old"), Some("sec-old"), false),
+                ("secret", Some("obj-gone"), Some("sec-orphan"), true),
+            ]
+        );
+        assert_eq!((res.epoch, res.hidden, res.truncated), (2, 0, false));
+    }
+
+    #[tokio::test]
+    async fn stale_items_hides_rows_the_caller_cannot_view() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        at_epoch_2(&pool, team, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+        grant_view_secrets(&pool, team, member).await;
+        object_at(&pool, team, owner, "obj-open", 1).await;
+        object_at(&pool, team, owner, "obj-locked", 1).await;
+        secret_at(&pool, team, owner, "sec-orphan", "obj-gone", 1).await;
+        let set = seed_rule_set(&pool, team, owner, &[("member", Some(member), 0, crate::permissions::PERM_VIEW)]).await;
+        crate::test_support::point_object(&pool, team, "obj-locked", Some(set)).await;
+
+        let res = get_stale_items(State(pool.clone()), Extension(AuthUser(member)), Path(team)).await.expect("stale items ok").0;
+
+        let ids: Vec<Option<&str>> = res.items.iter().map(|i| i.object_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("obj-open")]);
+        assert_eq!(res.hidden, 2, "a locked object and an orphan secret stay hidden from a non-admin");
+    }
+
+    #[tokio::test]
+    async fn stale_items_forbidden_for_non_member() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        let outsider = seed_user(&pool).await;
+
+        let res = get_stale_items(State(pool.clone()), Extension(AuthUser(outsider)), Path(team)).await;
 
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
     }

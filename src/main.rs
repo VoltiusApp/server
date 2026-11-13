@@ -660,6 +660,10 @@ async fn main() {
             get(routes::team_sync::get_rotation_status),
         )
         .route(
+            "/v1/teams/:team_id/vault-key/stale-items",
+            get(routes::team_sync::get_stale_items),
+        )
+        .route(
             "/v1/teams/:team_id/vault-key",
             put(routes::team_sync::put_vault_keys),
         )
