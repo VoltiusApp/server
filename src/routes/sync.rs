@@ -287,6 +287,7 @@ impl Drop for PresenceGuard {
 pub async fn sync_stream(
     State(pool): State<PgPool>,
     axum::Extension(auth): axum::Extension<AuthUser>,
+    axum::Extension(current): axum::Extension<crate::auth::CurrentSession>,
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::Extension(presence): axum::Extension<PresenceMap>,
     axum::Extension(usage): axum::Extension<UsageMap>,
@@ -312,7 +313,11 @@ pub async fn sync_stream(
 
     let rx = notifier.subscribe();
 
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+    let events = BroadcastStream::new(rx).take_while(move |msg| {
+        !matches!(msg, Ok(SyncEvent::LoginSessionsEnded { user_id: uid, ended }) if *uid == user_id && ended.covers(current.0))
+    });
+
+    let stream = events.filter_map(move |msg| {
         let _guard = &guard;
         match msg {
             Ok(SyncEvent::BlobPushed { user_id: uid, device_id }) if uid == user_id => {

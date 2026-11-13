@@ -7,6 +7,7 @@ mod features;
 mod handles;
 mod last_seen;
 mod lemonsqueezy;
+mod login_sessions;
 mod models;
 mod object_authz;
 mod observability;
@@ -426,7 +427,7 @@ async fn main() {
         .layer(middleware::from_fn(rate_limit::invite_rate_limit))
         .layer(Extension(invite_limiter))
         .layer(middleware::from_fn(features::require_team_invites))
-        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(pool.clone(), auth::auth_middleware))
         .layer(Extension(notifier.clone()));
 
     // Pro-gated sync routes (auth → rate limit → tier check)
@@ -436,7 +437,7 @@ async fn main() {
         .layer(middleware::from_fn(auth::require_pro))
         .layer(middleware::from_fn(rate_limit::sync_rate_limit))
         .layer(Extension(sync_limiter.clone()))
-        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(pool.clone(), auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(presence_map.clone()));
 
@@ -444,7 +445,7 @@ async fn main() {
     let teams_gated = Router::new()
         .route("/v1/teams", post(routes::teams::create_team))
         .layer(middleware::from_fn(auth::require_teams))
-        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(pool.clone(), auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(presence_map.clone()));
 
@@ -455,7 +456,7 @@ async fn main() {
             axum::routing::post(routes::audit::report_client_event),
         )
         .layer(Extension(audit_client_limiter))
-        .layer(middleware::from_fn(auth::auth_middleware));
+        .layer(middleware::from_fn_with_state(pool.clone(), auth::auth_middleware));
 
     // Protected routes — auth required + rate limited at 60/hour per IP
     let protected = Router::new()
@@ -464,6 +465,10 @@ async fn main() {
         .route("/v1/auth/email", put(routes::auth::update_email))
         .route("/v1/auth/password", put(routes::auth::update_password))
         .route("/v1/auth/logout-all", post(routes::auth::logout_all))
+        .route("/v1/auth/sessions", get(routes::auth::list_sessions))
+        .route("/v1/auth/sessions/revoke-others", post(routes::auth::logout_all))
+        .route("/v1/auth/sessions/revoke-all", post(routes::auth::logout_everywhere))
+        .route("/v1/auth/sessions/:id", delete(routes::auth::end_session))
         .route("/v1/auth/2fa/setup", post(routes::two_factor::setup))
         .route("/v1/auth/2fa/enable", post(routes::two_factor::enable))
         .route("/v1/auth/2fa/disable", post(routes::two_factor::disable))
@@ -819,7 +824,7 @@ async fn main() {
         .layer(Extension(grant_redeem_limiter))
         .layer(Extension(enrollment_redeem_limiter))
         .layer(Extension(resend_verification_limiter))
-        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(pool.clone(), auth::auth_middleware))
         .layer(Extension(notifier.clone()))
         .layer(Extension(terminal_manager.clone()))
         .layer(Extension(presence_map.clone()))

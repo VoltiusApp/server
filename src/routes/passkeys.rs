@@ -7,7 +7,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, CurrentSession};
 use crate::passkeys::{self, Begun, Ceremony, Finished, Handle, PasskeyInfo, Passkeys, ReturnTo};
 use crate::routes::auth::{pending_sign_in, require_auth_key};
 use crate::routes::two_factor::{conclude_addition, remove, Factor, FactorAdded, Removal, StepUpRequest};
@@ -110,6 +110,7 @@ pub struct Activated {
 pub async fn activate(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(current): Extension<CurrentSession>,
     Extension(notifier): Extension<SyncNotifier>,
     Json(body): Json<ActivateRequest>,
 ) -> Result<Json<Activated>, Refusal> {
@@ -119,19 +120,20 @@ pub async fn activate(
         .await
         .map_err(db_failure)?
         .ok_or(Refusal::Invalid)?;
-    let added = conclude_addition(&pool, &notifier, tx, auth.0, was_enabled).await?;
+    let added = conclude_addition(&pool, &notifier, tx, auth.0, current, was_enabled).await?;
     Ok(Json(Activated { passkey, added }))
 }
 
 pub async fn remove_passkey(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
+    Extension(current): Extension<CurrentSession>,
     Extension(cipher): Extension<SeedCipher>,
     Extension(notifier): Extension<SyncNotifier>,
     Path(passkey_id): Path<Uuid>,
     Json(body): Json<StepUpRequest>,
 ) -> Result<Json<Removal>, Refusal> {
-    remove(&pool, &cipher, &notifier, auth.0, &body, Factor::Passkey(passkey_id)).await
+    remove(&pool, &cipher, &notifier, auth.0, current, &body, Factor::Passkey(passkey_id)).await
 }
 
 #[cfg(test)]
@@ -234,6 +236,7 @@ mod tests {
         activate(
             State(pool.clone()),
             Extension(AuthUser(uid)),
+            Extension(CurrentSession::default()),
             Extension(SyncNotifier::new()),
             Json(ActivateRequest { passkey_code }),
         )
@@ -278,7 +281,7 @@ mod tests {
             State(pool.clone()),
             Extension(SeedCipher::for_tests()),
             Extension(Passkeys::for_tests()),
-            Json(LoginRequest { account_id, auth_key: AUTH_KEY.to_string() }),
+            Json(LoginRequest { account_id, auth_key: AUTH_KEY.to_string(), device: Default::default() }),
         )
         .await
         .expect("password accepted");
@@ -289,6 +292,7 @@ mod tests {
         remove_passkey(
             State(pool.clone()),
             Extension(AuthUser(uid)),
+            Extension(CurrentSession::default()),
             Extension(SeedCipher::for_tests()),
             Extension(SyncNotifier::new()),
             Path(passkey_id),
@@ -304,7 +308,7 @@ mod tests {
         let pool = test_pool_or_skip!();
         let account_id = Uuid::new_v4();
         let uid = seed_user_with_credentials(&pool, account_id, AUTH_KEY).await;
-        let before = create_refresh_token(uid, 0).unwrap();
+        let before = create_refresh_token(uid, 0, None).unwrap();
         let mut device = Device::new();
 
         let handle = open_registration(&pool, Passkeys::for_tests(), uid, SecondFactorProof::default())
@@ -319,6 +323,7 @@ mod tests {
             activate(
                 State(pool.clone()),
                 Extension(AuthUser(uid)),
+                Extension(CurrentSession::default()),
                 Extension(SyncNotifier::new()),
                 Json(ActivateRequest { passkey_code }),
             )
@@ -501,6 +506,7 @@ mod tests {
         let Json(without_totp) = remove_totp(
             State(pool.clone()),
             Extension(AuthUser(user.uid)),
+            Extension(CurrentSession::default()),
             Extension(SeedCipher::for_tests()),
             Extension(SyncNotifier::new()),
             Json(step_up_request(AUTH_KEY, proof)),

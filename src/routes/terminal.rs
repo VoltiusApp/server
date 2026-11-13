@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::auth::{jwt::validate_token, AuthClaims, AuthUser};
+use crate::auth::{AuthClaims, AuthUser};
 use crate::terminal_manager::{Participant, TerminalManager, BROADCAST_CAPACITY};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -1375,11 +1375,11 @@ pub async fn ws_handler(
     Extension(notifier): Extension<crate::sync_notifier::SyncNotifier>,
     Extension(drain): Extension<crate::shutdown::Drain>,
 ) -> impl IntoResponse {
-    let user_id = match validate_token(&query.token, "access") {
-        Ok(claims) => claims.sub,
-        Err(_) => {
-            warn!(session_id = %session_id, "WS upgrade rejected: invalid token");
-            return StatusCode::UNAUTHORIZED.into_response();
+    let (user_id, login_session) = match crate::auth::authenticate(&pool, &query.token).await {
+        Ok(claims) => (claims.sub, claims.sid),
+        Err(status) => {
+            warn!(session_id = %session_id, %status, "WS upgrade rejected: invalid token");
+            return status.into_response();
         }
     };
 
@@ -1390,6 +1390,7 @@ pub async fn ws_handler(
             socket,
             session_id,
             user_id,
+            login_session,
             handle,
             query.invite_token,
             pool,
@@ -1565,6 +1566,7 @@ async fn handle_socket(
     socket: WebSocket,
     session_id: Uuid,
     user_id: Uuid,
+    login_session: Option<Uuid>,
     handle: String,
     invite_token: Option<String>,
     pool: PgPool,
@@ -1678,12 +1680,19 @@ async fn handle_socket(
     let mut send_task = {
         let pool = pool.clone();
         let manager = manager.clone();
+        let signed_out = notifier.signed_out(user_id, login_session);
         tokio::spawn(async move {
             tokio::pin!(stopping);
+            tokio::pin!(signed_out);
             loop {
                 tokio::select! {
                     () = &mut stopping => {
                         end_socket(&mut ws_sender, SERVER_RESTART_FRAME, Some(axum::extract::ws::close_code::RESTART)).await;
+                        break;
+                    }
+                    () = &mut signed_out => {
+                        info!(session_id = %session_id, user_id = %user_id, "WS participant signed out");
+                        end_socket(&mut ws_sender, ACCESS_REVOKED_FRAME, None).await;
                         break;
                     }
                     Ok(()) = access_rx.changed() => {
@@ -1949,6 +1958,7 @@ mod authz_tests {
             jti: None,
             billing_tier: None,
             seat_team: None,
+            sid: None,
         })
     }
 
@@ -3910,7 +3920,7 @@ mod live_revoke_tests {
     }
 
     async fn try_connect_with(addr: std::net::SocketAddr, session_id: Uuid, user: Uuid, query: &str) -> Option<Client> {
-        let token = crate::auth::jwt::create_access_token(user, crate::auth::jwt::PlanClaims::own("business"), None, false, false, false, true).unwrap();
+        let token = crate::auth::jwt::create_access_token(user, crate::auth::jwt::PlanClaims::own("business"), None, false, false, false, true, None).unwrap();
         let url = format!("ws://{addr}/v1/terminal-sessions/{session_id}/ws?token={token}{query}");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         next_of_type(&mut ws, "participant_list").await.map(|_| ws)
