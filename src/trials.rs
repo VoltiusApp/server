@@ -295,6 +295,30 @@ pub async fn post_promo_event(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Downgrade lapsed trials to `free`: a non-free tier whose `trial_ends_at` has
+/// passed, with no paid subscription and no admin override, has consumed its
+/// trial and reverts. Records the end for the plan-ended promo and clears the
+/// trial seat cap on teams trials. Paid accounts carry `trial_ends_at = NULL`.
+pub async fn expire_lapsed_trials(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        r#"UPDATE users SET
+               subscription_tier = 'free',
+               trial_used = TRUE,
+               last_plan_ended_at = trial_ends_at,
+               last_plan_ended_kind = CASE WHEN subscription_tier = 'teams' THEN 'teams_trial' ELSE 'pro_trial' END,
+               seat_count = CASE WHEN subscription_tier = 'teams' THEN NULL ELSE seat_count END,
+               trial_ends_at = NULL
+           WHERE subscription_tier <> 'free'
+             AND trial_ends_at IS NOT NULL
+             AND trial_ends_at <= now()
+             AND ls_subscription_id IS NULL
+             AND admin_override = FALSE"#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +686,77 @@ mod tests {
         assert_eq!(pi.status, "past_due");
         crate::test_support::set_user_ls_status(&pool, u, "active").await;
         assert!(promos(&pool, u).await.payment_issue.is_none());
+    }
+
+    async fn expire_row(pool: &sqlx::PgPool, id: uuid::Uuid) -> (String, bool, Option<i32>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<String>) {
+        sqlx::query_as(
+            "SELECT subscription_tier, trial_used, seat_count, trial_ends_at, last_plan_ended_at, last_plan_ended_kind FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_lapsed(pool: &sqlx::PgPool, tier: &str, seats: Option<i32>) -> (uuid::Uuid, chrono::DateTime<chrono::Utc>) {
+        let u = seed_user(pool).await;
+        let ended = chrono::Utc::now() - chrono::Duration::days(2);
+        sqlx::query("UPDATE users SET subscription_tier = $1, seat_count = $2, trial_ends_at = $3 WHERE id = $4")
+            .bind(tier)
+            .bind(seats)
+            .bind(ended)
+            .bind(u)
+            .execute(pool)
+            .await
+            .unwrap();
+        (u, ended)
+    }
+
+    #[tokio::test]
+    async fn sweep_records_pro_trial_end() {
+        let pool = crate::test_pool_or_skip!();
+        let (u, ended) = seed_lapsed(&pool, "pro", None).await;
+        expire_lapsed_trials(&pool).await.unwrap();
+        let (tier, used, _, te, at, kind) = expire_row(&pool, u).await;
+        assert_eq!((tier.as_str(), used, te), ("free", true, None));
+        assert_eq!(at.unwrap().timestamp_micros(), ended.timestamp_micros());
+        assert_eq!(kind.as_deref(), Some("pro_trial"));
+    }
+
+    #[tokio::test]
+    async fn sweep_records_teams_trial_end_and_clears_seats() {
+        let pool = crate::test_pool_or_skip!();
+        let (u, ended) = seed_lapsed(&pool, "teams", Some(10)).await;
+        expire_lapsed_trials(&pool).await.unwrap();
+        let (tier, used, seats, te, at, kind) = expire_row(&pool, u).await;
+        assert_eq!((tier.as_str(), used, seats, te), ("free", true, None, None));
+        assert_eq!(at.unwrap().timestamp_micros(), ended.timestamp_micros());
+        assert_eq!(kind.as_deref(), Some("teams_trial"));
+    }
+
+    #[tokio::test]
+    async fn sweep_ignores_paid_and_comped() {
+        let pool = crate::test_pool_or_skip!();
+        let (paid, _) = seed_lapsed(&pool, "pro", None).await;
+        let (comped, _) = seed_lapsed(&pool, "teams", Some(10)).await;
+        sqlx::query("UPDATE users SET ls_subscription_id = $1 WHERE id = $2")
+            .bind(format!("sub_{paid}"))
+            .bind(paid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET admin_override = TRUE WHERE id = $1")
+            .bind(comped)
+            .execute(&pool)
+            .await
+            .unwrap();
+        expire_lapsed_trials(&pool).await.unwrap();
+        for (u, tier) in [(paid, "pro"), (comped, "teams")] {
+            let (t, used, _, te, at, kind) = expire_row(&pool, u).await;
+            assert_eq!(t, tier);
+            assert!(!used);
+            assert!(te.is_some());
+            assert!(at.is_none() && kind.is_none());
+        }
     }
 }

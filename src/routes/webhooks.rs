@@ -392,7 +392,9 @@ async fn handle_subscription_expired(
             subscription_cancelled = FALSE,
             subscription_renews_at = NULL,
             subscription_ends_at = COALESCE(subscription_ends_at, NOW()),
-            trial_used = TRUE
+            trial_used = TRUE,
+            last_plan_ended_at = now(),
+            last_plan_ended_kind = 'subscription'
          WHERE ls_subscription_id = $1 AND admin_override = FALSE",
     )
     .bind(ls_subscription_id)
@@ -521,5 +523,31 @@ mod tests {
         assert_eq!(tier_for_subscription_update(&subscription), "free");
 
         std::env::remove_var("LS_VARIANT_PRO_MONTHLY");
+    }
+
+    #[tokio::test]
+    async fn expired_webhook_records_subscription_end() {
+        let pool = crate::test_pool_or_skip!();
+        let u = crate::test_support::seed_user(&pool).await;
+        let sub = format!("sub_{u}");
+        sqlx::query("UPDATE users SET subscription_tier = 'pro', ls_subscription_id = $1 WHERE id = $2")
+            .bind(&sub)
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let payload = json!({ "data": { "id": sub } });
+        let status = handle_subscription_expired(&pool, &SyncNotifier::new(), &payload).await;
+        assert_eq!(status, StatusCode::OK);
+        let (tier, kind, at_recent): (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT subscription_tier, last_plan_ended_kind, COALESCE(last_plan_ended_at > now() - interval '1 minute', FALSE) FROM users WHERE id = $1",
+        )
+        .bind(u)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tier, "free");
+        assert_eq!(kind.as_deref(), Some("subscription"));
+        assert!(at_recent);
     }
 }
