@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::routes::audit::write_audit_event;
+use crate::routes::ApiError;
 use crate::routes::teams::notify_team_members_changed;
 use crate::sync_notifier::SyncNotifier;
 
@@ -15,6 +16,7 @@ use crate::sync_notifier::SyncNotifier;
 #[derive(Serialize)]
 pub struct InvitationDetails {
     pub team_name: String,
+    pub email: String,
     pub inviter_display_name: String,
     pub role: String,
     pub expires_at: i64,
@@ -24,8 +26,8 @@ pub async fn get_invitation(
     State(pool): State<PgPool>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<Json<InvitationDetails>, StatusCode> {
-    let row = sqlx::query_as::<_, (String, Option<String>, String, chrono::DateTime<chrono::Utc>)>(
-        r#"SELECT t.name, u.handle, pi.role, pi.expires_at
+    let row = sqlx::query_as::<_, (String, String, Option<String>, String, chrono::DateTime<chrono::Utc>)>(
+        r#"SELECT t.name, pi.email, u.handle, pi.role, pi.expires_at
            FROM pending_invitations pi
            JOIN teams t ON t.id = pi.team_id
            LEFT JOIN users u ON u.id = pi.invited_by
@@ -44,9 +46,10 @@ pub async fn get_invitation(
 
     Ok(Json(InvitationDetails {
         team_name: row.0,
-        inviter_display_name: row.1.unwrap_or_else(|| "A teammate".to_string()),
-        role: row.2,
-        expires_at: row.3.timestamp(),
+        email: row.1,
+        inviter_display_name: row.2.unwrap_or_else(|| "A teammate".to_string()),
+        role: row.3,
+        expires_at: row.4.timestamp(),
     }))
 }
 
@@ -124,15 +127,8 @@ pub(crate) struct PendingInvitation {
 
 pub(crate) const PENDING_INVITATION_COLUMNS: &str = "id, team_id, email, role, role_ids, invited_by, member_name";
 
-/// Every acceptance path ends here, so none can skip the audit row or the team fan-out.
-pub(crate) async fn accept_pending_invitation(
-    pool: &PgPool,
-    notifier: &SyncNotifier,
-    invitation: &PendingInvitation,
-    user_id: Uuid,
-    user_email: Option<String>,
-    via: &str,
-) -> Result<(), StatusCode> {
+/// GONE when the sender left or lost the authority the invitation was sent with.
+async fn require_sender_still_entitled(pool: &PgPool, invitation: &PendingInvitation) -> Result<(), StatusCode> {
     let inviter = invitation.invited_by.ok_or(StatusCode::GONE)?;
     crate::routes::teams::require_inviter_still_entitled(pool, invitation.team_id, inviter, &invitation.role, &invitation.role_ids)
         .await
@@ -142,7 +138,51 @@ pub(crate) async fn accept_pending_invitation(
             }
             warn!(invitation_id = %invitation.id, inviter = %inviter, ?status, "Invitation outlived its sender's authority");
             StatusCode::GONE
-        })?;
+        })
+}
+
+async fn find_live_invitation(pool: &PgPool, token: &str) -> Result<Option<PendingInvitation>, StatusCode> {
+    sqlx::query_as::<_, PendingInvitation>(&format!(
+        "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
+         WHERE token = $1 AND accepted_at IS NULL AND expires_at > now()"
+    ))
+    .bind(token)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to fetch invitation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+fn addressed_to(invitation: &PendingInvitation, email: &str) -> bool {
+    crate::email::normalize(&invitation.email) == crate::email::normalize(email)
+}
+
+/// Whether this invitation lets `email` create an account while public registration is closed.
+pub(crate) async fn invitation_admits(pool: &PgPool, token: &str, email: &str) -> Result<(), ApiError> {
+    let invitation = find_live_invitation(pool, token)
+        .await?
+        .ok_or(ApiError::coded(StatusCode::NOT_FOUND, "INVITATION_NOT_FOUND"))?;
+    if !addressed_to(&invitation, email) {
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "INVITATION_EMAIL_MISMATCH"));
+    }
+    require_sender_still_entitled(pool, &invitation).await.map_err(|status| match status {
+        StatusCode::GONE => ApiError::coded(StatusCode::GONE, "INVITATION_WITHDRAWN"),
+        other => other.into(),
+    })
+}
+
+/// Every acceptance path ends here, so none can skip the audit row or the team fan-out.
+pub(crate) async fn accept_pending_invitation(
+    pool: &PgPool,
+    notifier: &SyncNotifier,
+    invitation: &PendingInvitation,
+    user_id: Uuid,
+    user_email: Option<String>,
+    via: &str,
+) -> Result<(), StatusCode> {
+    require_sender_still_entitled(pool, invitation).await?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for invitation acceptance");
@@ -223,18 +263,7 @@ pub async fn accept_invitation(
     axum::Extension(notifier): axum::Extension<SyncNotifier>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let invitation = sqlx::query_as::<_, PendingInvitation>(&format!(
-        "SELECT {PENDING_INVITATION_COLUMNS} FROM pending_invitations
-         WHERE token = $1 AND accepted_at IS NULL AND expires_at > now()"
-    ))
-    .bind(&token)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch invitation for acceptance");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
+    let invitation = find_live_invitation(&pool, &token).await?.ok_or_else(|| {
         warn!("Invitation not found or expired: {token}");
         StatusCode::NOT_FOUND
     })?;
@@ -248,7 +277,7 @@ pub async fn accept_invitation(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    if user_email.to_lowercase() != invitation.email.to_lowercase() {
+    if !addressed_to(&invitation, &user_email) {
         warn!(
             user_id = %auth.0,
             user_email = %user_email,
