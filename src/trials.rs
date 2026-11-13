@@ -40,11 +40,20 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query(RELAUNCH_SQL).execute(&pool).await.unwrap();
+        sqlx::query(&format!("{RELAUNCH_SQL} AND id = ANY($1)"))
+            .bind(vec![free, paid, admin, banned])
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(flags(&pool, free).await, (true, true));
         assert_eq!(flags(&pool, paid).await, (false, false));
         assert_eq!(flags(&pool, admin).await, (false, false));
         assert_eq!(flags(&pool, banned).await, (false, false));
+    }
+
+    #[test]
+    fn relaunch_sql_matches_migration() {
+        assert!(include_str!("../migrations/075_trial_activation.sql").contains(RELAUNCH_SQL));
     }
 }
