@@ -1384,6 +1384,93 @@ mod tests {
         assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "REGISTRATION_DISABLED" })));
     }
 
+    async fn invited_team(pool: &PgPool, email: &str) -> (Uuid, String) {
+        let owner = seed_user(pool).await;
+        let team = seed_team_with_roles(pool, owner).await;
+        let (_, token) = crate::test_support::seed_invitation(pool, team, email, "member", None).await;
+        (team, token)
+    }
+
+    impl SignupApp {
+        async fn register_invited(&self, ip: &str, email: &str, invitation: &str) -> (StatusCode, serde_json::Value) {
+            let body = json!({ "email": email, "account_id": Uuid::new_v4(), "auth_key": "auth-key-secret", "public_key": "pk", "invitation": invitation });
+            self.post("/v1/auth/register", ip, body).await
+        }
+
+        async fn is_member(&self, team: Uuid, email: &str) -> bool {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id = $1 AND u.email = $2)",
+            )
+            .bind(team)
+            .bind(email)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_opens_closed_registration_and_joins_the_team() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 5);
+        let email = fresh_email("invitee.test");
+        let (team, token) = invited_team(&pool, &email).await;
+        let (status, _) = app.register_invited("10.0.4.1", &email.to_uppercase(), &token).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(app.is_member(team, &email).await);
+    }
+
+    #[tokio::test]
+    async fn invitation_only_opens_registration_for_its_own_address() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 5);
+        let (_, token) = invited_team(&pool, &fresh_email("invitee.test")).await;
+        let other = fresh_email("invitee.test");
+        let (status, value) = app.register_invited("10.0.4.2", &other, &token).await;
+        assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "INVITATION_EMAIL_MISMATCH" })));
+        assert!(!app.user_exists(&other).await);
+    }
+
+    #[tokio::test]
+    async fn unknown_or_withdrawn_invitation_creates_no_user() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { registration: false, ..Features::open() }, 5);
+        let email = fresh_email("invitee.test");
+        let (status, value) = app.register_invited("10.0.4.3", &email, "no-such-token").await;
+        assert_eq!((status, value), (StatusCode::NOT_FOUND, json!({ "error": "INVITATION_NOT_FOUND" })));
+
+        let (_, token) = invited_team(&pool, &email).await;
+        sqlx::query("UPDATE pending_invitations SET invited_by = NULL WHERE token = $1").bind(&token).execute(&pool).await.unwrap();
+        let (status, value) = app.register_invited("10.0.4.3", &email, &token).await;
+        assert_eq!((status, value), (StatusCode::GONE, json!({ "error": "INVITATION_WITHDRAWN" })));
+        assert!(!app.user_exists(&email).await);
+    }
+
+    #[tokio::test]
+    async fn invitation_is_ignored_when_team_invites_are_off() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features { team_invites: false, registration: false, ..Features::open() }, 5);
+        let email = fresh_email("invitee.test");
+        let (_, token) = invited_team(&pool, &email).await;
+        let (status, value) = app.register_invited("10.0.4.4", &email, &token).await;
+        assert_eq!((status, value), (StatusCode::FORBIDDEN, json!({ "error": "REGISTRATION_DISABLED" })));
+    }
+
+    #[tokio::test]
+    async fn bad_invitations_count_against_the_ip_limit() {
+        let _billing = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let app = signup_app(&pool, Features::open(), 5);
+        for _ in 0..5 {
+            assert_eq!(app.register_invited("10.0.4.5", &fresh_email("x.test"), "nope").await.0, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(app.register("10.0.4.5", &fresh_email("x.test"), None).await.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
     #[tokio::test]
     async fn malformed_body_hits_the_registration_gate_first() {
         let _billing = BillingMode::self_hosted();

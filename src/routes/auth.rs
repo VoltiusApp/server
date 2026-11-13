@@ -28,7 +28,7 @@ use crate::routes::team_enrollment::{load_live_token, EnrollmentCredential};
 use crate::routes::ApiError;
 use crate::email::{send_password_changed_email, send_verification_email};
 use crate::routes::email_undeliverable_response;
-use crate::routes::invitations::{accept_pending_invitation, PendingInvitation, PENDING_INVITATION_COLUMNS};
+use crate::routes::invitations::{accept_pending_invitation, invitation_admits, PendingInvitation, PENDING_INVITATION_COLUMNS};
 use crate::self_host;
 use crate::sync_notifier::{EndedSessions, SyncNotifier};
 use crate::passkeys::Passkeys;
@@ -309,6 +309,9 @@ pub struct RegisterRequest {
     pub machine_fingerprint: Option<String>,
     #[serde(default)]
     pub enrollment: Option<EnrollmentCredential>,
+    /// An emailed invitation's token: opens registration to the invited address only.
+    #[serde(default)]
+    pub invitation: Option<String>,
     #[serde(default)]
     pub device: Device,
 }
@@ -451,7 +454,16 @@ pub async fn register(
             }
         },
         None => {
-            charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?;
+            match body.invitation.as_deref().filter(|_| features.team_invites) {
+                Some(invitation) => {
+                    if let Err(err) = invitation_admits(&pool, invitation, &body.email).await {
+                        check_budget(&resolve_limiter, ip, "invitation_resolve").await?;
+                        charge_ip_gates(&auth_limiter, &register_limiter, ip).await?;
+                        return Err(err);
+                    }
+                }
+                None => charge_untokened_gates(&features, &auth_limiter, &register_limiter, ip).await?,
+            }
             None
         }
     };
@@ -1331,6 +1343,7 @@ mod handler_tests {
             wrapped_user_secrets: None,
             machine_fingerprint: fp.map(str::to_string),
             enrollment: None,
+            invitation: None,
             device: Device::default(),
         }
     }
