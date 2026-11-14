@@ -65,6 +65,7 @@ fn tier_rank(tier: &str) -> u8 {
 type ActivationRow = (bool, String, Option<DateTime<Utc>>, bool, bool, bool, bool);
 
 /// Starts the card-free 14-day trial of `pro` or `teams`.
+#[allow(clippy::result_large_err)]
 pub async fn activate_trial(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -212,6 +213,7 @@ type SeenRow = (String, String, Option<DateTime<Utc>>, DateTime<Utc>);
 type PromoUserRow = (bool, bool, bool, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>);
 
 /// Everything the client needs to decide which promo to show.
+#[allow(clippy::result_large_err)]
 pub async fn get_promos(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -283,6 +285,7 @@ pub async fn get_promos(
 }
 
 /// Records a promo interaction; `shown` is idempotent per promo and occurrence.
+#[allow(clippy::result_large_err)]
 pub async fn post_promo_event(
     State(pool): State<PgPool>,
     Extension(auth): Extension<AuthUser>,
@@ -453,6 +456,7 @@ mod tests {
         u
     }
 
+    #[allow(clippy::result_large_err)]
     async fn activate(
         pool: &sqlx::PgPool,
         u: uuid::Uuid,
@@ -631,6 +635,7 @@ mod tests {
         s
     }
 
+    #[allow(clippy::result_large_err)]
     async fn post_event(
         pool: &sqlx::PgPool,
         u: uuid::Uuid,
