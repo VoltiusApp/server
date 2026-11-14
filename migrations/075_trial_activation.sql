@@ -22,4 +22,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_events_shown_once
     WHERE event = 'shown';
 
 -- Relaunch: offer both trials to every unpaid, active account.
-UPDATE users SET pro_trial_available = TRUE, teams_trial_available = TRUE WHERE deleted_at IS NULL AND is_banned = FALSE AND ls_subscription_id IS NULL AND admin_override = FALSE;
+UPDATE users SET pro_trial_available = TRUE, teams_trial_available = TRUE WHERE deleted_at IS NULL AND is_banned = FALSE AND ls_subscription_id IS NULL AND admin_override = FALSE AND (subscription_tier = 'free' OR trial_ends_at IS NOT NULL);

@@ -31,7 +31,7 @@ pub(crate) fn initial_plan(self_hosted: bool, trial_blocked: bool, supports_acti
 
 /// Relaunch statement; must stay identical to the UPDATE in migrations/075_trial_activation.sql.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const RELAUNCH_SQL: &str = "UPDATE users SET pro_trial_available = TRUE, teams_trial_available = TRUE WHERE deleted_at IS NULL AND is_banned = FALSE AND ls_subscription_id IS NULL AND admin_override = FALSE";
+pub(crate) const RELAUNCH_SQL: &str = "UPDATE users SET pro_trial_available = TRUE, teams_trial_available = TRUE WHERE deleted_at IS NULL AND is_banned = FALSE AND ls_subscription_id IS NULL AND admin_override = FALSE AND (subscription_tier = 'free' OR trial_ends_at IS NOT NULL)";
 
 #[derive(Deserialize)]
 pub struct ActivateTrialRequest {
@@ -368,6 +368,25 @@ mod tests {
         assert_eq!(flags(&pool, paid).await, (false, false));
         assert_eq!(flags(&pool, admin).await, (false, false));
         assert_eq!(flags(&pool, banned).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn relaunch_skips_manual_grants_without_override() {
+        let pool = crate::test_pool_or_skip!();
+        let manual = seed_user(&pool).await;
+        let trialing = seed_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, manual, "business").await;
+        crate::test_support::set_user_tier(&pool, trialing, "pro").await;
+        crate::test_support::set_user_trial(&pool, trialing, 7).await;
+
+        sqlx::query(&format!("{RELAUNCH_SQL} AND id = ANY($1)"))
+            .bind(vec![manual, trialing])
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(flags(&pool, manual).await, (false, false));
+        assert_eq!(flags(&pool, trialing).await, (true, true));
     }
 
     #[test]
