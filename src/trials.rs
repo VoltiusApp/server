@@ -823,15 +823,18 @@ mod tests {
     #[tokio::test]
     async fn sweep_ignores_paid_and_comped() {
         let pool = crate::test_pool_or_skip!();
-        let (paid, _) = seed_lapsed(&pool, "pro", None).await;
-        let (comped, _) = seed_lapsed(&pool, "teams", Some(10)).await;
-        sqlx::query("UPDATE users SET ls_subscription_id = $1 WHERE id = $2")
+        let ended = chrono::Utc::now() - chrono::Duration::days(2);
+        let paid = seed_user(&pool).await;
+        sqlx::query("UPDATE users SET subscription_tier = 'pro', trial_ends_at = $1, ls_subscription_id = $2 WHERE id = $3")
+            .bind(ended)
             .bind(format!("sub_{paid}"))
             .bind(paid)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE users SET admin_override = TRUE WHERE id = $1")
+        let comped = seed_user(&pool).await;
+        sqlx::query("UPDATE users SET subscription_tier = 'teams', seat_count = 10, trial_ends_at = $1, admin_override = TRUE WHERE id = $2")
+            .bind(ended)
             .bind(comped)
             .execute(&pool)
             .await
