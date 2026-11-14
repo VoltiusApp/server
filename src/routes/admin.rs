@@ -621,6 +621,8 @@ pub struct UserDetail {
     email_verified_at: Option<DateTime<Utc>>,
     /// Set by the Resend webhook when mail to the address bounced.
     email_undeliverable_at: Option<DateTime<Utc>>,
+    pro_trial_available: bool,
+    teams_trial_available: bool,
 }
 
 pub async fn get_user(
@@ -634,6 +636,7 @@ pub async fn get_user(
                ls_customer_id, ls_subscription_id, admin_override, created_at, seat_count,
                last_seen_on, deleted_at, deletion_reason, deleted_by,
                email_verified, email_verified_at, email_undeliverable_at,
+               pro_trial_available, teams_trial_available,
                {} AS two_factor_enabled
         FROM users WHERE id = $1
         "#,
@@ -668,6 +671,9 @@ pub struct PatchUserRequest {
     /// accounts. It also clears `email_undeliverable_at`: that flag only means
     /// something for an unverified address. `false` reverts to unverified.
     email_verified: Option<bool>,
+    /// Grants or revokes the one-click 14-day trial offers shown in the app.
+    pro_trial_available: Option<bool>,
+    teams_trial_available: Option<bool>,
 }
 
 pub async fn patch_user(
@@ -742,6 +748,8 @@ pub async fn patch_user(
                 WHEN $10::boolean = TRUE THEN NULL
                 ELSE email_undeliverable_at
             END,
+            pro_trial_available = COALESCE($11::boolean, pro_trial_available),
+            teams_trial_available = COALESCE($12::boolean, teams_trial_available),
             updated_at = CASE WHEN $10::boolean IS NOT NULL THEN now() ELSE updated_at END
         WHERE id = $7
         "#,
@@ -756,6 +764,8 @@ pub async fn patch_user(
     .bind(body.admin_override)
     .bind(body.seat_count)
     .bind(body.email_verified)
+    .bind(body.pro_trial_available)
+    .bind(body.teams_trial_available)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -775,6 +785,8 @@ pub async fn patch_user(
             "discount_pct": body.discount_pct,
             "admin_override": body.admin_override,
             "email_verified": body.email_verified,
+            "pro_trial_available": body.pro_trial_available,
+            "teams_trial_available": body.teams_trial_available,
             "old_tier": old_tier,
         }),
     )
@@ -1613,6 +1625,8 @@ mod admin_handler_tests {
             admin_override: None,
             seat_count: None,
             email_verified: None,
+            pro_trial_available: None,
+            teams_trial_available: None,
         }
     }
 
@@ -1908,6 +1922,83 @@ mod admin_handler_tests {
         let (verified, verified_at, _) = email_verification_of(&pool, user).await;
         assert!(!verified);
         assert!(verified_at.is_none());
+    }
+
+    async fn trial_offers_of(pool: &PgPool, id: Uuid) -> (bool, bool) {
+        sqlx::query_as::<_, (bool, bool)>(
+            "SELECT pro_trial_available, teams_trial_available FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn patch_offers(pool: &PgPool, id: Uuid, pro: Option<bool>, teams: Option<bool>) {
+        let status = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(id),
+            Json(PatchUserRequest {
+                pro_trial_available: pro,
+                teams_trial_available: teams,
+                ..patch_defaults()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn patch_user_grants_and_revokes_trial_offers() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        assert_eq!(trial_offers_of(&pool, user).await, (false, false));
+
+        patch_offers(&pool, user, Some(true), Some(true)).await;
+        assert_eq!(trial_offers_of(&pool, user).await, (true, true));
+
+        let detail = get_user(State(pool.clone()), Path(user)).await.expect("get user").0;
+        let body = serde_json::to_value(&detail).expect("serialize detail");
+        assert_eq!(body["pro_trial_available"], json!(true));
+        assert_eq!(body["teams_trial_available"], json!(true));
+
+        let audit: Value = sqlx::query_scalar(
+            "SELECT detail FROM admin_audit_log WHERE target_id = $1 AND action = 'patch_user'",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit["pro_trial_available"], json!(true));
+        assert_eq!(audit["teams_trial_available"], json!(true));
+
+        patch_offers(&pool, user, Some(false), None).await;
+        assert_eq!(trial_offers_of(&pool, user).await, (false, true));
+    }
+
+    #[tokio::test]
+    async fn patch_user_without_trial_offers_leaves_them_alone() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        patch_offers(&pool, user, Some(true), Some(true)).await;
+
+        let res = patch_user(
+            State(pool.clone()),
+            admin(),
+            notifier(),
+            Path(user),
+            Json(PatchUserRequest {
+                seat_count: Some(4),
+                ..patch_defaults()
+            }),
+        )
+        .await;
+
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(trial_offers_of(&pool, user).await, (true, true));
     }
 
     #[tokio::test]
