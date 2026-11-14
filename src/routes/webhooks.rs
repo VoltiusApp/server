@@ -176,7 +176,9 @@ async fn handle_subscription_created(
                 subscription_renews_at = $8,
                 subscription_ends_at = $9,
                 trial_used = TRUE,
-                trial_ends_at = NULL
+                trial_ends_at = NULL,
+                pro_trial_available = FALSE,
+                teams_trial_available = FALSE
              WHERE id = $10",
         )
         .bind(tier)
@@ -210,7 +212,9 @@ async fn handle_subscription_created(
                 subscription_renews_at = $8,
                 subscription_ends_at = $9,
                 trial_used = TRUE,
-                trial_ends_at = NULL
+                trial_ends_at = NULL,
+                pro_trial_available = FALSE,
+                teams_trial_available = FALSE
              WHERE email = $10",
         )
         .bind(tier)
@@ -523,6 +527,42 @@ mod tests {
         assert_eq!(tier_for_subscription_update(&subscription), "free");
 
         std::env::remove_var("LS_VARIANT_PRO_MONTHLY");
+    }
+
+    #[tokio::test]
+    async fn created_webhook_clears_trial_offers() {
+        let pool = crate::test_pool_or_skip!();
+        let _env = crate::test_support::EnvLockGuard(crate::test_support::env_lock());
+        std::env::set_var("LS_VARIANT_TEAMS_MONTHLY", "201");
+        let u = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET pro_trial_available = TRUE, teams_trial_available = TRUE WHERE id = $1")
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let payload = json!({
+            "meta": { "custom_data": { "user_id": u.to_string() } },
+            "data": {
+                "id": format!("sub_{u}"),
+                "attributes": {
+                    "variant_id": 201,
+                    "status": "active",
+                    "user_email": "nobody@example.invalid",
+                    "first_subscription_item": { "quantity": 3 }
+                }
+            }
+        });
+        let status = handle_subscription_created(&pool, &SyncNotifier::new(), &payload).await;
+        std::env::remove_var("LS_VARIANT_TEAMS_MONTHLY");
+        assert_eq!(status, StatusCode::OK);
+        let row: (String, bool, bool) = sqlx::query_as(
+            "SELECT subscription_tier, pro_trial_available, teams_trial_available FROM users WHERE id = $1",
+        )
+        .bind(u)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("teams".to_string(), false, false));
     }
 
     #[tokio::test]

@@ -68,6 +68,7 @@ pub struct TierBreakdown {
     pro: i64,
     pro_trial: i64,
     teams: i64,
+    teams_trial: i64,
     business: i64,
 }
 
@@ -140,69 +141,78 @@ pub struct RecentChurnRow {
 }
 
 // Monthly price per paying unit. teams/business are per-seat; pro is per-user.
+// Card-free trials (no LemonSqueezy subscription, trial end set) never count as paying.
 const PRICE_PRO: i64 = 7;
 const PRICE_TEAMS_PER_SEAT: i64 = 15;
 const PRICE_BUSINESS_PER_SEAT: i64 = 49;
 
-pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewResponse>, StatusCode> {
-    // ── Headline counts ──────────────────────────────────────────────────────
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, i64, Option<f64>)>(
+#[derive(sqlx::FromRow)]
+struct BillingCounts {
+    total: i64,
+    free: i64,
+    pro: i64,
+    paid_pro: i64,
+    teams: i64,
+    teams_trial: i64,
+    business: i64,
+    trials_active: i64,
+    trials_expiring_7d: i64,
+    deleted_pending: i64,
+    teams_seats: i64,
+    business_seats: i64,
+}
+
+impl BillingCounts {
+    fn mrr(&self) -> (i64, i64, i64) {
+        (
+            self.paid_pro * PRICE_PRO,
+            self.teams_seats * PRICE_TEAMS_PER_SEAT,
+            self.business_seats * PRICE_BUSINESS_PER_SEAT,
+        )
+    }
+
+    fn paying(&self) -> i64 {
+        self.paid_pro + self.teams + self.business
+    }
+}
+
+async fn billing_counts(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<BillingCounts, sqlx::Error> {
+    sqlx::query_as::<_, BillingCounts>(
         r#"
         SELECT
-            COUNT(*) FILTER (WHERE deleted_at IS NULL),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'free'),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro'),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams'),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'business'),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now()),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now() AND trial_ends_at < now() + interval '7 days'),
-            COUNT(*) FILTER (WHERE deleted_at IS NOT NULL),
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro' AND (trial_ends_at IS NULL OR trial_ends_at <= now())),
-            NULL::float8
+            COUNT(*) FILTER (WHERE deleted_at IS NULL) AS total,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'free') AS free,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro') AS pro,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro' AND (trial_ends_at IS NULL OR trial_ends_at <= now())) AS paid_pro,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams' AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)) AS teams,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams' AND ls_subscription_id IS NULL AND trial_ends_at IS NOT NULL) AS teams_trial,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'business' AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)) AS business,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now()) AS trials_active,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now() AND trial_ends_at < now() + interval '7 days') AS trials_expiring_7d,
+            COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted_pending,
+            COALESCE(SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)), 0)::bigint AS teams_seats,
+            COALESCE(SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)), 0)::bigint AS business_seats
         FROM users
+        WHERE $1::uuid[] IS NULL OR id = ANY($1)
         "#,
     )
-    .fetch_one(&pool)
+    .bind(only)
+    .fetch_one(pool)
     .await
-    .map_err(|e| {
+}
+
+pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewResponse>, StatusCode> {
+    let counts = billing_counts(&pool, None).await.map_err(|e| {
         error!(error = %e, "overview: counts failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    let total_users = row.0;
-    let free_users = row.1;
-    let pro_users = row.2;
-    let teams_users = row.3;
-    let business_users = row.4;
-    let trials_active = row.5;
-    let trials_expiring_7d = row.6;
-    let deleted_pending = row.7;
-    let paid_pro_users = row.8;
-
-    // ── MRR (seat-aware for teams/business) ──────────────────────────────────
-    let seat_row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
-        r#"
-        SELECT
-            SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL),
-            SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL)
-        FROM users
-        "#,
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "overview: seat sums failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let teams_seats = seat_row.0.unwrap_or(0);
-    let business_seats = seat_row.1.unwrap_or(0);
-
-    let mrr_pro = pro_users * PRICE_PRO;
-    let mrr_teams = teams_seats * PRICE_TEAMS_PER_SEAT;
-    let mrr_business = business_seats * PRICE_BUSINESS_PER_SEAT;
+    let total_users = counts.total;
+    let trials_active = counts.trials_active;
+    let trials_expiring_7d = counts.trials_expiring_7d;
+    let deleted_pending = counts.deleted_pending;
+    let (mrr_pro, mrr_teams, mrr_business) = counts.mrr();
     let mrr_total = mrr_pro + mrr_teams + mrr_business;
-    let paying_subscribers = paid_pro_users + teams_users + business_users;
+    let paying_subscribers = counts.paying();
 
     // ── Recent windows ───────────────────────────────────────────────────────
     let (signups_7d, signups_30d): (i64, i64) = sqlx::query_as(
@@ -392,11 +402,12 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         active_30d: activity.active_30d,
         never_seen: activity.never_seen,
         tier_breakdown: TierBreakdown {
-            free: free_users,
-            pro: paid_pro_users,
-            pro_trial: pro_users - paid_pro_users,
-            teams: teams_users,
-            business: business_users,
+            free: counts.free,
+            pro: counts.paid_pro,
+            pro_trial: counts.pro - counts.paid_pro,
+            teams: counts.teams,
+            teams_trial: counts.teams_trial,
+            business: counts.business,
         },
         signups_series,
         churn_series,
@@ -2572,6 +2583,45 @@ mod admin_handler_tests {
         assert_eq!(rows[0].reason, "conflict");
         assert_eq!(handle_of(&pool, id).await, current);
         assert!(set_handle_audits(&pool, id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overview_excludes_card_free_teams_trials() {
+        let pool = test_pool_or_skip!();
+        let set = |u: Uuid, tier: &'static str, seats: i32, trial_days: Option<i64>, sub: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE users SET subscription_tier = $1, seat_count = $2, \
+                     trial_ends_at = CASE WHEN $3::bigint IS NULL THEN NULL ELSE now() + ($3 * interval '1 day') END, \
+                     ls_subscription_id = CASE WHEN $4 THEN 'sub_' || id::text END WHERE id = $5",
+                )
+                .bind(tier)
+                .bind(seats)
+                .bind(trial_days)
+                .bind(sub)
+                .bind(u)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let (trial, paid, manual, biz_trial, pro_trial) = (
+            seed_user(&pool).await,
+            seed_user(&pool).await,
+            seed_user(&pool).await,
+            seed_user(&pool).await,
+            seed_user(&pool).await,
+        );
+        set(trial, "teams", 10, Some(10), false).await;
+        set(paid, "teams", 3, None, true).await;
+        set(manual, "teams", 5, None, false).await;
+        set(biz_trial, "business", 4, Some(10), false).await;
+        set(pro_trial, "pro", 1, Some(5), false).await;
+        let c = billing_counts(&pool, Some(vec![trial, paid, manual, biz_trial, pro_trial])).await.unwrap();
+        assert_eq!((c.teams, c.teams_trial, c.business), (2, 1, 0));
+        assert_eq!(c.paying(), 2);
+        assert_eq!(c.mrr(), (0, 8 * PRICE_TEAMS_PER_SEAT, 0));
     }
 
     #[tokio::test]

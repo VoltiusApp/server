@@ -33,6 +33,13 @@ pub(crate) fn initial_plan(self_hosted: bool, trial_blocked: bool, supports_acti
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const RELAUNCH_SQL: &str = "UPDATE users SET pro_trial_available = TRUE, teams_trial_available = TRUE WHERE deleted_at IS NULL AND is_banned = FALSE AND ls_subscription_id IS NULL AND admin_override = FALSE AND (subscription_tier = 'free' OR trial_ends_at IS NOT NULL)";
 
+/// Accounts that may still take a trial offer: not paying, not comped and not on a plan granted by hand.
+macro_rules! offer_eligible {
+    () => {
+        "ls_subscription_id IS NULL AND admin_override = FALSE AND NOT (subscription_tier <> 'free' AND trial_ends_at IS NULL)"
+    };
+}
+
 #[derive(Deserialize)]
 pub struct ActivateTrialRequest {
     pub plan: String,
@@ -55,7 +62,7 @@ fn tier_rank(tier: &str) -> u8 {
     }
 }
 
-type ActivationRow = (bool, String, Option<DateTime<Utc>>, bool, Option<String>, bool, bool);
+type ActivationRow = (bool, String, Option<DateTime<Utc>>, bool, bool, bool, bool);
 
 /// Starts the card-free 14-day trial of `pro` or `teams`.
 pub async fn activate_trial(
@@ -75,34 +82,44 @@ pub async fn activate_trial(
         coded_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
     };
 
-    let row: ActivationRow = sqlx::query_as(
-        "SELECT email_verified, subscription_tier, trial_ends_at, admin_override, ls_subscription_id, \
-         pro_trial_available, teams_trial_available FROM users WHERE id = $1 AND deleted_at IS NULL",
-    )
+    let row: ActivationRow = sqlx::query_as(concat!(
+        "SELECT email_verified, subscription_tier, trial_ends_at, admin_override, ls_subscription_id IS NOT NULL, \
+         pro_trial_available AND ",
+        offer_eligible!(),
+        ", teams_trial_available AND ",
+        offer_eligible!(),
+        " FROM users WHERE id = $1 AND deleted_at IS NULL",
+    ))
     .bind(auth.0)
     .fetch_one(&pool)
     .await
     .map_err(internal)?;
-    let (verified, stored_tier, stored_ends, admin_override, ls_sub, pro_flag, teams_flag) = row;
+    let (verified, stored_tier, stored_ends, admin_override, has_sub, pro_offer, teams_offer) = row;
     if !verified {
         return Err(email_not_verified_response());
     }
-    let flag = if plan == "pro" { pro_flag } else { teams_flag };
-    let effective = effective_tier(&stored_tier, stored_ends, ls_sub.is_some(), admin_override, Utc::now());
-    if !flag || ls_sub.is_some() || admin_override || tier_rank(effective) >= tier_rank(plan) {
+    let offer = if plan == "pro" { pro_offer } else { teams_offer };
+    let effective = effective_tier(&stored_tier, stored_ends, has_sub, admin_override, Utc::now());
+    if !offer || tier_rank(effective) >= tier_rank(plan) {
         return Err(unavailable());
     }
 
     // Eligibility is re-checked in the WHERE so a concurrent second call affects 0 rows.
     let sql = if plan == "pro" {
-        "UPDATE users SET subscription_tier = 'pro', trial_ends_at = now() + interval '14 days', pro_trial_available = FALSE \
-         WHERE id = $1 AND pro_trial_available AND email_verified AND ls_subscription_id IS NULL AND admin_override = FALSE \
-         AND subscription_tier = $2 AND trial_ends_at IS NOT DISTINCT FROM $3 RETURNING trial_ends_at"
+        concat!(
+            "UPDATE users SET subscription_tier = 'pro', trial_ends_at = now() + interval '14 days', pro_trial_available = FALSE \
+             WHERE id = $1 AND pro_trial_available AND email_verified AND ",
+            offer_eligible!(),
+            " AND subscription_tier = $2 AND trial_ends_at IS NOT DISTINCT FROM $3 RETURNING trial_ends_at"
+        )
     } else {
-        "UPDATE users SET subscription_tier = 'teams', trial_ends_at = now() + interval '14 days', seat_count = 10, \
-         teams_trial_available = FALSE, pro_trial_available = FALSE \
-         WHERE id = $1 AND teams_trial_available AND email_verified AND ls_subscription_id IS NULL AND admin_override = FALSE \
-         AND subscription_tier = $2 AND trial_ends_at IS NOT DISTINCT FROM $3 RETURNING trial_ends_at"
+        concat!(
+            "UPDATE users SET subscription_tier = 'teams', trial_ends_at = now() + interval '14 days', seat_count = 10, \
+             teams_trial_available = FALSE, pro_trial_available = FALSE \
+             WHERE id = $1 AND teams_trial_available AND email_verified AND ",
+            offer_eligible!(),
+            " AND subscription_tier = $2 AND trial_ends_at IS NOT DISTINCT FROM $3 RETURNING trial_ends_at"
+        )
     };
     let ends: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(sql)
         .bind(auth.0)
@@ -204,10 +221,14 @@ pub async fn get_promos(
         coded_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
     };
 
-    let (pro, teams, verified, ended_at, ended_kind, ls_status, renews): PromoUserRow = sqlx::query_as(
-        "SELECT pro_trial_available, teams_trial_available, email_verified, last_plan_ended_at, last_plan_ended_kind, \
+    let (pro, teams, verified, ended_at, ended_kind, ls_status, renews): PromoUserRow = sqlx::query_as(concat!(
+        "SELECT pro_trial_available AND ",
+        offer_eligible!(),
+        ", teams_trial_available AND ",
+        offer_eligible!(),
+        ", email_verified, last_plan_ended_at, last_plan_ended_kind, \
          ls_subscription_status, subscription_renews_at FROM users WHERE id = $1 AND deleted_at IS NULL",
-    )
+    ))
     .bind(auth.0)
     .fetch_one(&pool)
     .await
@@ -269,7 +290,7 @@ pub async fn post_promo_event(
 ) -> Result<StatusCode, Response> {
     let invalid = || coded_error(StatusCode::BAD_REQUEST, "INVALID_PROMO_EVENT");
     if !matches!(body.promo.as_str(), "pro_redeem" | "teams_promo" | "plan_ended")
-        || !matches!(body.event.as_str(), "shown" | "dismissed" | "clicked" | "activated")
+        || !matches!(body.event.as_str(), "shown" | "dismissed" | "clicked")
     {
         return Err(invalid());
     }
@@ -561,6 +582,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activation_refused_for_manual_grant() {
+        let pool = crate::test_pool_or_skip!();
+        let _billing = crate::test_support::BillingMode::hosted();
+        let manual_pro = verified_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, manual_pro, "pro").await;
+        let manual_business = verified_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, manual_business, "business").await;
+        for (u, tier, plan) in [(manual_pro, "pro", "teams"), (manual_business, "business", "pro")] {
+            let (status, body) = err_body(activate(&pool, u, plan).await).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, r#"{"error":"TRIAL_UNAVAILABLE"}"#);
+            let (t, ends): (String, Option<DateTime<Utc>>) =
+                sqlx::query_as("SELECT subscription_tier, trial_ends_at FROM users WHERE id = $1").bind(u).fetch_one(&pool).await.unwrap();
+            assert_eq!((t.as_str(), ends), (tier, None));
+        }
+    }
+
+    #[tokio::test]
     async fn activation_blocked_when_self_hosted() {
         use tower::ServiceExt;
         let _billing = crate::test_support::BillingMode::self_hosted();
@@ -629,6 +668,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promos_hide_offers_for_paid_or_comped() {
+        let pool = crate::test_pool_or_skip!();
+        let free = verified_user(&pool).await;
+        let trialing = verified_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, trialing, "pro").await;
+        crate::test_support::set_user_trial(&pool, trialing, 7).await;
+        let paid = verified_user(&pool).await;
+        sqlx::query("UPDATE users SET ls_subscription_id = $1 WHERE id = $2").bind(format!("sub_{paid}")).bind(paid).execute(&pool).await.unwrap();
+        let comped = verified_user(&pool).await;
+        sqlx::query("UPDATE users SET admin_override = TRUE WHERE id = $1").bind(comped).execute(&pool).await.unwrap();
+        let manual = verified_user(&pool).await;
+        crate::test_support::set_user_tier(&pool, manual, "business").await;
+        for u in [free, trialing] {
+            let s = promos(&pool, u).await;
+            assert_eq!((s.pro_trial_available, s.teams_trial_available), (true, true));
+        }
+        for u in [paid, comped, manual] {
+            let s = promos(&pool, u).await;
+            assert_eq!((s.pro_trial_available, s.teams_trial_available), (false, false));
+        }
+    }
+
+    #[tokio::test]
     async fn shown_event_is_idempotent() {
         let pool = crate::test_pool_or_skip!();
         let u = verified_user(&pool).await;
@@ -654,7 +716,7 @@ mod tests {
     async fn invalid_promo_event_rejected() {
         let pool = crate::test_pool_or_skip!();
         let u = verified_user(&pool).await;
-        for (p, e) in [("bogus", "shown"), ("pro_redeem", "bogus")] {
+        for (p, e) in [("bogus", "shown"), ("pro_redeem", "bogus"), ("pro_redeem", "activated")] {
             let r = post_event(&pool, u, p, e, None).await.expect_err("expected error");
             assert_eq!(r.status(), StatusCode::BAD_REQUEST);
             let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
