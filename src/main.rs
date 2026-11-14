@@ -22,6 +22,7 @@ mod team_authority;
 mod team_join_grants;
 mod team_plan;
 mod team_policy;
+mod trials;
 mod vault_key_exposure;
 mod sync_notifier;
 mod terminal_manager;
@@ -107,10 +108,6 @@ async fn not_found() -> axum::http::StatusCode {
     axum::http::StatusCode::NOT_FOUND
 }
 
-/// Downgrade lapsed trials to `free`: a non-free tier whose `trial_ends_at` has
-/// passed, with no paid subscription and no admin override, has consumed its
-/// trial and reverts. Paid accounts carry `trial_ends_at = NULL` and are never
-/// matched. Keeps `subscription_tier` (and thus admin metrics) truthful.
 async fn purge_soft_deleted_users(pool: &sqlx::PgPool, grace_days: i64) {
     match user_purge::purge_expired(pool, grace_days).await {
         Ok(c) => tracing::info!(deleted = c.deleted, released = c.released, grace_days, "Soft-deleted user purge completed"),
@@ -118,22 +115,13 @@ async fn purge_soft_deleted_users(pool: &sqlx::PgPool, grace_days: i64) {
     }
 }
 
+/// Downgrade lapsed trials to `free`: a non-free tier whose `trial_ends_at` has
+/// passed, with no paid subscription and no admin override, has consumed its
+/// trial and reverts. Paid accounts carry `trial_ends_at = NULL` and are never
+/// matched. Keeps `subscription_tier` (and thus admin metrics) truthful.
 async fn expire_lapsed_trials(pool: &sqlx::PgPool) {
-    match sqlx::query(
-        r#"UPDATE users SET
-               subscription_tier = 'free',
-               trial_used = TRUE,
-               trial_ends_at = NULL
-           WHERE subscription_tier <> 'free'
-             AND trial_ends_at IS NOT NULL
-             AND trial_ends_at <= now()
-             AND ls_subscription_id IS NULL
-             AND admin_override = FALSE"#,
-    )
-    .execute(pool)
-    .await
-    {
-        Ok(r) => tracing::info!(downgraded = r.rows_affected(), "Lapsed trial downgrade completed"),
+    match trials::expire_lapsed_trials(pool).await {
+        Ok(n) => tracing::info!(downgraded = n, "Lapsed trial downgrade completed"),
         Err(e) => tracing::error!(error = %e, "Lapsed trial downgrade failed"),
     }
 }
@@ -798,6 +786,21 @@ async fn main() {
         .route(
             "/v1/billing/checkout",
             post(routes::billing::create_checkout),
+        )
+        .route(
+            "/v1/billing/trial",
+            post(trials::activate_trial)
+                .route_layer(middleware::from_fn(self_host::block_when_self_hosted)),
+        )
+        .route(
+            "/v1/promos",
+            get(trials::get_promos)
+                .route_layer(middleware::from_fn(self_host::block_when_self_hosted)),
+        )
+        .route(
+            "/v1/promos/events",
+            post(trials::post_promo_event)
+                .route_layer(middleware::from_fn(self_host::block_when_self_hosted)),
         )
         .route("/v1/billing/portal", post(routes::billing::get_portal))
         .route("/v1/billing/seats", post(routes::billing::update_seats))
