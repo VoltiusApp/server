@@ -31,19 +31,21 @@ pub struct AuthClaims(pub Claims);
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CurrentSession(pub Option<Uuid>);
 
-/// Decodes an access token and refuses one whose login session has ended.
+/// Decodes an access token and refuses one whose login session has ended or whose account is deleted.
+/// `is_banned` is replaced by the live value: the claim is only as fresh as the token.
 pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Claims, StatusCode> {
-    let claims = jwt::validate_token(token, "access").map_err(|_| StatusCode::UNAUTHORIZED)?;
-    if let Some(sid) = claims.sid {
-        let live = crate::login_sessions::is_live(pool, claims.sub, sid).await.map_err(|e| {
-            error!(error = %e, user_id = %claims.sub, "Failed to check login session");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
-        if !live {
-            return Err(StatusCode::UNAUTHORIZED);
+    let mut claims = jwt::validate_token(token, "access").map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let standing = crate::login_sessions::standing(pool, claims.sub, claims.sid).await.map_err(|e| {
+        error!(error = %e, user_id = %claims.sub, "Failed to check login session");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    match standing {
+        Some((banned, true)) => {
+            claims.is_banned = banned;
+            Ok(claims)
         }
+        _ => Err(StatusCode::UNAUTHORIZED),
     }
-    Ok(claims)
 }
 
 pub async fn auth_middleware(State(pool): State<PgPool>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
@@ -465,11 +467,14 @@ mod authz_tests {
     async fn auth_middleware_forbids_banned_user() {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let pool = crate::test_pool_or_skip!();
+        let user = crate::test_support::seed_user(&pool).await;
+        sqlx::query("UPDATE users SET is_banned = TRUE WHERE id = $1").bind(user).execute(&pool).await.unwrap();
         let token =
-            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, true, true, None).unwrap();
+            jwt::create_access_token(user, jwt::PlanClaims::own("pro"), None, false, false, false, true, None).unwrap();
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
+            .layer(from_fn_with_state(pool, auth_middleware));
 
         let resp = app
             .oneshot(
@@ -489,12 +494,13 @@ mod authz_tests {
     async fn auth_middleware_allows_valid_user() {
         let _guard = EnvLockGuard(env_lock());
         std::env::set_var("JWT_SECRET", "ci-test-secret");
+        let pool = crate::test_pool_or_skip!();
+        let user = crate::test_support::seed_user(&pool).await;
         let token =
-            jwt::create_access_token(Uuid::new_v4(), jwt::PlanClaims::own("pro"), None, false, false, false, true, None)
-                .unwrap();
+            jwt::create_access_token(user, jwt::PlanClaims::own("pro"), None, false, false, false, true, None).unwrap();
         let app = Router::new()
             .route("/x", get(ok_handler))
-            .layer(from_fn_with_state(dead_pool().await, auth_middleware));
+            .layer(from_fn_with_state(pool, auth_middleware));
 
         let resp = app
             .oneshot(

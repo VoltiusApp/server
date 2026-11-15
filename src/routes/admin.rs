@@ -853,7 +853,7 @@ pub async fn ban_user(
     )
     .await;
 
-    notifier.notify(user_id, "token_invalidated".to_string());
+    notifier.notify_sessions_reset(user_id, None);
     info!(admin = %admin_email, user = %user_id, reason = %body.reason, "User banned");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1183,7 +1183,7 @@ pub async fn delete_user(
         )
         .await;
 
-        notifier.notify(user_id, "token_invalidated".to_string());
+        notifier.notify_sessions_reset(user_id, None);
         info!(admin = %admin_email, user = %user_id, "User soft-deleted");
         Ok((StatusCode::NO_CONTENT, Json(json!({}))))
     }
@@ -1671,6 +1671,50 @@ mod admin_handler_tests {
         assert!(is_banned);
         assert_eq!(reason.as_deref(), Some("spam"));
         assert!(banned_at.is_some());
+    }
+
+    fn ends_every_login_session(events: &mut tokio::sync::broadcast::Receiver<crate::sync_notifier::SyncEvent>, user: Uuid) -> bool {
+        std::iter::from_fn(|| events.try_recv().ok()).any(|e| {
+            matches!(e, crate::sync_notifier::SyncEvent::LoginSessionsEnded {
+                user_id,
+                ended: crate::sync_notifier::EndedSessions::AllBut(None),
+            } if user_id == user)
+        })
+    }
+
+    #[tokio::test]
+    async fn banning_closes_the_users_live_connections() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let notifier = SyncNotifier::new();
+        let mut events = notifier.subscribe();
+
+        ban_user(State(pool.clone()), admin(), Extension(notifier), Path(user), Json(BanRequest { reason: "spam".to_string() }))
+            .await
+            .unwrap();
+
+        assert!(ends_every_login_session(&mut events, user));
+    }
+
+    #[tokio::test]
+    async fn soft_deleting_closes_the_users_live_connections() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        let notifier = SyncNotifier::new();
+        let mut events = notifier.subscribe();
+
+        let _ = delete_user(
+            State(pool.clone()),
+            admin(),
+            Extension(notifier),
+            Path(user),
+            Query(DeleteQuery { force: None }),
+            Json(DeleteBody { reason: None }),
+        )
+        .await
+        .expect("soft delete ok");
+
+        assert!(ends_every_login_session(&mut events, user));
     }
 
     #[tokio::test]
