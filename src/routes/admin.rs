@@ -351,8 +351,10 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
                COUNT(*) FILTER (WHERE event = 'shown')::bigint AS shown,
                COUNT(*) FILTER (WHERE event = 'clicked')::bigint AS clicked,
                COUNT(*) FILTER (WHERE event = 'activated')::bigint AS activated
-        FROM promo_events
-        WHERE created_at > now() - interval '30 days'
+        FROM promo_events pe
+        JOIN users u ON u.id = pe.user_id
+        WHERE pe.created_at > now() - interval '30 days'
+          AND u.admin_override = FALSE AND u.is_admin = FALSE
         GROUP BY promo, source
         ORDER BY promo, source
         "#,
@@ -371,6 +373,7 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         FROM promo_events pe
         JOIN users u ON u.id = pe.user_id
         WHERE pe.event = 'activated' AND pe.created_at > now() - interval '30 days'
+          AND u.admin_override = FALSE AND u.is_admin = FALSE
         "#,
     )
     .fetch_one(&pool)
@@ -2773,5 +2776,38 @@ mod admin_handler_tests {
         );
         assert_eq!(after.trials_activated_30d - before.trials_activated_30d, 2);
         assert_eq!(after.trial_to_paid_30d - before.trial_to_paid_30d, 1);
+    }
+
+    #[tokio::test]
+    async fn overview_promo_funnel_ignores_comped_and_admin_accounts() {
+        let pool = test_pool_or_skip!();
+        let src = format!("t7-{}", Uuid::new_v4());
+        let (comped, admin) = (seed_user(&pool).await, seed_user(&pool).await);
+        sqlx::query("UPDATE users SET admin_override = TRUE WHERE id = $1")
+            .bind(comped)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET is_admin = TRUE WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for u in [comped, admin] {
+            for event in ["shown", "clicked", "activated"] {
+                sqlx::query(
+                    "INSERT INTO promo_events (user_id, promo, event, source) VALUES ($1, 'pro_redeem', $2, $3)",
+                )
+                .bind(u)
+                .bind(event)
+                .bind(&src)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let after = get_overview(State(pool.clone())).await.unwrap().0;
+        assert!(after.promo_funnel.iter().all(|r| r.source != src));
     }
 }
