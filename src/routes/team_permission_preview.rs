@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::object_authz::{
-    compose_member_row, live_rule_set_ids, member_rows, object_refs, preview_for, rule_entries,
-    team_role_bits, MemberContext, MemberRow, ObjectAuthz, ObjectRef, Preview, RoleBits, RuleEntry,
+    compose_member_row, live_rule_set_ids, member_rows, object_refs, preview_for, team_role_bits,
+    MemberContext, MemberRow, ObjectAuthz, ObjectRef, Preview, RoleBits, RuleEntry,
 };
 use crate::permissions::{
     has_team_permission, ALL_PERMISSIONS, PERM_MANAGE_MEMBERS, PERM_MANAGE_ROLES, PERM_VIEW,
@@ -55,6 +55,7 @@ pub enum PreviewScope {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreviewRequest {
     pub subject: PreviewSubject,
     #[serde(default)]
@@ -100,9 +101,15 @@ pub async fn preview_permissions(
     let locked = team_locked(&pool, team_id).await?;
     let roles = team_role_bits(&pool, team_id).await?;
     let objects = visible_objects(&pool, team_id, &caller).await?;
-    let entries = rule_entries(&pool, team_id, None).await?;
+    let entries = caller.entries();
     let live = live_rule_set_ids(&pool, team_id).await?;
-    let build = |ctx: MemberContext| shape(preview_for(ctx, &entries, &objects, &live), gate_only);
+    let build = |ctx: MemberContext| {
+        shape(
+            preview_for(ctx, entries, &objects, &live),
+            gate_only,
+            &caller,
+        )
+    };
 
     let (current, draft, affected) = match (body.subject, body.draft) {
         (PreviewSubject::Member { user_id }, draft) => {
@@ -144,26 +151,16 @@ pub async fn preview_permissions(
             let role_ctx = |roles: &[RoleBits]| {
                 compose_member_row(Uuid::nil(), &[role_id], 0, 0, roles).context(locked)
             };
+            let current = build(role_ctx(&roles));
             match draft {
-                None => (build(role_ctx(&roles)), None, None),
+                None => (current, None, None),
                 Some(PreviewDraft::Role(RoleDraft { permissions })) if !role.builtin => {
                     let drafted = with_role_bits(&roles, role_id, permissions);
                     let rows = member_rows(&pool, team_id, None).await?;
                     let affected = affected_by_role_draft(
-                        &rows,
-                        &roles,
-                        role_id,
-                        permissions,
-                        locked,
-                        &entries,
-                        &objects,
-                        &live,
+                        &rows, &roles, &drafted, role_id, locked, entries, &objects, &live,
                     );
-                    (
-                        build(role_ctx(&roles)),
-                        Some(build(role_ctx(&drafted))),
-                        Some(affected),
-                    )
+                    (current, Some(build(role_ctx(&drafted))), Some(affected))
                 }
                 Some(_) => return Err(StatusCode::BAD_REQUEST),
             }
@@ -196,14 +193,13 @@ fn with_role_bits(roles: &[RoleBits], role_id: Uuid, draft_bits: i64) -> Vec<Rol
 pub fn affected_by_role_draft(
     rows: &[MemberRow],
     roles: &[RoleBits],
+    drafted: &[RoleBits],
     role_id: Uuid,
-    draft_bits: i64,
     locked: bool,
     entries: &HashMap<Uuid, Vec<RuleEntry>>,
     objects: &[ObjectRef],
     live: &[Uuid],
 ) -> Affected {
-    let drafted = with_role_bits(roles, role_id, draft_bits);
     let preview = |row: &MemberRow, roles: &[RoleBits]| {
         let ctx = compose_member_row(row.user_id, &row.role_ids, row.allow, row.deny, roles)
             .context(locked);
@@ -219,7 +215,7 @@ pub fn affected_by_role_draft(
         lose_vault_key: vec![],
     };
     for row in holders {
-        let (before, after) = (preview(row, roles), preview(row, &drafted));
+        let (before, after) = (preview(row, roles), preview(row, drafted));
         let same_objects = before.objects.len() == after.objects.len()
             && before
                 .objects
@@ -236,11 +232,14 @@ pub fn affected_by_role_draft(
     affected
 }
 
-fn shape(mut preview: Preview, gate_only: bool) -> Preview {
+fn shape(mut preview: Preview, gate_only: bool, caller: &ObjectAuthz) -> Preview {
     if gate_only {
         preview.objects.clear();
         preview.rule_sets.clear();
     }
+    preview
+        .rule_sets
+        .retain(|id, _| caller.can(Some(*id), PERM_MANAGE_ROLES));
     preview
 }
 
@@ -259,12 +258,11 @@ async fn visible_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_authz::{RuleEntry, Subject};
+    use crate::object_authz::Subject;
     use crate::permissions::{PERM_ADMINISTRATOR, PERM_CONNECT};
     use crate::routes::team_objects::list_objects;
     use crate::test_pool_or_skip;
     use crate::test_support::*;
-    use std::collections::HashMap;
 
     struct Fx {
         team: Uuid,
@@ -286,13 +284,13 @@ mod tests {
         }
     }
 
-    fn member_req(
-        user: Uuid,
+    fn req(
+        subject: PreviewSubject,
         draft: Option<PreviewDraft>,
         scope: PreviewScope,
     ) -> Json<PreviewRequest> {
         Json(PreviewRequest {
-            subject: PreviewSubject::Member { user_id: user },
+            subject,
             draft,
             scope,
         })
@@ -314,15 +312,32 @@ mod tests {
         .map(|j| j.0)
     }
 
-    async fn full(pool: &PgPool, f: &Fx, caller: Uuid, user: Uuid) -> PreviewResponse {
+    async fn full(pool: &PgPool, team: Uuid, caller: Uuid, user: Uuid) -> PreviewResponse {
         call(
             pool,
-            f.team,
+            team,
             caller,
-            member_req(user, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Member { user_id: user },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await
         .expect("preview")
+    }
+
+    async fn role_holder(pool: &PgPool, team: Uuid, role: Uuid) -> Uuid {
+        let holder = seed_user(pool).await;
+        add_member(pool, team, holder).await;
+        assign_role(pool, team, holder, role).await;
+        holder
+    }
+
+    async fn foreign_role(pool: &PgPool) -> Uuid {
+        let other_owner = seed_user(pool).await;
+        let other_team = seed_team_with_roles(pool, other_owner).await;
+        seed_role(pool, other_team, "foreign", PERM_CONNECT).await
     }
 
     async fn soft_delete(pool: &PgPool, team: Uuid, id: &str) {
@@ -344,7 +359,11 @@ mod tests {
             &pool,
             f.team,
             plain,
-            member_req(f.target, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Member { user_id: f.target },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -360,7 +379,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            member_req(f.target, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Member { user_id: f.target },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::PAYMENT_REQUIRED));
@@ -377,13 +400,7 @@ mod tests {
         add_member(&pool, team, target).await;
         grant_builtin_role(&pool, team, target, "member").await;
         seed_team_object(&pool, team, owner, "o1", "connection").await;
-        let member_role: Uuid = sqlx::query_scalar(
-            "SELECT id FROM team_roles WHERE team_id = $1 AND is_builtin AND name = 'member'",
-        )
-        .bind(team)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let member_role = builtin_role_id(&pool, team, "member").await;
         let draft = PreviewDraft::Member(MemberDraft {
             role_ids: vec![member_role],
             allow: 0,
@@ -393,13 +410,36 @@ mod tests {
             &pool,
             team,
             owner,
-            member_req(target, Some(draft), PreviewScope::VaultKeyGate),
+            req(
+                PreviewSubject::Member { user_id: target },
+                Some(draft),
+                PreviewScope::VaultKeyGate,
+            ),
         )
         .await
         .expect("gate scope");
+        assert!(res.locked);
         assert!(res.current.holds_vault_key_gate);
-        assert!(!res.draft.expect("draft").holds_vault_key_gate);
+        let d = res.draft.expect("draft");
+        assert!(!d.holds_vault_key_gate);
+        assert!(d.objects.is_empty() && d.rule_sets.is_empty());
         assert!(res.current.objects.is_empty() && res.current.rule_sets.is_empty());
+
+        let custom = member_with_role(&pool, team, PERM_CONNECT).await;
+        let res = call(
+            &pool,
+            team,
+            owner,
+            req(
+                PreviewSubject::Member { user_id: custom },
+                None,
+                PreviewScope::VaultKeyGate,
+            ),
+        )
+        .await
+        .expect("gate scope");
+        assert!(res.locked);
+        assert!(!res.current.holds_vault_key_gate);
     }
 
     #[tokio::test]
@@ -411,7 +451,13 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            member_req(Uuid::new_v4(), None, PreviewScope::Full),
+            req(
+                PreviewSubject::Member {
+                    user_id: Uuid::new_v4(),
+                },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
@@ -424,14 +470,8 @@ mod tests {
         let f = hidden_object_fixture(&pool, "connection", PERM_CONNECT).await;
         grant_builtin_role(&pool, f.team, f.admin, "owner").await;
         seed_team_object(&pool, f.team, f.owner, "plain", "connection").await;
-        let fx = Fx {
-            team: f.team,
-            owner: f.owner,
-            manager: f.admin,
-            target: f.viewer,
-        };
         for target in [f.viewer, f.blocked] {
-            let preview = full(&pool, &fx, f.admin, target).await;
+            let preview = full(&pool, f.team, f.admin, target).await;
             let listed: HashMap<String, i64> = list_objects(
                 State(pool.clone()),
                 Extension(AuthUser(target)),
@@ -448,9 +488,10 @@ mod tests {
             for (id, o) in &preview.current.objects {
                 assert_eq!(o.mask, listed.get(id).copied().unwrap_or(0), "object {id}");
             }
+            if target == f.blocked {
+                assert_eq!(preview.current.objects[&f.object_id].mask, 0);
+            }
         }
-        let blocked = full(&pool, &fx, f.admin, f.blocked).await;
-        assert_eq!(blocked.current.objects[&f.object_id].mask, 0);
     }
 
     #[tokio::test]
@@ -471,9 +512,10 @@ mod tests {
         )
         .await;
         point_object(&pool, f.team, "h", Some(set)).await;
-        let res = full(&pool, &f, f.manager, f.target).await;
+        let res = full(&pool, f.team, f.manager, f.target).await;
         assert!(!res.current.objects.contains_key("h"));
         assert!(res.current.objects.contains_key("v"));
+        assert!(!res.current.rule_sets.contains_key(&set));
     }
 
     #[tokio::test]
@@ -492,11 +534,11 @@ mod tests {
         )
         .await;
         point_object(&pool, f.team, "gone", Some(set)).await;
-        let before = full(&pool, &f, f.owner, target).await;
+        let before = full(&pool, f.team, f.owner, target).await;
         assert!(before.current.objects.contains_key("gone"));
         assert!(before.current.holds_vault_key_gate);
         soft_delete(&pool, f.team, "gone").await;
-        let res = full(&pool, &f, f.owner, target).await;
+        let res = full(&pool, f.team, f.owner, target).await;
         assert!(!res.current.objects.contains_key("gone"));
         assert!(res.current.objects.contains_key("kept"));
         assert!(res.current.rule_sets.is_empty());
@@ -521,7 +563,7 @@ mod tests {
         )
         .await;
         point_object(&pool, f.team, "b", Some(set)).await;
-        let res = full(&pool, &f, f.owner, admin).await;
+        let res = full(&pool, f.team, f.owner, admin).await;
         assert_eq!(res.current.objects.len(), 2);
         for o in res.current.objects.values() {
             assert_eq!(
@@ -554,7 +596,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            member_req(f.target, Some(draft), PreviewScope::Full),
+            req(
+                PreviewSubject::Member { user_id: f.target },
+                Some(draft),
+                PreviewScope::Full,
+            ),
         )
         .await
         .expect("preview");
@@ -570,9 +616,7 @@ mod tests {
         let _b = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let f = fx(&pool).await;
-        let other_owner = seed_user(&pool).await;
-        let other_team = seed_team_with_roles(&pool, other_owner).await;
-        let foreign = seed_role(&pool, other_team, "foreign", PERM_CONNECT).await;
+        let foreign = foreign_role(&pool).await;
         let draft = PreviewDraft::Member(MemberDraft {
             role_ids: vec![foreign],
             allow: 0,
@@ -582,7 +626,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            member_req(f.target, Some(draft), PreviewScope::Full),
+            req(
+                PreviewSubject::Member { user_id: f.target },
+                Some(draft),
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
@@ -600,7 +648,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            member_req(f.target, Some(draft), PreviewScope::Full),
+            req(
+                PreviewSubject::Member { user_id: f.target },
+                Some(draft),
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
@@ -623,6 +675,17 @@ mod tests {
             r,
             PreviewDraft::Role(RoleDraft { permissions: 5 })
         ));
+    }
+
+    #[test]
+    fn a_misspelled_scope_key_is_rejected() {
+        let subject =
+            r#""subject":{"type":"member","user_id":"00000000-0000-0000-0000-000000000000"}"#;
+        assert!(serde_json::from_str::<PreviewRequest>(&format!("{{{subject}}}")).is_ok());
+        assert!(serde_json::from_str::<PreviewRequest>(&format!(
+            r#"{{{subject},"scop":"vault_key_gate"}}"#
+        ))
+        .is_err());
     }
 
     #[test]
@@ -676,11 +739,12 @@ mod tests {
             object_id: "o".into(),
             rule_set_id: Some(set),
         }];
+        let drafted = with_role_bits(&roles, r, PERM_VIEW);
         let a = affected_by_role_draft(
             &rows,
             &roles,
+            &drafted,
             r,
-            PERM_VIEW,
             false,
             &entries,
             &objects,
@@ -700,31 +764,10 @@ mod tests {
             role(other, false, PERM_CONNECT),
         ];
         let rows = [holder(dave, &[other])];
-        let a = affected_by_role_draft(&rows, &roles, r, 0, false, &HashMap::new(), &[], &[]);
+        let drafted = with_role_bits(&roles, r, 0);
+        let a =
+            affected_by_role_draft(&rows, &roles, &drafted, r, false, &HashMap::new(), &[], &[]);
         assert!(a.changed.is_empty() && a.lose_vault_key.is_empty());
-    }
-
-    fn role_req(
-        role_id: Uuid,
-        draft: Option<PreviewDraft>,
-        scope: PreviewScope,
-    ) -> Json<PreviewRequest> {
-        Json(PreviewRequest {
-            subject: PreviewSubject::Role { role_id },
-            draft,
-            scope,
-        })
-    }
-
-    async fn builtin_role_id(pool: &PgPool, team: Uuid, name: &str) -> Uuid {
-        sqlx::query_scalar(
-            "SELECT id FROM team_roles WHERE team_id = $1 AND is_builtin AND name = $2",
-        )
-        .bind(team)
-        .bind(name)
-        .fetch_one(pool)
-        .await
-        .unwrap()
     }
 
     #[tokio::test]
@@ -737,7 +780,11 @@ mod tests {
             &pool,
             f.team,
             f.manager,
-            role_req(r, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: r },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -746,7 +793,11 @@ mod tests {
             &pool,
             f.team,
             outsider,
-            role_req(r, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: r },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::FORBIDDEN));
@@ -763,7 +814,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            role_req(member, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: member },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await
         .expect("preview");
@@ -783,7 +838,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            role_req(member, Some(draft), PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: member },
+                Some(draft),
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
@@ -804,7 +863,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            role_req(r, Some(draft), PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: r },
+                Some(draft),
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
@@ -815,14 +878,16 @@ mod tests {
         let _b = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let f = fx(&pool).await;
-        let other_owner = seed_user(&pool).await;
-        let other_team = seed_team_with_roles(&pool, other_owner).await;
-        let foreign = seed_role(&pool, other_team, "foreign", PERM_CONNECT).await;
+        let foreign = foreign_role(&pool).await;
         let res = call(
             &pool,
             f.team,
             f.owner,
-            role_req(foreign, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: foreign },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await;
         assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
@@ -839,7 +904,7 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            &[("member", Some(f.target), PERM_CONNECT, 0)],
+            &[("member", Some(f.owner), PERM_CONNECT, 0)],
         )
         .await;
         point_object(&pool, f.team, "o", Some(set)).await;
@@ -847,7 +912,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            role_req(r, None, PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: r },
+                None,
+                PreviewScope::Full,
+            ),
         )
         .await
         .expect("preview");
@@ -861,9 +930,7 @@ mod tests {
         let pool = test_pool_or_skip!();
         let f = fx(&pool).await;
         let r = seed_role(&pool, f.team, "r", PERM_VIEW | PERM_CONNECT).await;
-        let holder = seed_user(&pool).await;
-        add_member(&pool, f.team, holder).await;
-        assign_role(&pool, f.team, holder, r).await;
+        let holder = role_holder(&pool, f.team, r).await;
         let draft = PreviewDraft::Role(RoleDraft {
             permissions: PERM_VIEW,
         });
@@ -871,7 +938,11 @@ mod tests {
             &pool,
             f.team,
             f.owner,
-            role_req(r, Some(draft), PreviewScope::Full),
+            req(
+                PreviewSubject::Role { role_id: r },
+                Some(draft),
+                PreviewScope::Full,
+            ),
         )
         .await
         .expect("preview");
@@ -888,20 +959,91 @@ mod tests {
         let pool = test_pool_or_skip!();
         let f = fx(&pool).await;
         let r = seed_role(&pool, f.team, "r", PERM_VIEW | PERM_CONNECT).await;
-        let holder = seed_user(&pool).await;
-        add_member(&pool, f.team, holder).await;
-        assign_role(&pool, f.team, holder, r).await;
+        let holder = role_holder(&pool, f.team, r).await;
         seed_team_object(&pool, f.team, f.owner, "o", "connection").await;
         let draft = PreviewDraft::Role(RoleDraft { permissions: 0 });
         let res = call(
             &pool,
             f.team,
             f.owner,
-            role_req(r, Some(draft), PreviewScope::VaultKeyGate),
+            req(
+                PreviewSubject::Role { role_id: r },
+                Some(draft),
+                PreviewScope::VaultKeyGate,
+            ),
         )
         .await
         .expect("preview");
         assert_eq!(res.affected.expect("affected").lose_vault_key, vec![holder]);
         assert!(res.current.objects.is_empty() && res.current.rule_sets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_manage_roles_only_caller_can_preview_a_role() {
+        let _b = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let f = fx(&pool).await;
+        let caller = member_with_role(&pool, f.team, PERM_MANAGE_ROLES).await;
+        let r = seed_role(&pool, f.team, "r", PERM_CONNECT).await;
+        let res = call(
+            &pool,
+            f.team,
+            caller,
+            req(
+                PreviewSubject::Role { role_id: r },
+                None,
+                PreviewScope::Full,
+            ),
+        )
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rule_sets_are_limited_to_those_the_caller_can_manage() {
+        let _b = BillingMode::self_hosted();
+        let pool = test_pool_or_skip!();
+        let f = fx(&pool).await;
+        let caller = member_with_role(&pool, f.team, PERM_MANAGE_MEMBERS | PERM_MANAGE_ROLES).await;
+        seed_team_object(&pool, f.team, f.owner, "locked", "connection").await;
+        seed_team_object(&pool, f.team, f.owner, "open", "connection").await;
+        let locked_set = seed_rule_set(
+            &pool,
+            f.team,
+            f.owner,
+            &[("everyone", None, PERM_VIEW, PERM_MANAGE_ROLES)],
+        )
+        .await;
+        let open_set =
+            seed_rule_set(&pool, f.team, f.owner, &[("everyone", None, PERM_VIEW, 0)]).await;
+        point_object(&pool, f.team, "locked", Some(locked_set)).await;
+        point_object(&pool, f.team, "open", Some(open_set)).await;
+        let draft = || {
+            Some(PreviewDraft::Member(MemberDraft {
+                role_ids: vec![],
+                allow: 0,
+                deny: 0,
+            }))
+        };
+        let preview = |who| {
+            call(
+                &pool,
+                f.team,
+                who,
+                req(
+                    PreviewSubject::Member { user_id: f.target },
+                    draft(),
+                    PreviewScope::Full,
+                ),
+            )
+        };
+        let res = preview(caller).await.expect("preview");
+        for p in [&res.current, res.draft.as_ref().expect("draft")] {
+            assert!(p.objects.contains_key("locked") && p.objects.contains_key("open"));
+            assert!(!p.rule_sets.contains_key(&locked_set));
+            assert!(p.rule_sets.contains_key(&open_set));
+        }
+        let res = preview(f.owner).await.expect("preview");
+        assert!(res.current.rule_sets.contains_key(&locked_set));
     }
 }

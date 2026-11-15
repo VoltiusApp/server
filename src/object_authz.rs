@@ -216,6 +216,10 @@ impl ObjectAuthz {
         Self { member, entries }
     }
 
+    pub fn entries(&self) -> &HashMap<Uuid, Vec<RuleEntry>> {
+        &self.entries
+    }
+
     pub fn is_admin(&self) -> bool {
         self.member.base & PERM_ADMINISTRATOR != 0
     }
