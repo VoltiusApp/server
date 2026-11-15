@@ -721,6 +721,10 @@ async fn main() {
             post(routes::team_rule_sets::create_rule_set),
         )
         .route(
+            "/v1/teams/:team_id/permissions/preview",
+            post(routes::team_permission_preview::preview_permissions),
+        )
+        .route(
             "/v1/teams/:team_id/rule-sets/:set_id",
             get(routes::team_rule_sets::get_rule_set),
         )

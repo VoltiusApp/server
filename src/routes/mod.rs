@@ -21,6 +21,7 @@ pub mod team_policy;
 pub mod team_sync;
 pub mod team_objects;
 pub mod team_object_prefs;
+pub mod team_permission_preview;
 pub mod team_ownership;
 pub mod team_rule_sets;
 pub mod teams;
