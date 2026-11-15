@@ -237,7 +237,7 @@ pub async fn get_promos(
     .map_err(internal)?;
 
     let seen_rows: Vec<SeenRow> = sqlx::query_as(
-        "SELECT promo, source, occurrence, created_at FROM promo_events WHERE user_id = $1 AND event = 'shown' ORDER BY created_at",
+        "SELECT promo, source, occurrence, created_at FROM (SELECT DISTINCT ON (promo, occurrence) promo, source, occurrence, created_at FROM promo_events WHERE user_id = $1 AND event = 'shown' ORDER BY promo, occurrence, created_at) e ORDER BY created_at",
     )
     .bind(auth.0)
     .fetch_all(&pool)
@@ -284,7 +284,7 @@ pub async fn get_promos(
     }))
 }
 
-/// Records a promo interaction; `shown` is idempotent per promo and occurrence.
+/// Records a promo interaction; a `launch` `shown` is idempotent per promo and occurrence, every other opening is kept.
 #[allow(clippy::result_large_err)]
 pub async fn post_promo_event(
     State(pool): State<PgPool>,
@@ -715,6 +715,47 @@ mod tests {
         assert_eq!(s.seen.len(), 2);
         let pe = s.seen.iter().find(|p| p.promo == "plan_ended").unwrap();
         assert_eq!(pe.occurrence, Some(1_700_000_000));
+    }
+
+    async fn post_shown_from(pool: &sqlx::PgPool, u: uuid::Uuid, source: &str) {
+        post_promo_event(
+            State(pool.clone()),
+            Extension(AuthUser(u)),
+            Json(PromoEventRequest { promo: "pro_redeem".into(), event: "shown".into(), source: source.into(), occurrence: None }),
+        )
+        .await
+        .ok()
+        .unwrap();
+    }
+
+    async fn pro_redeem_shown_by_source(pool: &sqlx::PgPool, u: uuid::Uuid) -> Vec<String> {
+        sqlx::query_scalar("SELECT source FROM promo_events WHERE user_id = $1 AND promo = 'pro_redeem' AND event = 'shown' ORDER BY source")
+            .bind(u)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn paywall_openings_are_each_counted() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        for src in ["launch", "vault_limit", "vault_limit", "launch"] {
+            post_shown_from(&pool, u, src).await;
+        }
+        assert_eq!(pro_redeem_shown_by_source(&pool, u).await, vec!["launch", "vault_limit", "vault_limit"]);
+    }
+
+    #[tokio::test]
+    async fn promo_state_seen_has_one_entry_per_occurrence() {
+        let pool = crate::test_pool_or_skip!();
+        let u = verified_user(&pool).await;
+        for src in ["launch", "vault_limit", "vault_limit"] {
+            post_shown_from(&pool, u, src).await;
+        }
+        let s = promos(&pool, u).await;
+        assert_eq!(s.seen.len(), 1);
+        assert_eq!(s.seen[0].promo, "pro_redeem");
     }
 
     #[tokio::test]
