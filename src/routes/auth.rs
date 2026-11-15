@@ -2095,6 +2095,61 @@ mod handler_tests {
         assert_eq!(access_status(pool, session).await, Ok(()));
     }
 
+    async fn ban(pool: &PgPool, uid: Uuid) {
+        sqlx::query("UPDATE users SET is_banned = TRUE WHERE id = $1").bind(uid).execute(pool).await.unwrap();
+    }
+
+    fn token_without_session(uid: Uuid, banned: bool) -> String {
+        crate::auth::jwt::create_access_token(uid, crate::auth::jwt::PlanClaims::own("free"), None, false, false, banned, true, None)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_ban_applies_to_an_unexpired_access_token() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, here, _) = signed_in_twice(&pool).await;
+
+        ban(&pool, uid).await;
+
+        assert!(crate::auth::authenticate(&pool, &here.jwt_token).await.unwrap().is_banned);
+    }
+
+    #[tokio::test]
+    async fn an_unban_applies_to_an_unexpired_access_token() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, _, _) = signed_in_twice(&pool).await;
+        let banned_token = token_without_session(uid, true);
+
+        assert!(!crate::auth::authenticate(&pool, &banned_token).await.unwrap().is_banned);
+    }
+
+    #[tokio::test]
+    async fn a_ban_applies_to_a_token_without_a_login_session() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, _, _) = signed_in_twice(&pool).await;
+        let legacy = token_without_session(uid, false);
+
+        ban(&pool, uid).await;
+
+        assert!(crate::auth::authenticate(&pool, &legacy).await.unwrap().is_banned);
+    }
+
+    #[tokio::test]
+    async fn a_soft_delete_refuses_an_unexpired_access_token() {
+        let _env = EnvGuard::new(true);
+        let pool = test_pool_or_skip!();
+        let (uid, here, _) = signed_in_twice(&pool).await;
+        let legacy = token_without_session(uid, false);
+
+        soft_delete(&pool, uid).await;
+
+        assert_eq!(access_status(&pool, &here).await, Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(crate::auth::authenticate(&pool, &legacy).await.map(drop), Err(StatusCode::UNAUTHORIZED));
+    }
+
     #[tokio::test]
     async fn password_change_ends_other_sessions_and_keeps_the_callers() {
         let _env = EnvGuard::new(true);

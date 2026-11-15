@@ -73,6 +73,18 @@ pub async fn is_live(pool: &PgPool, user_id: Uuid, session_id: Uuid) -> Result<b
     .await
 }
 
+/// `(is_banned, session_live)` for a token's user, or `None` once the account is deleted.
+pub async fn standing(pool: &PgPool, user_id: Uuid, session_id: Option<Uuid>) -> Result<Option<(bool, bool)>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT a.is_banned, ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM login_sessions s WHERE s.id = $2 AND s.user_id = a.id AND {LIVE}))
+           FROM users a WHERE a.id = $1 AND a.deleted_at IS NULL"
+    ))
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn touch(pool: &PgPool, session_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE login_sessions SET last_seen_at = now() WHERE id = $1")
         .bind(session_id)
