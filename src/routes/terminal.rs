@@ -698,10 +698,13 @@ pub async fn create_session(
     // Notified last: a recipient acting on the push before its wrapped key row
     // lands gets a 404 from get_my_session_key.
     if !body.vault_ids.is_empty() {
-        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, Some(auth.0), |recipient| {
-            notifier.notify_session_shared(recipient, session_id, auth.0);
-        })
-        .await;
+        let mut members = Vec::new();
+        crate::sync_notifier::notify_team_members(&pool, &body.vault_ids, Some(auth.0), |m| members.push(m)).await;
+        for recipient in members {
+            if may_see_session(&pool, recipient, session_id).await {
+                notifier.notify_session_shared(recipient, session_id, auth.0);
+            }
+        }
     }
 
     // Get host public key
@@ -938,6 +941,11 @@ async fn visible_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<VisibleSes
         }
     }
     Ok(kept)
+}
+
+/// Whether the session list would show `session_id` to `user_id`.
+async fn may_see_session(pool: &PgPool, user_id: Uuid, session_id: Uuid) -> bool {
+    visible_sessions(pool, user_id).await.is_ok_and(|rows| rows.iter().any(|r| r.id == session_id))
 }
 
 type AuthzCache = std::collections::HashMap<Uuid, Option<crate::object_authz::ObjectAuthz>>;
@@ -1992,6 +2000,65 @@ mod authz_tests {
 
     pub(super) fn direct_session_request(invitees: Vec<ParticipantKeyEntry>) -> CreateSessionRequest {
         session_request(Vec::new(), "direct", invitees)
+    }
+
+    async fn shared_to(pool: &PgPool, req: CreateSessionRequest, host: Uuid) -> Vec<Uuid> {
+        let notifier = SyncNotifier::new();
+        let mut events = notifier.subscribe();
+        let _ = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(host)),
+            Extension(claims_for(host)),
+            Extension(TerminalManager::new()),
+            Extension(notifier),
+            Extension(knocks()),
+            Json(req),
+        )
+        .await
+        .expect("create session");
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| match e {
+                crate::sync_notifier::SyncEvent::SessionShared { recipient, .. } => Some(recipient),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn team_with_host_viewer_and_blind(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+        let owner = seed_user(pool).await;
+        crate::test_support::set_user_tier(pool, owner, "teams").await;
+        let team = seed_team(pool, owner).await;
+        let host = member_with_role(pool, team, crate::permissions::PERM_START_TERMINAL_SESSION).await;
+        let viewer = member_with_role(pool, team, crate::permissions::PERM_VIEW_TERMINAL_SESSIONS).await;
+        let blind = member_with_role(pool, team, PERM_CONNECT).await;
+        (team, host, viewer, blind)
+    }
+
+    #[tokio::test]
+    async fn sharing_a_vault_session_notifies_only_members_who_may_view_sessions() {
+        let pool = test_pool_or_skip!();
+        let (team, host, viewer, _blind) = team_with_host_viewer_and_blind(&pool).await;
+
+        assert_eq!(shared_to(&pool, vault_session_request(vec![team]), host).await, vec![viewer]);
+    }
+
+    #[tokio::test]
+    async fn sharing_a_session_on_a_hidden_host_does_not_notify_who_cannot_see_it() {
+        let pool = test_pool_or_skip!();
+        let (team, host, viewer, _blind) = team_with_host_viewer_and_blind(&pool).await;
+        crate::test_support::seed_team_object(&pool, team, host, "h-hidden", "connection").await;
+        let set = crate::test_support::seed_rule_set(
+            &pool,
+            team,
+            host,
+            &[("member", Some(viewer), 0, crate::permissions::PERM_VIEW)],
+        )
+        .await;
+        crate::test_support::point_object(&pool, team, "h-hidden", Some(set)).await;
+        let mut req = vault_session_request(vec![team]);
+        req.connection_object_id = Some("h-hidden".into());
+
+        assert!(shared_to(&pool, req, host).await.is_empty());
     }
 
     #[tokio::test]
