@@ -22,6 +22,7 @@ pub struct SubscriptionInfoResponse {
     pub renews_at: Option<i64>,
     pub ends_at: Option<i64>,
     /// Seats purchased. What the buy-seats UI prices; NOT what invites enforce.
+    /// `None` on a team tier means no seat count is set, so seats are unlimited.
     pub seats: Option<i32>,
     /// The cap invites actually enforce (`teams::owner_seat_cap`): an active
     /// trial clamps it to 10 however many seats were purchased. `None` means
@@ -567,15 +568,13 @@ pub async fn get_subscription(
         None
     };
 
-    let seats = if is_team_tier && row.2.is_none() { Some(3) } else { row.2 };
-
     Ok(Json(SubscriptionInfoResponse {
         tier: row.0,
         status: row.4,
         cancelled: row.5,
         renews_at: row.6.map(|t| t.timestamp()),
         ends_at: row.7.map(|t| t.timestamp()),
-        seats,
+        seats: row.2,
         effective_seats,
         used_seats,
         trial_ends_at: row.1.map(|t| t.timestamp()),
@@ -914,6 +913,19 @@ mod seat_reporting_tests {
         let info = subscription_for(owner, pool.clone()).await;
 
         assert_eq!(info.used_seats, Some(2));
+    }
+
+    #[tokio::test]
+    async fn team_owner_without_seat_count_reports_unlimited() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        set_user_tier(&pool, owner, "teams").await;
+
+        let info = subscription_for(owner, pool.clone()).await;
+
+        assert_eq!(info.seats, None);
+        assert_eq!(info.effective_seats, None);
+        assert_eq!(info.used_seats, Some(0));
     }
 
     #[tokio::test]
