@@ -81,6 +81,42 @@ impl MemberRow {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RoleBits {
+    pub id: Uuid,
+    pub builtin: bool,
+    pub permissions: i64,
+}
+
+pub fn compose_member_row(
+    user_id: Uuid,
+    role_ids: &[Uuid],
+    allow: i64,
+    deny: i64,
+    roles: &[RoleBits],
+) -> MemberRow {
+    let (mut builtin, mut custom) = (0, 0);
+    for r in roles.iter().filter(|r| role_ids.contains(&r.id)) {
+        if r.builtin {
+            builtin |= r.permissions;
+        } else {
+            custom |= r.permissions;
+        }
+    }
+    MemberRow { user_id, builtin, custom, allow, deny, role_ids: role_ids.to_vec() }
+}
+
+pub async fn team_role_bits(pool: &PgPool, team_id: Uuid) -> Result<Vec<RoleBits>, StatusCode> {
+    let rows = sqlx::query_as::<_, (Uuid, bool, i64)>(
+        "SELECT id, is_builtin, permissions FROM team_roles WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_error(e, "team_role_bits"))?;
+    Ok(rows.into_iter().map(|(id, builtin, permissions)| RoleBits { id, builtin, permissions }).collect())
+}
+
 pub(crate) fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
     error!(error = %e, what, "Database query failed");
     StatusCode::INTERNAL_SERVER_ERROR
@@ -349,6 +385,32 @@ mod tests {
 
     fn row(builtin: i64, custom: i64, allow: i64, deny: i64) -> MemberRow {
         MemberRow { user_id: Uuid::nil(), builtin, custom, allow, deny, role_ids: vec![] }
+    }
+
+    #[test]
+    fn compose_splits_builtin_and_custom_bits() {
+        let (b, c) = (Uuid::new_v4(), Uuid::new_v4());
+        let roles = [
+            RoleBits { id: b, builtin: true, permissions: PERM_VIEW },
+            RoleBits { id: c, builtin: false, permissions: PERM_CONNECT },
+        ];
+        let row = compose_member_row(Uuid::nil(), &[b, c], 0, 0, &roles);
+        assert_eq!((row.builtin, row.custom), (PERM_VIEW, PERM_CONNECT));
+    }
+
+    #[test]
+    fn compose_ignores_unknown_role_ids() {
+        let row = compose_member_row(Uuid::nil(), &[Uuid::new_v4()], 0, 0, &[]);
+        assert_eq!((row.builtin, row.custom), (0, 0));
+    }
+
+    #[test]
+    fn compose_then_context_respects_locked() {
+        let c = Uuid::new_v4();
+        let roles = [RoleBits { id: c, builtin: false, permissions: PERM_VIEW | PERM_CONNECT }];
+        let row = compose_member_row(Uuid::nil(), &[c], PERM_VIEW, 0, &roles);
+        assert_eq!(row.context(true).base, 0);
+        assert_eq!(row.context(false).base, PERM_VIEW | PERM_CONNECT);
     }
 
     #[test]
