@@ -141,7 +141,8 @@ pub struct RecentChurnRow {
 }
 
 // Monthly price per paying unit. teams/business are per-seat; pro is per-user.
-// Card-free trials (no LemonSqueezy subscription, trial end set) never count as paying.
+// Only accounts with a LemonSqueezy subscription count as paying: card-free
+// trials and hand-granted (comped) accounts add nothing to MRR.
 const PRICE_PRO: i64 = 7;
 const PRICE_TEAMS_PER_SEAT: i64 = 15;
 const PRICE_BUSINESS_PER_SEAT: i64 = 49;
@@ -151,10 +152,13 @@ struct BillingCounts {
     total: i64,
     free: i64,
     pro: i64,
+    pro_trial: i64,
     paid_pro: i64,
     teams: i64,
     teams_trial: i64,
+    paid_teams: i64,
     business: i64,
+    paid_business: i64,
     trials_active: i64,
     trials_expiring_7d: i64,
     deleted_pending: i64,
@@ -172,7 +176,7 @@ impl BillingCounts {
     }
 
     fn paying(&self) -> i64 {
-        self.paid_pro + self.teams + self.business
+        self.paid_pro + self.paid_teams + self.paid_business
     }
 }
 
@@ -183,15 +187,18 @@ async fn billing_counts(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<Billin
             COUNT(*) FILTER (WHERE deleted_at IS NULL) AS total,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'free') AS free,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro') AS pro,
-            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro' AND (trial_ends_at IS NULL OR trial_ends_at <= now())) AS paid_pro,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro' AND ls_subscription_id IS NULL AND trial_ends_at IS NOT NULL) AS pro_trial,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'pro' AND ls_subscription_id IS NOT NULL) AS paid_pro,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams' AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)) AS teams,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams' AND ls_subscription_id IS NULL AND trial_ends_at IS NOT NULL) AS teams_trial,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'teams' AND ls_subscription_id IS NOT NULL) AS paid_teams,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'business' AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)) AS business,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND subscription_tier = 'business' AND ls_subscription_id IS NOT NULL) AS paid_business,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now()) AS trials_active,
             COUNT(*) FILTER (WHERE deleted_at IS NULL AND trial_ends_at IS NOT NULL AND trial_ends_at > now() AND trial_ends_at < now() + interval '7 days') AS trials_expiring_7d,
             COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted_pending,
-            COALESCE(SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)), 0)::bigint AS teams_seats,
-            COALESCE(SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL AND (ls_subscription_id IS NOT NULL OR trial_ends_at IS NULL)), 0)::bigint AS business_seats
+            COALESCE(SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'teams' AND deleted_at IS NULL AND ls_subscription_id IS NOT NULL), 0)::bigint AS teams_seats,
+            COALESCE(SUM(COALESCE(seat_count, 3)) FILTER (WHERE subscription_tier = 'business' AND deleted_at IS NULL AND ls_subscription_id IS NOT NULL), 0)::bigint AS business_seats
         FROM users
         WHERE $1::uuid[] IS NULL OR id = ANY($1)
         "#,
@@ -406,8 +413,8 @@ pub async fn get_overview(State(pool): State<PgPool>) -> Result<Json<OverviewRes
         never_seen: activity.never_seen,
         tier_breakdown: TierBreakdown {
             free: counts.free,
-            pro: counts.paid_pro,
-            pro_trial: counts.pro - counts.paid_pro,
+            pro: counts.pro - counts.pro_trial,
+            pro_trial: counts.pro_trial,
             teams: counts.teams,
             teams_trial: counts.teams_trial,
             business: counts.business,
@@ -669,6 +676,8 @@ pub struct PatchUserRequest {
     admin_notes: Option<String>,
     admin_override: Option<bool>,
     seat_count: Option<i32>,
+    /// `true` clears `seat_count` (NULL = no seat cap). An explicit `seat_count` wins.
+    unlimited_seats: Option<bool>,
     /// `true` marks the email verified (keeping an earlier `email_verified_at`)
     /// for accounts whose mailbox cannot receive the link, e.g. store-review demo
     /// accounts. It also clears `email_undeliverable_at`: that flag only means
@@ -738,7 +747,9 @@ pub async fn patch_user(
             admin_override = COALESCE($8, admin_override),
             seat_count = CASE
                 WHEN $9::int IS NOT NULL THEN $9
-                WHEN seat_count IS NULL AND COALESCE($1, subscription_tier) IN ('teams', 'business') THEN 3
+                WHEN $13::boolean = TRUE THEN NULL
+                WHEN seat_count IS NULL AND $1 IN ('teams', 'business')
+                     AND subscription_tier NOT IN ('teams', 'business') THEN 3
                 ELSE seat_count
             END,
             email_verified = COALESCE($10::boolean, email_verified),
@@ -769,6 +780,7 @@ pub async fn patch_user(
     .bind(body.email_verified)
     .bind(body.pro_trial_available)
     .bind(body.teams_trial_available)
+    .bind(body.unlimited_seats)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -787,6 +799,8 @@ pub async fn patch_user(
             "trial_used": body.trial_used,
             "discount_pct": body.discount_pct,
             "admin_override": body.admin_override,
+            "seat_count": body.seat_count,
+            "unlimited_seats": body.unlimited_seats,
             "email_verified": body.email_verified,
             "pro_trial_available": body.pro_trial_available,
             "teams_trial_available": body.teams_trial_available,
@@ -1627,6 +1641,7 @@ mod admin_handler_tests {
             admin_notes: None,
             admin_override: None,
             seat_count: None,
+            unlimited_seats: None,
             email_verified: None,
             pro_trial_available: None,
             teams_trial_available: None,
@@ -1739,6 +1754,85 @@ mod admin_handler_tests {
         assert_eq!(tier_of(&pool, user).await, "teams");
         // NULL seat_count with a teams/business tier defaults to 3.
         assert_eq!(seats_of(&pool, user).await, Some(3));
+    }
+
+    async fn patch_seats(pool: &PgPool, user: Uuid, req: PatchUserRequest) {
+        let res = patch_user(State(pool.clone()), admin(), notifier(), Path(user), Json(req)).await;
+        assert_eq!(res.unwrap(), StatusCode::NO_CONTENT);
+    }
+
+    async fn set_tier_and_seats(pool: &PgPool, user: Uuid, tier: &str, seats: Option<i32>) {
+        sqlx::query("UPDATE users SET subscription_tier = $1, seat_count = $2 WHERE id = $3")
+            .bind(tier)
+            .bind(seats)
+            .bind(user)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_user_keeps_unlimited_seats_on_plain_save() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        set_tier_and_seats(&pool, user, "business", None).await;
+
+        patch_seats(&pool, user, PatchUserRequest { admin_notes: Some("note".into()), ..patch_defaults() }).await;
+        assert_eq!(seats_of(&pool, user).await, None);
+
+        patch_seats(&pool, user, PatchUserRequest { tier: Some("business".into()), ..patch_defaults() }).await;
+        assert_eq!(seats_of(&pool, user).await, None);
+
+        patch_seats(&pool, user, PatchUserRequest { tier: Some("teams".into()), ..patch_defaults() }).await;
+        assert_eq!(seats_of(&pool, user).await, None);
+    }
+
+    #[tokio::test]
+    async fn patch_user_sets_unlimited_seats() {
+        let pool = test_pool_or_skip!();
+        let user = seed_user(&pool).await;
+        set_tier_and_seats(&pool, user, "teams", Some(5)).await;
+
+        patch_seats(&pool, user, PatchUserRequest { unlimited_seats: Some(true), ..patch_defaults() }).await;
+        assert_eq!(seats_of(&pool, user).await, None);
+        let audit: Value = sqlx::query_scalar(
+            "SELECT detail FROM admin_audit_log WHERE target_id = $1 AND action = 'patch_user'",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit["unlimited_seats"], json!(true));
+
+        let fresh = seed_user(&pool).await;
+        patch_seats(
+            &pool,
+            fresh,
+            PatchUserRequest { tier: Some("business".into()), unlimited_seats: Some(true), ..patch_defaults() },
+        )
+        .await;
+        assert_eq!(seats_of(&pool, fresh).await, None);
+
+        patch_seats(
+            &pool,
+            user,
+            PatchUserRequest { unlimited_seats: Some(false), seat_count: Some(8), ..patch_defaults() },
+        )
+        .await;
+        assert_eq!(seats_of(&pool, user).await, Some(8));
+    }
+
+    #[tokio::test]
+    async fn patch_user_defaults_three_seats_when_upgrading_to_teams() {
+        let pool = test_pool_or_skip!();
+        for from in ["free", "pro"] {
+            for to in ["teams", "business"] {
+                let user = seed_user(&pool).await;
+                set_tier_and_seats(&pool, user, from, None).await;
+                patch_seats(&pool, user, PatchUserRequest { tier: Some(to.into()), ..patch_defaults() }).await;
+                assert_eq!(seats_of(&pool, user).await, Some(3), "{from} -> {to}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2714,8 +2808,47 @@ mod admin_handler_tests {
         set(pro_trial, "pro", 1, Some(5), false).await;
         let c = billing_counts(&pool, Some(vec![trial, paid, manual, biz_trial, pro_trial])).await.unwrap();
         assert_eq!((c.teams, c.teams_trial, c.business), (2, 1, 0));
+        assert_eq!(c.paying(), 1);
+        assert_eq!(c.mrr(), (0, 3 * PRICE_TEAMS_PER_SEAT, 0));
+    }
+
+    #[tokio::test]
+    async fn overview_ignores_comped_accounts_in_mrr() {
+        let pool = test_pool_or_skip!();
+        let set = |u: Uuid, tier: &'static str, seats: Option<i32>, trial_days: Option<i64>, sub: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE users SET subscription_tier = $1, seat_count = $2, \
+                     trial_ends_at = CASE WHEN $3::bigint IS NULL THEN NULL ELSE now() + ($3 * interval '1 day') END, \
+                     ls_subscription_id = CASE WHEN $4 THEN 'sub_' || id::text END WHERE id = $5",
+                )
+                .bind(tier)
+                .bind(seats)
+                .bind(trial_days)
+                .bind(sub)
+                .bind(u)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let mut ids = Vec::new();
+        for _ in 0..6 {
+            ids.push(seed_user(&pool).await);
+        }
+        let (comped_biz, comped_biz_seats, paid_biz, comped_pro, lapsed_pro, paid_pro) =
+            (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+        set(comped_biz, "business", None, None, false).await;
+        set(comped_biz_seats, "business", Some(20), None, false).await;
+        set(paid_biz, "business", Some(2), None, true).await;
+        set(comped_pro, "pro", None, None, false).await;
+        set(lapsed_pro, "pro", None, Some(-1), false).await;
+        set(paid_pro, "pro", None, None, true).await;
+        let c = billing_counts(&pool, Some(ids)).await.unwrap();
         assert_eq!(c.paying(), 2);
-        assert_eq!(c.mrr(), (0, 8 * PRICE_TEAMS_PER_SEAT, 0));
+        assert_eq!(c.mrr(), (PRICE_PRO, 0, 2 * PRICE_BUSINESS_PER_SEAT));
+        assert_eq!((c.business, c.pro, c.pro_trial), (3, 3, 1));
     }
 
     #[tokio::test]

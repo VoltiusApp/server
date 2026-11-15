@@ -41,10 +41,37 @@ pub(crate) async fn owner_seat_cap(pool: &PgPool, owner_id: Uuid) -> Result<Opti
     .await
     .map_err(|e| { error!(error = %e, "Failed to fetch seat count"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    Ok(seat_count.map(|seats| {
+    Ok(effective_seat_cap(seat_count, on_trial))
+}
+
+fn effective_seat_cap(seat_count: Option<i32>, on_trial: bool) -> Option<i64> {
+    seat_count.map(|seats| {
         let effective = if on_trial { seats.min(10) } else { seats };
         effective as i64
-    }))
+    })
+}
+
+/// Seat usage and cap per owner in one query, for listing many teams at once.
+/// Matches `owner_seats_used` and `owner_seat_cap`; self-hosted is uncapped.
+async fn owner_seats_for(pool: &PgPool, owners: &[Uuid]) -> Result<std::collections::HashMap<Uuid, OwnerSeats>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (Uuid, Option<i32>, bool, i64)>(
+        "SELECT u.id, u.seat_count,
+                u.trial_ends_at IS NOT NULL OR u.ls_subscription_status IS NOT DISTINCT FROM 'on_trial',
+                (SELECT COUNT(DISTINCT tm.user_id) FROM team_members tm JOIN teams t ON tm.team_id = t.id
+                 WHERE t.owner_id = u.id)
+         FROM users u WHERE u.id = ANY($1)",
+    )
+    .bind(owners)
+    .fetch_all(pool)
+    .await?;
+    let self_hosted = crate::self_host::is_self_hosted();
+    Ok(rows
+        .into_iter()
+        .map(|(id, seat_count, on_trial, used)| {
+            let total = if self_hosted { None } else { effective_seat_cap(seat_count, on_trial) };
+            (id, OwnerSeats { used, total })
+        })
+        .collect())
 }
 
 /// Distinct users occupying a seat across every team this owner owns.
@@ -197,6 +224,14 @@ pub struct TeamWithRole {
     pub policy_revision: i64,
     pub data_version: i64,
     pub joined_at: chrono::DateTime<chrono::Utc>,
+    pub owner_seats: OwnerSeats,
+}
+
+/// Seats across every team of the owner; `total: None` means unlimited.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerSeats {
+    pub used: i64,
+    pub total: Option<i64>,
 }
 
 pub async fn list_teams(
@@ -292,7 +327,20 @@ async fn teams_for_user(
                     policy_revision: row.policy_revision,
                     data_version: row.data_version,
                     joined_at: row.joined_at,
+                    owner_seats: OwnerSeats { used: 0, total: None },
                 });
+            }
+        }
+    }
+
+    let mut owners: Vec<Uuid> = teams.iter().map(|t| t.owner_id).collect();
+    owners.sort_unstable();
+    owners.dedup();
+    if !owners.is_empty() {
+        let seats = owner_seats_for(pool, &owners).await?;
+        for team in &mut teams {
+            if let Some(s) = seats.get(&team.owner_id) {
+                team.owner_seats = *s;
             }
         }
     }
@@ -2099,14 +2147,46 @@ mod authz_tests {
     }
 
     #[tokio::test]
+    async fn list_teams_reports_owner_seats() {
+        let _env = BillingMode::hosted();
+        let pool = test_pool_or_skip!();
+        let capped = seed_user(&pool).await;
+        set_user_tier(&pool, capped, "teams").await;
+        set_user_seats(&pool, capped, 5).await;
+        let capped_team = seed_team_with_roles(&pool, capped).await;
+        let unlimited = seed_user(&pool).await;
+        set_user_tier(&pool, unlimited, "business").await;
+        sqlx::query("UPDATE users SET seat_count = NULL WHERE id = $1").bind(unlimited).execute(&pool).await.unwrap();
+        let unlimited_team = seed_team_with_roles(&pool, unlimited).await;
+        let other_unlimited_team = seed_team_with_roles(&pool, unlimited).await;
+
+        let member = seed_user(&pool).await;
+        let colleague = seed_user(&pool).await;
+        add_team_member(&pool, capped_team, member).await;
+        add_team_member(&pool, unlimited_team, member).await;
+        add_team_member(&pool, other_unlimited_team, colleague).await;
+
+        let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(member))).await.unwrap();
+        let seats_of = |team: Uuid| listed.iter().find(|t| t.id == team).unwrap().owner_seats;
+        assert_eq!(seats_of(capped_team), OwnerSeats { used: 2, total: Some(5) });
+        assert_eq!(seats_of(unlimited_team), OwnerSeats { used: 3, total: None });
+
+        let body = serde_json::to_value(&listed).unwrap();
+        let team = body.as_array().unwrap().iter().find(|t| t["id"] == json!(unlimited_team)).unwrap();
+        assert_eq!(team["owner_seats"], json!({ "used": 3, "total": null }));
+    }
+
+    #[tokio::test]
     async fn list_teams_reports_business_when_self_hosted() {
         let _env = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let owner = seed_user(&pool).await;
+        set_user_seats(&pool, owner, 5).await;
         let team = seed_team_with_roles(&pool, owner).await;
 
         let Json(listed) = list_teams(State(pool.clone()), Extension(AuthUser(owner))).await.unwrap();
         assert_eq!(listed.iter().find(|t| t.id == team).unwrap().owner_tier, "business");
+        assert_eq!(listed.iter().find(|t| t.id == team).unwrap().owner_seats, OwnerSeats { used: 1, total: None });
     }
 
     async fn rename(pool: &PgPool, team: Uuid, user: Uuid, name: &str) -> Result<StatusCode, StatusCode> {
