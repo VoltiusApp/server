@@ -517,6 +517,16 @@ async fn guest_cap_for(pool: &PgPool, vault_owner_id: Option<Uuid>, host_user_id
     }
 }
 
+/// A vault session's host must hold Start terminal session in every vault it is shared into.
+async fn may_host_in_vaults(pool: &PgPool, vault_ids: &[Uuid], user_id: Uuid) -> Result<bool, StatusCode> {
+    for &team_id in vault_ids {
+        if !crate::permissions::has_team_permission(pool, team_id, user_id, crate::permissions::PERM_START_TERMINAL_SESSION).await? {
+            return Ok(false);
+        }
+    }
+    Ok(!vault_ids.is_empty())
+}
+
 // ─── Create terminal session ──────────────────────────────────────────────────
 
 pub async fn create_session(
@@ -537,29 +547,8 @@ pub async fn create_session(
         if body.vault_ids.is_empty() {
             return Err(StatusCode::BAD_REQUEST);
         }
-        let member_of_any = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM team_members WHERE team_id = ANY($1) AND user_id = $2)",
-        )
-        .bind(&body.vault_ids)
-        .bind(auth.0)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to check vault membership");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if !member_of_any {
-            return Err(StatusCode::FORBIDDEN);
-        }
-
-        // Check START_TERMINAL_SESSION permission (custom roles may restrict this)
-        let can_start = crate::permissions::has_any_team_permission(
-            &pool, &body.vault_ids, auth.0, crate::permissions::PERM_START_TERMINAL_SESSION,
-        )
-        .await?;
-        if !can_start {
-            warn!(user_id = %auth.0, "Insufficient permission to start terminal session");
+        if !may_host_in_vaults(&pool, &body.vault_ids, auth.0).await? {
+            warn!(user_id = %auth.0, "Not allowed to start a terminal session in these vaults");
             return Err(StatusCode::FORBIDDEN);
         }
 
@@ -963,12 +952,23 @@ async fn host_hidden_from(
     connection_object_id: Option<&str>,
     authz: &mut AuthzCache,
 ) -> Result<bool, StatusCode> {
-    let Some(object_id) = connection_object_id else {
-        return Ok(false);
-    };
     if host_user_id == user_id || invited {
         return Ok(false);
     }
+    object_hidden_from(pool, user_id, session_id, connection_object_id, authz).await
+}
+
+/// Without `View` on the shared host in any of the session's vaults.
+async fn object_hidden_from(
+    pool: &PgPool,
+    user_id: Uuid,
+    session_id: Uuid,
+    connection_object_id: Option<&str>,
+    authz: &mut AuthzCache,
+) -> Result<bool, StatusCode> {
+    let Some(object_id) = connection_object_id else {
+        return Ok(false);
+    };
     let owners: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT tvo.team_id, tvo.rule_set_id FROM team_vault_objects tvo \
            JOIN terminal_session_vaults tsv ON tsv.team_id = tvo.team_id \
@@ -1428,7 +1428,9 @@ pub(crate) async fn is_authorized_participant(
         return false;
     }
     if user_id == host_user_id {
-        return true;
+        return visibility != "vault"
+            || (may_host_in_vaults(pool, vault_ids, user_id).await.unwrap_or(false)
+                && sees_session_host(pool, session_id, user_id).await);
     }
     if invitees.contains(&user_id) {
         return true;
@@ -1481,6 +1483,10 @@ pub(crate) async fn is_authorized_participant(
     {
         return false;
     }
+    sees_session_host(pool, session_id, user_id).await
+}
+
+async fn sees_session_host(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> bool {
     let Ok(object_id) = sqlx::query_scalar::<_, Option<String>>(
         "SELECT connection_object_id FROM terminal_sessions WHERE id = $1",
     )
@@ -1490,8 +1496,7 @@ pub(crate) async fn is_authorized_participant(
     else {
         return false;
     };
-    let hidden = host_hidden_from(pool, user_id, session_id, host_user_id, false, object_id.as_deref(), &mut AuthzCache::new()).await;
-    hidden == Ok(false)
+    object_hidden_from(pool, user_id, session_id, object_id.as_deref(), &mut AuthzCache::new()).await == Ok(false)
 }
 
 /// Stamps first admission. `accepted_at IS NULL` in the predicate makes a
@@ -2010,6 +2015,28 @@ mod authz_tests {
         // `Ok` is `(StatusCode, Json<CreateSessionResponse>)`, which isn't `Debug`
         // (`CreateSessionResponse` derives only `Serialize`) — `unwrap_err()`
         // doesn't compile here, so match on the `Err` variant directly.
+        assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
+    }
+
+    #[tokio::test]
+    async fn create_session_forbidden_when_one_vault_is_not_the_hosts() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let own_team = seed_team(&pool, owner).await;
+        let caller = member_with_role(&pool, own_team, crate::permissions::PERM_START_TERMINAL_SESSION).await;
+        let foreign_team = seed_team(&pool, owner).await;
+
+        let res = create_session(
+            State(pool.clone()),
+            Extension(AuthUser(caller)),
+            Extension(claims_for(caller)),
+            Extension(TerminalManager::new()),
+            Extension(SyncNotifier::new()),
+            Extension(knocks()),
+            Json(vault_session_request(vec![own_team, foreign_team])),
+        )
+        .await;
+
         assert!(matches!(res, Err(axum::http::StatusCode::FORBIDDEN)));
     }
 
@@ -3891,7 +3918,7 @@ mod guest_cap_tests {
 #[cfg(test)]
 mod live_revoke_tests {
     use super::*;
-    use crate::permissions::PERM_JOIN_TERMINAL_SESSION;
+    use crate::permissions::{PERM_JOIN_TERMINAL_SESSION, PERM_START_TERMINAL_SESSION};
     use crate::sync_notifier::SyncNotifier;
     use crate::test_pool_or_skip;
     use crate::test_support::{add_member, member_with_role, seed_session, seed_team, seed_user, set_user_tier};
@@ -4196,6 +4223,8 @@ mod live_revoke_tests {
         set_user_tier(pool, host, "teams").await;
         let team = seed_team(pool, host).await;
         add_member(pool, team, host).await;
+        let starter = crate::test_support::seed_role(pool, team, "starter", PERM_START_TERMINAL_SESSION | crate::permissions::PERM_VIEW).await;
+        crate::test_support::assign_role(pool, team, host, starter).await;
         let mate = member_with_role(pool, team, PERM_JOIN_TERMINAL_SESSION).await;
         let session_id = seed_session(pool, host, "vault").await;
         let manager = TerminalManager::new();
@@ -4222,17 +4251,76 @@ mod live_revoke_tests {
         assert_evicted(&mut s.mate_ws).await;
     }
 
+    async fn assert_session_ended_for_everyone(pool: &PgPool, s: &mut VaultSession) {
+        assert_evicted(&mut s.host_ws).await;
+        next_of_type(&mut s.mate_ws, "session_ended").await.expect("the guest is told the session ended");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while s.manager.sessions.lock().await.contains_key(&s.session_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the session leaves memory");
+        let ended: bool = sqlx::query_scalar("SELECT ended_at IS NOT NULL FROM terminal_sessions WHERE id = $1")
+            .bind(s.session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert!(ended, "the session must not stay listed to teammates");
+    }
+
+    #[tokio::test]
+    async fn removing_the_host_from_the_team_ends_their_vault_session() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+
+        leave_team(&pool, &s.manager, s.team, s.host).await;
+
+        assert_session_ended_for_everyone(&pool, &mut s).await;
+    }
+
+    #[tokio::test]
+    async fn stripping_start_from_the_host_ends_their_vault_session_on_recheck() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+
+        sqlx::query("DELETE FROM team_member_roles tmr USING team_roles tr \
+                      WHERE tr.id = tmr.role_id AND tmr.team_id = $1 AND tmr.user_id = $2 AND tr.name = 'starter'")
+            .bind(s.team)
+            .bind(s.host)
+            .execute(&pool)
+            .await
+            .unwrap();
+        s.manager.recheck_sessions(Some(s.team)).await;
+
+        assert_session_ended_for_everyone(&pool, &mut s).await;
+    }
+
+    #[tokio::test]
+    async fn a_host_who_keeps_start_keeps_their_vault_session_on_recheck() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+
+        s.manager.recheck_sessions(Some(s.team)).await;
+
+        assert_still_relayed(&mut s.host_ws, &mut s.mate_ws).await;
+    }
+
     #[tokio::test]
     async fn stripping_join_from_a_role_drops_the_live_socket_on_recheck() {
         let pool = test_pool_or_skip!();
         let mut s = vault_session_with_joined_mate(&pool).await;
 
-        sqlx::query("UPDATE team_roles SET permissions = $2 WHERE team_id = $1 AND NOT is_builtin")
-            .bind(s.team)
-            .bind(crate::permissions::PERM_VIEW)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE team_roles SET permissions = $3 WHERE team_id = $1 \
+               AND id IN (SELECT role_id FROM team_member_roles WHERE team_id = $1 AND user_id = $2)",
+        )
+        .bind(s.team)
+        .bind(s.mate)
+        .bind(crate::permissions::PERM_VIEW)
+        .execute(&pool)
+        .await
+        .unwrap();
         s.manager.recheck_sessions(Some(s.team)).await;
 
         assert_evicted(&mut s.mate_ws).await;
@@ -4242,20 +4330,47 @@ mod live_revoke_tests {
     async fn hiding_the_shared_host_drops_the_live_socket_on_recheck() {
         let pool = test_pool_or_skip!();
         let mut s = vault_session_with_joined_mate(&pool).await;
+        set_user_tier(&pool, s.host, "business").await;
         let object_id = format!("conn-{}", Uuid::new_v4());
-        crate::test_support::seed_team_object(&pool, s.team, s.host, &object_id, "connection").await;
+        share_vault_session_on(&pool, &s, &object_id).await;
+        s.manager.recheck_sessions(Some(s.team)).await;
+        assert_still_relayed(&mut s.host_ws, &mut s.mate_ws).await;
+
+        let hidden = crate::test_support::seed_rule_set(
+            &pool,
+            s.team,
+            s.host,
+            &[("everyone", None, 0, crate::permissions::PERM_VIEW), ("member", Some(s.host), crate::permissions::PERM_VIEW, 0)],
+        )
+        .await;
+        crate::test_support::point_object(&pool, s.team, &object_id, Some(hidden)).await;
+        s.manager.recheck_sessions(Some(s.team)).await;
+
+        assert_evicted(&mut s.mate_ws).await;
+    }
+
+    async fn share_vault_session_on(pool: &PgPool, s: &VaultSession, object_id: &str) {
+        crate::test_support::seed_team_object(pool, s.team, s.host, object_id, "connection").await;
         sqlx::query("UPDATE terminal_sessions SET connection_object_id = $2 WHERE id = $1")
             .bind(s.session_id)
-            .bind(&object_id)
-            .execute(&pool)
+            .bind(object_id)
+            .execute(pool)
             .await
             .unwrap();
         sqlx::query("INSERT INTO terminal_session_vaults (session_id, team_id) VALUES ($1, $2)")
             .bind(s.session_id)
             .bind(s.team)
-            .execute(&pool)
+            .execute(pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hiding_the_shared_host_from_its_host_ends_their_vault_session() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+        let object_id = format!("conn-{}", Uuid::new_v4());
+        share_vault_session_on(&pool, &s, &object_id).await;
         s.manager.recheck_sessions(Some(s.team)).await;
         assert_still_relayed(&mut s.host_ws, &mut s.mate_ws).await;
 
@@ -4269,7 +4384,22 @@ mod live_revoke_tests {
         crate::test_support::point_object(&pool, s.team, &object_id, Some(hidden)).await;
         s.manager.recheck_sessions(Some(s.team)).await;
 
-        assert_evicted(&mut s.mate_ws).await;
+        assert_session_ended_for_everyone(&pool, &mut s).await;
+    }
+
+    #[tokio::test]
+    async fn removing_the_host_from_one_of_two_vaults_ends_their_vault_session() {
+        let pool = test_pool_or_skip!();
+        let mut s = vault_session_with_joined_mate(&pool).await;
+        let other = seed_team(&pool, s.host).await;
+        add_member(&pool, other, s.host).await;
+        let starter = crate::test_support::seed_role(&pool, other, "starter", PERM_START_TERMINAL_SESSION | crate::permissions::PERM_VIEW).await;
+        crate::test_support::assign_role(&pool, other, s.host, starter).await;
+        s.manager.sessions.lock().await.get_mut(&s.session_id).unwrap().vault_ids.push(other);
+
+        leave_team(&pool, &s.manager, s.team, s.host).await;
+
+        assert_session_ended_for_everyone(&pool, &mut s).await;
     }
 
     async fn send_json(ws: &mut Client, frame: serde_json::Value) {
