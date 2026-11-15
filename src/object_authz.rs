@@ -369,16 +369,22 @@ pub async fn visible_connection_ids(pool: &PgPool, user_id: Uuid) -> Result<Vec<
     Ok(visible)
 }
 
-pub async fn hidden_object_ids(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
-    let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
+pub async fn object_refs(pool: &PgPool, team_id: Uuid, include_deleted: bool) -> Result<Vec<ObjectRef>, StatusCode> {
     let rows = sqlx::query_as::<_, (String, Option<Uuid>)>(
-        "SELECT object_id, rule_set_id FROM team_vault_objects WHERE team_id = $1",
+        "SELECT object_id, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND ($2 OR deleted_at IS NULL)",
     )
     .bind(team_id)
+    .bind(include_deleted)
     .fetch_all(pool)
     .await
-    .map_err(|e| db_error(e, "hidden_object_ids"))?;
-    Ok(rows.into_iter().filter(|(_, set)| !authz.can(*set, PERM_VIEW)).map(|(id, _)| id).collect())
+    .map_err(|e| db_error(e, "object_refs"))?;
+    Ok(rows.into_iter().map(|(object_id, rule_set_id)| ObjectRef { object_id, rule_set_id }).collect())
+}
+
+pub async fn hidden_object_ids(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
+    let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let objects = object_refs(pool, team_id, true).await?;
+    Ok(objects.into_iter().filter(|o| !authz.can(o.rule_set_id, PERM_VIEW)).map(|o| o.object_id).collect())
 }
 
 pub async fn live_rule_set_ids(pool: &PgPool, team_id: Uuid) -> Result<Vec<Uuid>, StatusCode> {

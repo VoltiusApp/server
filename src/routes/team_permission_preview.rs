@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::object_authz::{
-    compose_member_row, db_error, live_rule_set_ids, member_rows, preview_for, rule_entries,
+    compose_member_row, live_rule_set_ids, member_rows, object_refs, preview_for, rule_entries,
     team_role_bits, MemberContext, ObjectAuthz, ObjectRef, Preview,
 };
 use crate::permissions::{has_team_permission, ALL_PERMISSIONS, PERM_MANAGE_MEMBERS, PERM_VIEW};
@@ -145,20 +145,10 @@ async fn visible_objects(
     team_id: Uuid,
     caller: &ObjectAuthz,
 ) -> Result<Vec<ObjectRef>, StatusCode> {
-    let rows = sqlx::query_as::<_, (String, Option<Uuid>)>(
-        "SELECT object_id, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(team_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| db_error(e, "preview_objects"))?;
-    Ok(rows
+    let objects = object_refs(pool, team_id, false).await?;
+    Ok(objects
         .into_iter()
-        .filter(|(_, set)| caller.mask(*set) & PERM_VIEW != 0)
-        .map(|(object_id, rule_set_id)| ObjectRef {
-            object_id,
-            rule_set_id,
-        })
+        .filter(|o| caller.can(o.rule_set_id, PERM_VIEW))
         .collect())
 }
 
@@ -386,21 +376,26 @@ mod tests {
         let _b = BillingMode::self_hosted();
         let pool = test_pool_or_skip!();
         let f = fx(&pool).await;
+        let target = member_with_role(&pool, f.team, 0).await;
         seed_team_object(&pool, f.team, f.owner, "gone", "connection").await;
         seed_team_object(&pool, f.team, f.owner, "kept", "connection").await;
         let set = seed_rule_set(
             &pool,
             f.team,
             f.owner,
-            &[("member", Some(f.target), PERM_CONNECT, 0)],
+            &[("member", Some(target), PERM_CONNECT, 0)],
         )
         .await;
         point_object(&pool, f.team, "gone", Some(set)).await;
+        let before = full(&pool, &f, f.owner, target).await;
+        assert!(before.current.objects.contains_key("gone"));
+        assert!(before.current.holds_vault_key_gate);
         soft_delete(&pool, f.team, "gone").await;
-        let res = full(&pool, &f, f.owner, f.target).await;
+        let res = full(&pool, &f, f.owner, target).await;
         assert!(!res.current.objects.contains_key("gone"));
         assert!(res.current.objects.contains_key("kept"));
         assert!(res.current.rule_sets.is_empty());
+        assert!(!res.current.holds_vault_key_gate);
     }
 
     #[tokio::test]
