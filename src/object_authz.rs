@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::http::StatusCode;
+use serde::Serialize;
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
@@ -79,6 +80,42 @@ impl MemberRow {
         };
         MemberContext { user_id: self.user_id, base, team_deny: self.deny, role_ids: self.role_ids.clone(), locked }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoleBits {
+    pub id: Uuid,
+    pub builtin: bool,
+    pub permissions: i64,
+}
+
+pub fn compose_member_row(
+    user_id: Uuid,
+    role_ids: &[Uuid],
+    allow: i64,
+    deny: i64,
+    roles: &[RoleBits],
+) -> MemberRow {
+    let (mut builtin, mut custom) = (0, 0);
+    for r in roles.iter().filter(|r| role_ids.contains(&r.id)) {
+        if r.builtin {
+            builtin |= r.permissions;
+        } else {
+            custom |= r.permissions;
+        }
+    }
+    MemberRow { user_id, builtin, custom, allow, deny, role_ids: role_ids.to_vec() }
+}
+
+pub async fn team_role_bits(pool: &PgPool, team_id: Uuid) -> Result<Vec<RoleBits>, StatusCode> {
+    let rows = sqlx::query_as::<_, (Uuid, bool, i64)>(
+        "SELECT id, is_builtin, permissions FROM team_roles WHERE team_id = $1",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_error(e, "team_role_bits"))?;
+    Ok(rows.into_iter().map(|(id, builtin, permissions)| RoleBits { id, builtin, permissions }).collect())
 }
 
 pub(crate) fn db_error(e: sqlx::Error, what: &'static str) -> StatusCode {
@@ -179,6 +216,10 @@ impl ObjectAuthz {
         Self { member, entries }
     }
 
+    pub fn entries(&self) -> &HashMap<Uuid, Vec<RuleEntry>> {
+        &self.entries
+    }
+
     pub fn is_admin(&self) -> bool {
         self.member.base & PERM_ADMINISTRATOR != 0
     }
@@ -215,6 +256,52 @@ impl ObjectAuthz {
 /// Team-level `CONNECT`, or `CONNECT` on any live object.
 pub fn holds_vault_key_gate(member: MemberContext, entries: HashMap<Uuid, Vec<RuleEntry>>, live: &[Uuid]) -> bool {
     ObjectAuthz::for_member(member, entries).grants_anywhere(live, PERM_CONNECT)
+}
+
+pub struct ObjectRef {
+    pub object_id: String,
+    pub rule_set_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+pub struct ObjectPreview {
+    pub mask: i64,
+    pub rule_set_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+pub struct Preview {
+    pub team_bits: i64,
+    pub objects: BTreeMap<String, ObjectPreview>,
+    pub rule_sets: BTreeMap<Uuid, RuleLayers>,
+    pub holds_vault_key_gate: bool,
+}
+
+pub fn preview_for(
+    member: MemberContext,
+    entries: &HashMap<Uuid, Vec<RuleEntry>>,
+    objects: &[ObjectRef],
+    live: &[Uuid],
+) -> Preview {
+    let gate = holds_vault_key_gate(member.clone(), entries.clone(), live);
+    let rule_sets = objects
+        .iter()
+        .filter_map(|o| o.rule_set_id)
+        .map(|id| {
+            let es = entries.get(&id).map(Vec::as_slice).unwrap_or_default();
+            (id, layers_for(es, &member.role_ids, member.user_id))
+        })
+        .collect();
+    let authz = ObjectAuthz::for_member(member, entries.clone());
+    Preview {
+        team_bits: authz.mask(None),
+        objects: objects
+            .iter()
+            .map(|o| (o.object_id.clone(), ObjectPreview { mask: authz.mask(o.rule_set_id), rule_set_id: o.rule_set_id }))
+            .collect(),
+        rule_sets,
+        holds_vault_key_gate: gate,
+    }
 }
 
 pub struct ObjectRow {
@@ -286,16 +373,22 @@ pub async fn visible_connection_ids(pool: &PgPool, user_id: Uuid) -> Result<Vec<
     Ok(visible)
 }
 
-pub async fn hidden_object_ids(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
-    let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
+pub async fn object_refs(pool: &PgPool, team_id: Uuid, include_deleted: bool) -> Result<Vec<ObjectRef>, StatusCode> {
     let rows = sqlx::query_as::<_, (String, Option<Uuid>)>(
-        "SELECT object_id, rule_set_id FROM team_vault_objects WHERE team_id = $1",
+        "SELECT object_id, rule_set_id FROM team_vault_objects WHERE team_id = $1 AND ($2 OR deleted_at IS NULL)",
     )
     .bind(team_id)
+    .bind(include_deleted)
     .fetch_all(pool)
     .await
-    .map_err(|e| db_error(e, "hidden_object_ids"))?;
-    Ok(rows.into_iter().filter(|(_, set)| !authz.can(*set, PERM_VIEW)).map(|(id, _)| id).collect())
+    .map_err(|e| db_error(e, "object_refs"))?;
+    Ok(rows.into_iter().map(|(object_id, rule_set_id)| ObjectRef { object_id, rule_set_id }).collect())
+}
+
+pub async fn hidden_object_ids(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<Vec<String>, StatusCode> {
+    let authz = ObjectAuthz::load(pool, team_id, user_id).await?.ok_or(StatusCode::FORBIDDEN)?;
+    let objects = object_refs(pool, team_id, true).await?;
+    Ok(objects.into_iter().filter(|o| !authz.can(o.rule_set_id, PERM_VIEW)).map(|o| o.object_id).collect())
 }
 
 pub async fn live_rule_set_ids(pool: &PgPool, team_id: Uuid) -> Result<Vec<Uuid>, StatusCode> {
@@ -349,6 +442,32 @@ mod tests {
 
     fn row(builtin: i64, custom: i64, allow: i64, deny: i64) -> MemberRow {
         MemberRow { user_id: Uuid::nil(), builtin, custom, allow, deny, role_ids: vec![] }
+    }
+
+    #[test]
+    fn compose_splits_builtin_and_custom_bits() {
+        let (b, c) = (Uuid::new_v4(), Uuid::new_v4());
+        let roles = [
+            RoleBits { id: b, builtin: true, permissions: PERM_VIEW },
+            RoleBits { id: c, builtin: false, permissions: PERM_CONNECT },
+        ];
+        let row = compose_member_row(Uuid::nil(), &[b, c], 0, 0, &roles);
+        assert_eq!((row.builtin, row.custom), (PERM_VIEW, PERM_CONNECT));
+    }
+
+    #[test]
+    fn compose_ignores_unknown_role_ids() {
+        let row = compose_member_row(Uuid::nil(), &[Uuid::new_v4()], 0, 0, &[]);
+        assert_eq!((row.builtin, row.custom), (0, 0));
+    }
+
+    #[test]
+    fn compose_then_context_respects_locked() {
+        let c = Uuid::new_v4();
+        let roles = [RoleBits { id: c, builtin: false, permissions: PERM_VIEW | PERM_CONNECT }];
+        let row = compose_member_row(Uuid::nil(), &[c], PERM_VIEW, 0, &roles);
+        assert_eq!(row.context(true).base, 0);
+        assert_eq!(row.context(false).base, PERM_VIEW | PERM_CONNECT);
     }
 
     #[test]
@@ -555,5 +674,37 @@ mod tests {
         point_object(&pool, team, &object_id, Some(set)).await;
         assert!(!hidden_object_ids(&pool, team, kept).await.unwrap().contains(&object_id));
         assert!(hidden_object_ids(&pool, team, denied).await.unwrap().contains(&object_id));
+    }
+
+    #[test]
+    fn preview_masks_follow_rule_layers() {
+        let role = Uuid::new_v4();
+        let set = Uuid::new_v4();
+        let entries = HashMap::from([(set, vec![RuleEntry { subject: Subject::Role(role), allow: 0, deny: PERM_CONNECT }])]);
+        let m = MemberContext { user_id: Uuid::new_v4(), base: PERM_VIEW | PERM_CONNECT, team_deny: 0, role_ids: vec![role], locked: false };
+        let objs = [ObjectRef { object_id: "a".into(), rule_set_id: None }, ObjectRef { object_id: "b".into(), rule_set_id: Some(set) }];
+        let p = preview_for(m, &entries, &objs, &[set]);
+        assert_eq!(p.objects["a"].mask & PERM_CONNECT, PERM_CONNECT);
+        assert_eq!(p.objects["b"].mask & PERM_CONNECT, 0);
+        assert_eq!(p.rule_sets[&set].roles_deny, PERM_CONNECT);
+        assert!(p.holds_vault_key_gate);
+    }
+
+    #[test]
+    fn preview_gate_holds_through_an_object_rule_alone() {
+        let set = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+        let entries = HashMap::from([(set, vec![RuleEntry { subject: Subject::Member(uid), allow: PERM_VIEW | PERM_CONNECT, deny: 0 }])]);
+        let m = MemberContext { user_id: uid, base: PERM_VIEW, team_deny: 0, role_ids: vec![], locked: false };
+        let p = preview_for(m, &entries, &[ObjectRef { object_id: "x".into(), rule_set_id: Some(set) }], &[set]);
+        assert_eq!(p.team_bits & PERM_CONNECT, 0);
+        assert!(p.holds_vault_key_gate);
+    }
+
+    #[test]
+    fn preview_keeps_hidden_objects_with_zero_mask() {
+        let m = MemberContext { user_id: Uuid::new_v4(), base: 0, team_deny: 0, role_ids: vec![], locked: false };
+        let p = preview_for(m, &HashMap::new(), &[ObjectRef { object_id: "h".into(), rule_set_id: None }], &[]);
+        assert_eq!(p.objects["h"].mask, 0);
     }
 }

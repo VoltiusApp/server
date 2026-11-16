@@ -187,7 +187,7 @@ pub async fn has_any_team_permission(
     Ok(false)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RuleLayers {
     pub everyone_allow: i64,
     pub everyone_deny: i64,

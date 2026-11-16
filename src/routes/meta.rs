@@ -27,6 +27,7 @@ pub struct MetaResponse {
     pub wrapped_secrets_cas: bool,
     /// Only Owners confer the Owner role, and `PUT /v1/teams/:id/billing-owner` exists.
     pub multi_owner: bool,
+    pub permission_preview: bool,
     /// The server can send email; without it registration auto-verifies and enrolment tokens must require approval.
     pub email_delivery: bool,
 }
@@ -53,6 +54,7 @@ fn meta_response(features: &Features, cipher: &SeedCipher, passkeys: &Passkeys, 
         passkeys: passkeys.available(),
         wrapped_secrets_cas: true,
         multi_owner: true,
+        permission_preview: true,
         email_delivery,
     }
 }
@@ -118,5 +120,11 @@ mod tests {
     async fn meta_advertises_multi_owner() {
         let Json(meta) = get_meta(Extension(Features::open()), Extension(SeedCipher::for_tests()), Extension(Passkeys::for_tests())).await;
         assert_eq!(serde_json::to_value(&meta).unwrap()["multi_owner"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn meta_advertises_permission_preview() {
+        let Json(meta) = get_meta(Extension(Features::open()), Extension(SeedCipher::for_tests()), Extension(Passkeys::for_tests())).await;
+        assert_eq!(serde_json::to_value(&meta).unwrap()["permission_preview"], serde_json::json!(true));
     }
 }

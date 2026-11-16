@@ -89,8 +89,13 @@ impl TerminalManager {
     }
 }
 
+const READ_ONLY_POST_SUFFIXES: &[&str] = &["/permissions/preview"];
+
 /// `Some(None)` rechecks every session: a team write can cost View or Join, an account write the account.
 fn recheck_scope(path: &str) -> Option<Option<Uuid>> {
+    if READ_ONLY_POST_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+        return None;
+    }
     if let Some(rest) = path.strip_prefix("/v1/teams/") {
         return rest.split('/').next()?.parse().ok().map(Some);
     }
@@ -166,6 +171,16 @@ mod tests {
             .layer(Extension(manager.clone()));
         let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
         app.oneshot(req).await.unwrap();
+    }
+
+    #[test]
+    fn recheck_scope_skips_read_only_posts_and_keeps_writes() {
+        let team = Uuid::new_v4();
+        assert_eq!(recheck_scope(&format!("/v1/teams/{team}/permissions/preview")), None);
+        assert_eq!(
+            recheck_scope(&format!("/v1/teams/{team}/members/{}/permissions", Uuid::new_v4())),
+            Some(Some(team))
+        );
     }
 
     #[tokio::test]
