@@ -62,14 +62,14 @@ async fn current_epoch(pool: &PgPool, team_id: Uuid) -> Result<i32, StatusCode> 
     Ok(max.unwrap_or(1))
 }
 
-async fn holds_key_at(pool: &PgPool, team_id: Uuid, user_id: Uuid, version: i32) -> Result<bool, StatusCode> {
+async fn holds_key_at<'e>(ex: impl sqlx::PgExecutor<'e>, team_id: Uuid, user_id: Uuid, version: i32) -> Result<bool, StatusCode> {
     sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = $3)",
     )
     .bind(team_id)
     .bind(user_id)
     .bind(version)
-    .fetch_one(pool)
+    .fetch_one(ex)
     .await
     .map_err(|e| {
         error!(error = %e, team_id = %team_id, "Failed to check caller key coverage");
@@ -502,7 +502,40 @@ pub async fn put_vault_keys(
         return Err(StatusCode::CONFLICT);
     }
 
-    // Upsert each wrapped key entry
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to open vault key transaction");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Serialises first-time inits: two callers each seeing an unkeyed epoch would upload different DEKs.
+    sqlx::query("SELECT 1 FROM teams WHERE id = $1 FOR UPDATE")
+        .bind(team_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, "Failed to lock team for vault key upsert");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Only a holder of the current DEK may wrap it; a newcomer may only mint the epoch's first one.
+    if !holds_key_at(&mut *tx, team_id, auth.0, version).await? {
+        let epoch_keyed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM team_vault_keys WHERE team_id = $1 AND key_version = $2)",
+        )
+        .bind(team_id)
+        .bind(version)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, team_id = %team_id, "Failed to check vault key initialisation");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if epoch_keyed || !body.keys.iter().any(|k| k.user_id == auth.0) {
+            warn!(team_id = %team_id, upserter = %auth.0, epoch = version, epoch_keyed, "Key upsert rejected: caller holds no key at the current epoch");
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+
     for entry in &body.keys {
         sqlx::query(
             r#"
@@ -517,13 +550,18 @@ pub async fn put_vault_keys(
         .bind(&entry.wrapped_key)
         .bind(auth.0)
         .bind(version)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             error!(error = %e, team_id = %team_id, target_user_id = %entry.user_id, "Failed to upsert vault key");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     }
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, team_id = %team_id, "Failed to commit vault key upsert");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     info!(team_id = %team_id, upserter = %auth.0, key_count = body.keys.len(), "Vault keys upserted");
     for user_id in vault_key_notification_targets(auth.0, &body.keys) {
@@ -1838,6 +1876,7 @@ mod tests {
             .bind(team).bind(newcomer).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO team_vault_keys (team_id, user_id, wrapped_key, wrapped_by, key_version) VALUES ($1, $2, 'epoch-2', $2, 2)")
             .bind(team).bind(newcomer).execute(&pool).await.unwrap();
+        seed_vault_key(&pool, team, owner, newcomer, 2, true).await;
 
         let put = |body| put_vault_keys(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Path(team), body);
         assert_eq!(put(put_body(newcomer, "stale-epoch-1", Some(1))).await, Err(StatusCode::CONFLICT));
@@ -1846,6 +1885,60 @@ mod tests {
         assert_eq!(kept, "epoch-2", "the rotated key must survive a late wrap of the old one");
 
         assert_eq!(put(put_body(newcomer, "fresh-epoch-2", Some(2))).await, Ok(StatusCode::NO_CONTENT));
+    }
+
+    async fn wrapped_key_of(pool: &PgPool, team: Uuid, user: Uuid) -> String {
+        sqlx::query_scalar("SELECT wrapped_key FROM team_vault_keys WHERE team_id = $1 AND user_id = $2 AND key_version = 1")
+            .bind(team).bind(user).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn put_vault_keys_refuses_a_keyless_newcomer_replacing_the_teams_key() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+        seed_vault_key(&pool, team, owner, owner, 1, true).await;
+        let newcomer = member_with_role(
+            &pool, team, PERM_CONNECT | crate::permissions::PERM_VIEW_SECRETS | crate::permissions::PERM_COPY_SECRETS,
+        )
+        .await;
+
+        let res = put_vault_keys(
+            State(pool.clone()), Extension(AuthUser(newcomer)), Extension(SyncNotifier::new()), Path(team),
+            Json(PutVaultKeysRequest {
+                keys: vec![
+                    WrappedKeyEntry { user_id: newcomer, wrapped_key: "fresh-dek".to_string() },
+                    WrappedKeyEntry { user_id: owner, wrapped_key: "fresh-dek".to_string() },
+                ],
+                key_version: Some(1),
+            }),
+        )
+        .await;
+
+        assert_eq!(res, Err(StatusCode::CONFLICT));
+        assert_eq!(wrapped_key_of(&pool, team, owner).await, "wrapped");
+        assert!(!holds_key_at(&pool, team, newcomer, 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_vault_keys_first_init_must_include_the_callers_own_wrap() {
+        let pool = test_pool_or_skip!();
+        let owner = seed_user(&pool).await;
+        let team = seed_team(&pool, owner).await;
+        add_member(&pool, team, owner).await;
+        grant_view_secrets_and_copy(&pool, team, owner).await;
+        let member = seed_user(&pool).await;
+        add_member(&pool, team, member).await;
+
+        let put = |body| put_vault_keys(State(pool.clone()), Extension(AuthUser(owner)), Extension(SyncNotifier::new()), Path(team), body);
+        assert_eq!(put(put_body(member, "orphan", Some(1))).await, Err(StatusCode::CONFLICT));
+        assert!(!holds_key_at(&pool, team, member, 1).await.unwrap());
+
+        assert_eq!(put(put_body(owner, "first", Some(1))).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(put(put_body(member, "distributed", Some(1))).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(wrapped_key_of(&pool, team, member).await, "distributed");
     }
 
     #[tokio::test]
